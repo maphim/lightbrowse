@@ -20,4 +20,9 @@ pub trait BrowserBackend: Send + Sync {
     ///
     /// Implementations must apply `session` cookies, user-agent and limits.
     async fn navigate(&self, session: &Session, url: &str) -> Result<Page>;
+
+    /// Downcast hook for backend-specific introspection (e.g. RAM stats).
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }

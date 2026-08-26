@@ -9,6 +9,7 @@ description = "HTTP/REST API for lightbrowse"
 
 [dependencies]
 lightbrowse-core = { workspace = true }
+lightbrowse-cdp = { workspace = true }
 tokio = { workspace = true }
 axum = { workspace = true }
 serde = { workspace = true }

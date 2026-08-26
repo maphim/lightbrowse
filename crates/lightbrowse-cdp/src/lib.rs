@@ -118,6 +118,10 @@ impl BrowserBackend for CdpBackend {
         "cdp"
     }
 
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     async fn navigate(&self, _session: &Session, url: &str) -> Result<Page> {
         // Lazily spawn Chromium on first use. (Do not hold the guard across
         // awaits that need `self` — everything is cloned before the await.)
@@ -157,6 +161,17 @@ impl BrowserBackend for CdpBackend {
             .to_string();
 
         let result = navigate_and_render(&page_ws, url, self.config.js_wait_ms).await;
+
+        // Honesty check: report when real RAM exceeds the configured budget.
+        if result.is_ok() {
+            let ram = self.memory_usage_mb().await;
+            if ram > self.config.memory_budget_mb {
+                tracing::warn!(
+                    "cdp: actual Chromium RAM {ram} MB exceeds budget {} MB — consider --engine fetch for this site or raise LIGHTBROWSE_MEMORY_MB",
+                    self.config.memory_budget_mb
+                );
+            }
+        }
 
         // Close the tab regardless of outcome.
         let _ = http
@@ -217,6 +232,10 @@ impl CdpBrowser {
         // itself, give the rest to the page.
         let js_heap_mb = config.memory_budget_mb.saturating_sub(250).clamp(64, 2048);
 
+        // Low-memory mode: when the budget is tight, shed every optional
+        // process and cache so a single tab fits in ~200 MB.
+        let low_mem = config.memory_budget_mb < 350;
+
         let mut cmd = Command::new(&chrome);
         cmd.args([
             "--headless=new",
@@ -236,8 +255,21 @@ impl CdpBrowser {
             &format!("--remote-debugging-port={port}"),
             &format!("--user-data-dir={}", user_data.display()),
             "about:blank",
-        ])
-        .stdout(Stdio::null())
+        ]);
+        if low_mem {
+            tracing::info!(
+                "cdp: low-memory mode (budget {} MB) — single renderer, no cache",
+                config.memory_budget_mb
+            );
+            // Note: --no-zygote crashes Chrome on some systems — do not add.
+            cmd.args([
+                "--renderer-process-limit=1",
+                "--disable-software-rasterizer",
+                "--disk-cache-size=1",
+                "--disable-features=Translate,MediaRouter,OptimizationHints",
+            ]);
+        }
+        cmd.stdout(Stdio::null())
         .stderr(Stdio::null())
         .stdin(Stdio::null());
         let child = cmd

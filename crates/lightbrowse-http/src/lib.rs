@@ -59,6 +59,19 @@ pub async fn serve(addr: &str, state: AppState) -> lightbrowse_core::Result<()> 
 }
 
 async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    // RAM is reported when the CDP engine has a live Chromium.
+    let (cdp_running, cdp_ram_mb) = if let Some(cdp) = &state.cdp {
+        let backend = cdp.clone();
+        let cdp = backend
+            .as_any()
+            .and_then(|b| b.downcast_ref::<lightbrowse_cdp::CdpBackend>());
+        match cdp {
+            Some(c) => (c.is_running().await, c.memory_usage_mb().await),
+            None => (false, 0),
+        }
+    } else {
+        (false, 0)
+    };
     Json(json!({
         "status": "ok",
         "service": "lightbrowse",
@@ -67,6 +80,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "headless": !state.config.ui,
         "memory_budget_mb": state.config.memory_budget_mb,
         "idle_timeout_secs": state.config.idle_timeout_secs,
+        "cdp_running": cdp_running,
+        "cdp_ram_mb": cdp_ram_mb,
     }))
 }
 
