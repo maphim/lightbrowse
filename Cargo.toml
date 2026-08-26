@@ -1,0 +1,45 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/lightbrowse-core",
+    "crates/lightbrowse-fetch",
+    "crates/lightbrowse-mcp",
+    "crates/lightbrowse-http",
+    "crates/lightbrowse-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["maphim"]
+repository = "https://github.com/maphim/lightbrowse"
+description = "A featherweight, AI-native browser in Rust. Navigate, extract and snapshot web pages as structured data for LLM agents."
+
+[workspace.dependencies]
+lightbrowse-core = { path = "crates/lightbrowse-core" }
+lightbrowse-fetch = { path = "crates/lightbrowse-fetch" }
+lightbrowse-mcp = { path = "crates/lightbrowse-mcp" }
+lightbrowse-http = { path = "crates/lightbrowse-http" }
+
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+async-trait = "0.1"
+url = "2"
+scraper = "0.20"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "http2", "gzip", "brotli", "deflate", "cookies", "json", "stream", "charset"] }
+clap = { version = "4", features = ["derive"] }
+axum = { version = "0.8", features = ["macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+opt-level = "s"
+
+[profile.dev]
+debug = false

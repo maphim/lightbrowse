@@ -1,0 +1,16 @@
+[package]
+name = "lightbrowse-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Core types and extraction logic for lightbrowse"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+url = { workspace = true }
+scraper = { workspace = true }

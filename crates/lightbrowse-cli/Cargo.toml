@@ -1,0 +1,23 @@
+[package]
+name = "lightbrowse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "A featherweight, AI-native browser in Rust"
+
+[[bin]]
+name = "lightbrowse"
+path = "src/main.rs"
+
+[dependencies]
+lightbrowse-core = { workspace = true }
+lightbrowse-fetch = { workspace = true }
+lightbrowse-mcp = { workspace = true }
+lightbrowse-http = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
