@@ -19,7 +19,9 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use lightbrowse_core::backend::BrowserBackend;
+use lightbrowse_core::config::{Config, Engine};
 use lightbrowse_core::extract::{self, ExtractMode};
+use lightbrowse_core::service;
 use lightbrowse_core::session::Session;
 use lightbrowse_core::snapshot::{self, SnapshotOptions};
 use serde::Deserialize;
@@ -28,7 +30,10 @@ use serde_json::json;
 #[derive(Clone)]
 pub struct AppState {
     pub backend: Arc<dyn BrowserBackend>,
+    pub cdp: Option<Arc<dyn BrowserBackend>>,
     pub session: Arc<Mutex<Session>>,
+    pub engine: Engine,
+    pub config: Arc<Config>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -53,34 +58,55 @@ pub async fn serve(addr: &str, state: AppState) -> lightbrowse_core::Result<()> 
         .map_err(lightbrowse_core::Error::Io)
 }
 
-async fn health() -> impl IntoResponse {
-    Json(json!({ "status": "ok", "service": "lightbrowse", "version": env!("CARGO_PKG_VERSION") }))
+async fn health(State(state): State<AppState>) -> impl IntoResponse {
+    Json(json!({
+        "status": "ok",
+        "service": "lightbrowse",
+        "version": env!("CARGO_PKG_VERSION"),
+        "engine": state.engine,
+        "headless": !state.config.ui,
+        "memory_budget_mb": state.config.memory_budget_mb,
+        "idle_timeout_secs": state.config.idle_timeout_secs,
+    }))
 }
 
 #[derive(Deserialize)]
 struct UrlQuery {
     url: String,
+    engine: Option<String>,
 }
 
-async fn fetch_page(state: &AppState, url: &str) -> Result<lightbrowse_core::Page, ApiError> {
+async fn nav_page(
+    state: &AppState,
+    url: &str,
+    engine: Engine,
+) -> Result<lightbrowse_core::Page, ApiError> {
     // Clone out of the lock: MutexGuard is !Send and must not cross .await.
     let session = state
         .session
         .lock()
         .map_err(|_| ApiError::internal("session lock poisoned"))?
         .clone();
-    state
-        .backend
-        .navigate(&session, url)
+    service::navigate(&*state.backend, state.cdp.as_deref(), &session, url, engine)
         .await
         .map_err(ApiError::from)
+}
+
+fn parse_engine(s: Option<&str>, default: Engine) -> Result<Engine, ApiError> {
+    match s {
+        None => Ok(default),
+        Some(v) => Engine::parse(v).ok_or_else(|| {
+            ApiError::bad_request(format!("invalid engine '{v}' (expected auto|fetch|cdp)"))
+        }),
+    }
 }
 
 async fn page(
     State(state): State<AppState>,
     Query(q): Query<UrlQuery>,
 ) -> Result<Response, ApiError> {
-    let p = fetch_page(&state, &q.url).await?;
+    let engine = parse_engine(q.engine.as_deref(), state.engine)?;
+    let p = nav_page(&state, &q.url, engine).await?;
     let t = extract::extract_text(&p.html);
     let body = json!({
         "url": p.url,
@@ -100,13 +126,15 @@ async fn page(
 struct ExtractQuery {
     url: String,
     mode: Option<String>,
+    engine: Option<String>,
 }
 
 async fn extract(
     State(state): State<AppState>,
     Query(q): Query<ExtractQuery>,
 ) -> Result<Response, ApiError> {
-    let p = fetch_page(&state, &q.url).await?;
+    let engine = parse_engine(q.engine.as_deref(), state.engine)?;
+    let p = nav_page(&state, &q.url, engine).await?;
     let mode = match q.mode.as_deref().unwrap_or("text") {
         "text" => ExtractMode::Text,
         "links" => ExtractMode::Links,
@@ -128,13 +156,15 @@ async fn extract(
 struct SnapshotQuery {
     url: String,
     max_nodes: Option<usize>,
+    engine: Option<String>,
 }
 
 async fn snapshot(
     State(state): State<AppState>,
     Query(q): Query<SnapshotQuery>,
 ) -> Result<Response, ApiError> {
-    let p = fetch_page(&state, &q.url).await?;
+    let engine = parse_engine(q.engine.as_deref(), state.engine)?;
+    let p = nav_page(&state, &q.url, engine).await?;
     let opts = SnapshotOptions {
         max_nodes: q.max_nodes.unwrap_or(400).clamp(10, 2000),
         ..SnapshotOptions::default()
@@ -154,7 +184,7 @@ async fn search(
     Query(q): Query<SearchQuery>,
 ) -> Result<Response, ApiError> {
     let ddg = format!("https://html.duckduckgo.com/html/?q={}", urlencoding(&q.q));
-    let p = fetch_page(&state, &ddg).await?;
+    let p = nav_page(&state, &ddg, Engine::Fetch).await?;
     let mut results = extract::extract_search_results(&p.html);
     results.truncate(q.max_results.unwrap_or(8).clamp(1, 20));
     Ok(Json(json!({ "query": q.q, "results": results })).into_response())

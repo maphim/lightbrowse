@@ -9,7 +9,9 @@
 use std::sync::{Arc, Mutex};
 
 use lightbrowse_core::backend::BrowserBackend;
+use lightbrowse_core::config::Engine;
 use lightbrowse_core::extract::{self, ExtractMode};
+use lightbrowse_core::service;
 use lightbrowse_core::session::Session;
 use lightbrowse_core::snapshot::{self, SnapshotOptions};
 use serde_json::{json, Map, Value};
@@ -22,7 +24,9 @@ const TEXT_PREVIEW_CHARS: usize = 4000;
 #[derive(Clone)]
 pub struct McpState {
     pub backend: Arc<dyn BrowserBackend>,
+    pub cdp: Option<Arc<dyn BrowserBackend>>,
     pub session: Arc<Mutex<Session>>,
+    pub engine: Engine,
 }
 
 pub struct McpServer {
@@ -30,9 +34,19 @@ pub struct McpServer {
 }
 
 impl McpServer {
-    pub fn new(backend: Arc<dyn BrowserBackend>, session: Arc<Mutex<Session>>) -> Self {
+    pub fn new(
+        backend: Arc<dyn BrowserBackend>,
+        cdp: Option<Arc<dyn BrowserBackend>>,
+        session: Arc<Mutex<Session>>,
+        engine: Engine,
+    ) -> Self {
         Self {
-            state: McpState { backend, session },
+            state: McpState {
+                backend,
+                cdp,
+                session,
+                engine,
+            },
         }
     }
 
@@ -133,7 +147,8 @@ impl McpServer {
         match name {
             "navigate" => {
                 let url = req_str(args, "url")?;
-                let page = fetch_page(&s, &url).await?;
+                let engine = parse_engine_arg(args, s.engine)?;
+                let page = nav_page(&s, &url, engine).await?;
                 if page.status >= 400 {
                     return Err(format!("HTTP {} while fetching {}", page.status, page.url));
                 }
@@ -157,7 +172,8 @@ impl McpServer {
                     .and_then(|m| m.as_str())
                     .unwrap_or("text")
                     .to_ascii_lowercase();
-                let page = fetch_page(&s, &url).await?;
+                let engine = parse_engine_arg(args, s.engine)?;
+                let page = nav_page(&s, &url, engine).await?;
                 let mode = parse_mode(&mode)?;
                 let output = extract::extract(&page.html, &page.url, mode);
                 let out = json!({ "url": page.url, "mode": mode_str(mode), "data": output });
@@ -165,7 +181,8 @@ impl McpServer {
             }
             "snapshot" => {
                 let url = req_str(args, "url")?;
-                let page = fetch_page(&s, &url).await?;
+                let engine = parse_engine_arg(args, s.engine)?;
+                let page = nav_page(&s, &url, engine).await?;
                 let opts = SnapshotOptions {
                     max_nodes: args
                         .get("max_nodes")
@@ -192,7 +209,7 @@ impl McpServer {
                     "https://html.duckduckgo.com/html/?q={}",
                     urlencoding(&query)
                 );
-                let page = fetch_page(&s, &ddg).await?;
+                let page = nav_page(&s, &ddg, Engine::Fetch).await?;
                 let mut results = extract::extract_search_results(&page.html);
                 results.truncate(max);
                 Ok(pretty(&json!({ "query": query, "results": results })))
@@ -202,19 +219,28 @@ impl McpServer {
     }
 }
 
-async fn fetch_page(
+/// Navigate honoring per-call engine selection.
+async fn nav_page(
     s: &McpState,
     url: &str,
+    engine: Engine,
 ) -> std::result::Result<lightbrowse_core::Page, String> {
     let session = s
         .session
         .lock()
         .map_err(|_| "session lock poisoned".to_string())?
         .clone();
-    s.backend
-        .navigate(&session, url)
+    service::navigate(&*s.backend, s.cdp.as_deref(), &session, url, engine)
         .await
         .map_err(|e| e.to_string())
+}
+
+fn parse_engine_arg(args: &Map<String, Value>, default: Engine) -> Result<Engine, String> {
+    match args.get("engine").and_then(|e| e.as_str()) {
+        None => Ok(default),
+        Some(s) => Engine::parse(s)
+            .ok_or_else(|| format!("invalid engine '{s}' (expected auto|fetch|cdp)")),
+    }
 }
 
 fn req_str(args: &Map<String, Value>, key: &str) -> Result<String, String> {
@@ -293,7 +319,8 @@ fn tools_schema() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "url": { "type": "string", "description": "Absolute http(s) URL" }
+                    "url": { "type": "string", "description": "Absolute http(s) URL" },
+                    "engine": { "type": "string", "enum": ["auto", "fetch", "cdp"], "description": "auto = fetch first, fall back to headless Chromium for JS-rendered pages" }
                 },
                 "required": ["url"]
             }
@@ -305,7 +332,8 @@ fn tools_schema() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "url": { "type": "string" },
-                    "mode": { "type": "string", "enum": ["text", "links", "forms", "meta", "headings"], "default": "text" }
+                    "mode": { "type": "string", "enum": ["text", "links", "forms", "meta", "headings"], "default": "text" },
+                    "engine": { "type": "string", "enum": ["auto", "fetch", "cdp"] }
                 },
                 "required": ["url"]
             }
@@ -317,7 +345,8 @@ fn tools_schema() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "url": { "type": "string" },
-                    "max_nodes": { "type": "integer", "minimum": 10, "maximum": 2000, "default": 400 }
+                    "max_nodes": { "type": "integer", "minimum": 10, "maximum": 2000, "default": 400 },
+                    "engine": { "type": "string", "enum": ["auto", "fetch", "cdp"] }
                 },
                 "required": ["url"]
             }

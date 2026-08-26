@@ -58,18 +58,22 @@ HTTP/REST API, and an **MCP server** (Model Context Protocol) so any AI host
 ## Quick start
 
 ```bash
-# CLI
+# CLI — featherweight fetch engine by default
 lightbrowse fetch    https://example.com
 lightbrowse extract  https://example.com --mode links
 lightbrowse snapshot https://example.com
 lightbrowse search   "rust async runtime"
 
+# CLI — headless Chromium for JS-rendered sites (lazy spawn, auto-suspend)
+lightbrowse fetch    https://spa.example --engine cdp
+lightbrowse fetch    https://spa.example --engine auto   # auto-fallback
+
 # HTTP API
-lightbrowse serve --port 8787
+lightbrowse serve --port 8787 --engine auto --idle-timeout 30
 curl 'http://127.0.0.1:8787/v1/extract?url=https://example.com&mode=meta'
 
 # MCP server (stdio) — wire this into your agent host
-lightbrowse mcp
+lightbrowse mcp --engine auto
 ```
 
 ## MCP integration
@@ -92,10 +96,23 @@ Available tools:
 
 | Tool | Description |
 |---|---|
-| `navigate(url)` | fetch + title/status/word-count + text preview |
-| `extract(url, mode)` | structured `text` \| `links` \| `forms` \| `meta` \| `headings` |
-| `snapshot(url, max_nodes?)` | accessibility tree with stable uids |
+| `navigate(url, engine?)` | title/status/word-count + text preview |
+| `extract(url, mode, engine?)` | structured `text` \| `links` \| `forms` \| `meta` \| `headings` |
+| `snapshot(url, max_nodes?, engine?)` | accessibility tree with stable uids |
 | `search(query, max_results?)` | DuckDuckGo results (title/url/snippet) |
+
+`engine` is `auto` by default: fetch first, headless Chromium fallback for
+JS-rendered pages.`
+
+### HTTP API
+
+| Endpoint | Query params |
+|---|---|
+| `GET /health` | — |
+| `GET /v1/page` | `url`, `engine` |
+| `GET /v1/extract` | `url`, `mode`, `engine` |
+| `GET /v1/snapshot` | `url`, `max_nodes`, `engine` |
+| `GET /v1/search` | `q`, `max_results` |
 
 ## HTTP API
 
@@ -113,12 +130,47 @@ Cargo workspace:
 
 ```
 crates/
-├── lightbrowse-core/   engine-agnostic types, extractors, snapshot, session
-├── lightbrowse-fetch/  default backend: reqwest (gzip/brotli, cookies)
+├── lightbrowse-core/   engine-agnostic types, extractors, snapshot, session, config
+├── lightbrowse-fetch/  tier-1 backend: pure-Rust reqwest (gzip/brotli, cookies)
+├── lightbrowse-cdp/    tier-2 backend: headless Chromium via hand-rolled CDP client
 ├── lightbrowse-mcp/    MCP stdio server (JSON-RPC 2.0, zero extra deps)
 ├── lightbrowse-http/   axum REST API
 └── lightbrowse-cli/    the `lightbrowse` binary
 ```
+
+## Engines & RAM strategy
+
+lightbrowse is a **two-tier browser**, because "good web support" and "low
+RAM" are opposing goals — so you only pay for what you need:
+
+| Tier | Engine | RAM | JS | When |
+|---|---|---|---|---|
+| 1 | `fetch` (pure Rust) | ~5 MB | ❌ | default for readable sites |
+| 2 | `cdp` (headless Chromium) | ~200 MB | ✅ | pages that render with JS |
+
+- **Headless-first**: the UI is off by default (`ui: false`); a window is an
+  opt-in feature for humans who want to watch.
+- **Lazy spawn**: Chromium is only launched when a page actually needs it —
+  `--engine auto` tries fetch first and falls back to Chromium for
+  JS-rendered pages (empty content + `<script>` heuristic).
+- **Idle suspension**: a tab that sits unused for `idle_timeout_secs`
+  (default 60 s) gets its network dropped — the Chromium process is killed
+  and its RAM released. A watcher polls every 5 s.
+- **Memory budget**: `memory_budget_mb` (default 1024) sizes the JS heap
+  (`--max-old-space-size`) and caps concurrent tabs.
+- **Lazy JS wait**: `js_wait_ms` (default 800) extra grace after the load
+  event for frameworks that render late.
+
+### Config
+
+| CLI flag / env | Default | Meaning |
+|---|---|---|
+| `--engine auto\|fetch\|cdp` | `auto` | engine selection (CLI/MCP/HTTP) |
+| `--idle-timeout <secs>` | `60` | suspend Chromium after idle (serve) |
+| `LIGHTBROWSE_MEMORY_MB` | `1024` | RAM budget |
+| `LIGHTBROWSE_IDLE_TIMEOUT` | `60` | idle timeout for one-shot modes |
+| `LIGHTBROWSE_UI` | unset | set to enable GUI (roadmap) |
+| `CHROME_PATH` | auto-detect | Chrome/Chromium binary |
 
 ## Build
 
@@ -132,11 +184,14 @@ Requires Rust 1.75+. Binary is stripped + `opt-level=s` (size-oriented).
 
 ## Roadmap
 
-- [ ] **cdp backend** — drive real Chrome via DevTools Protocol for JS-heavy sites
-- [ ] **webview backend** — embedded GUI + screenshots (wry)
-- [ ] interaction actions: `click(uid)`, `type(uid, text)`, `submit(form)`
+- [x] **fetch backend** — pure Rust, ~5 MB RAM
+- [x] **cdp backend** — hand-rolled CDP client, lazy Chromium spawn, idle suspension
+- [x] **auto engine** — fetch first, Chromium fallback for JS-rendered pages
+- [ ] interaction actions: `click(uid)`, `type(uid, text)`, `submit(form)` (CDP)
+- [ ] screenshots (CDP `Page.captureScreenshot`)
+- [ ] **webview backend** — optional GUI window (wry), off by default
 - [ ] session persistence to disk (survive restarts)
-- [ ] JS execution (boa_engine) for light scripting
+- [ ] multi-tab resource manager with per-tab suspend
 - [ ] proxy / socks support, stealth fingerprinting options
 
 ## License

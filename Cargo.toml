@@ -6,6 +6,7 @@ members = [
     "crates/lightbrowse-mcp",
     "crates/lightbrowse-http",
     "crates/lightbrowse-cli",
+    "crates/lightbrowse-cdp",
 ]
 
 [workspace.package]
@@ -21,6 +22,7 @@ lightbrowse-core = { path = "crates/lightbrowse-core" }
 lightbrowse-fetch = { path = "crates/lightbrowse-fetch" }
 lightbrowse-mcp = { path = "crates/lightbrowse-mcp" }
 lightbrowse-http = { path = "crates/lightbrowse-http" }
+lightbrowse-cdp = { path = "crates/lightbrowse-cdp" }
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -34,6 +36,9 @@ clap = { version = "4", features = ["derive"] }
 axum = { version = "0.8", features = ["macros"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+futures-util = "0.3"
+tokio-tungstenite = "0.24"
+tokio-util = { version = "0.7", features = ["rt"] }
 
 [profile.release]
 lto = true
