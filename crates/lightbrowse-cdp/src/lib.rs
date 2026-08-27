@@ -119,6 +119,20 @@ impl CdpBackend {
         });
     }
 
+    /// Reset browser state: kill any Chromium (alive or zombie), drop the
+    /// active tab. Used when a connection dies so the next call starts fresh.
+    pub async fn reset_browser(&self) {
+        let mut guard = self.inner.lock().await;
+        if let Some(mut b) = guard.take() {
+            if b.is_alive() {
+                b.close_gracefully().await;
+            } else {
+                tracing::warn!("cdp: Chromium process was already dead — cleaned up");
+            }
+        }
+        *self.active.lock().await = None;
+    }
+
     /// Close Chromium gracefully (cookies flushed to the profile) and
     /// release its RAM. Called on idle timeout / shutdown.
     pub async fn suspend(&self) {
@@ -208,6 +222,23 @@ impl BrowserBackend for CdpBackend {
     }
 
     async fn navigate(&self, session: &Session, url: &str) -> Result<Page> {
+        let attempt = self.try_navigate(session, url).await;
+        if let Err(e) = &attempt {
+            if is_connection_error(e) {
+                tracing::warn!(
+                    "cdp: connection lost ({e}) — killing Chromium and retrying once with a fresh instance"
+                );
+                self.reset_browser().await;
+                return self.try_navigate(session, url).await;
+            }
+        }
+        attempt
+    }
+}
+
+impl CdpBackend {
+    /// Single navigation attempt (no retry) — see `navigate`.
+    async fn try_navigate(&self, session: &Session, url: &str) -> Result<Page> {
         let active = self.ensure_page(url).await?;
         let result = navigate_and_render(
             &active.ws_url,
@@ -242,15 +273,25 @@ impl BrowserBackend for CdpBackend {
             mime: Some("text/html".into()),
         })
     }
-}
 
-impl CdpBackend {
     /// Make sure Chromium is alive and a tab exists; returns the active page.
     async fn ensure_page(&self, url: &str) -> Result<ActivePage> {
         // Reuse the open tab if we have one.
         if let Some(p) = self.active.lock().await.clone() {
             tracing::debug!("cdp: reusing active tab for {url}");
             return Ok(p);
+        }
+        // The browser struct may be alive while the process is actually dead
+        // (crashed/killed) — detect zombies and clean them before spawning.
+        {
+            let mut guard = self.inner.lock().await;
+            if let Some(b) = guard.as_mut() {
+                if !b.is_alive() {
+                    drop(guard);
+                    tracing::warn!("cdp: Chromium process dead but state alive — resetting");
+                    self.reset_browser().await;
+                }
+            }
         }
         tracing::debug!("cdp: creating new tab for {url}");
         let port = {
@@ -690,6 +731,11 @@ impl CdpBrowser {
         self.kill();
     }
 
+    /// Is the Chromium process still running? (try_wait needs &mut Child)
+    fn is_alive(&mut self) -> bool {
+        self.child.try_wait().ok().flatten().is_none()
+    }
+
     fn kill(mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -1006,6 +1052,18 @@ async fn rpc_expect(ws: &mut CdpWs, method: &str, params: Value) -> Result<Value
             Err(e) => return Err(Error::Transport(format!("cdp recv: {e}"))),
         }
     }
+}
+
+/// Heuristic: does this error mean the CDP websocket / browser died?
+/// (e.g. "Trying to work with closed connection" from tokio-tungstenite)
+fn is_connection_error(e: &Error) -> bool {
+    let msg = e.to_string().to_ascii_lowercase();
+    msg.contains("closed connection")
+        || msg.contains("connection closed")
+        || msg.contains("connection reset")
+        || msg.contains("unexpected eof")
+        || msg.contains("broken pipe")
+        || msg.contains("i/o error: connection")
 }
 
 fn next_id() -> u64 {
