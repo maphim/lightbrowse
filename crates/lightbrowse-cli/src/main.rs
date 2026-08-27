@@ -136,6 +136,14 @@ async fn main() -> lightbrowse_core::Result<()> {
     if let Ok(v) = std::env::var("LIGHTBROWSE_IDLE_TIMEOUT") {
         config.idle_timeout_secs = v.parse().unwrap_or(60);
     }
+    if let Ok(v) = std::env::var("LIGHTBROWSE_JS_WAIT_MS") {
+        config.js_wait_ms = v.parse().unwrap_or(800);
+    }
+    if let Ok(v) = std::env::var("LIGHTBROWSE_ENGINE") {
+        if let Some(e) = Engine::parse(&v) {
+            config.engine = e;
+        }
+    }
     config.profile_dir = cli.profile.clone().or_else(|| {
         std::env::var("LIGHTBROWSE_PROFILE")
             .ok()

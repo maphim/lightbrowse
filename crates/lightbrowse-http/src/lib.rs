@@ -49,6 +49,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/memory/recent", get(memory_recent))
         .route("/v1/current", get(current_page))
         .route("/v1/evaluate", get(evaluate))
+        .route("/v1/screenshot", get(screenshot))
         .route("/v1/runbook/list", get(runbook_list))
         .route("/v1/runbook/get", get(runbook_get))
         .route("/v1/runbook/run", axum::routing::post(runbook_run))
@@ -391,6 +392,26 @@ async fn runbook_run(
         state.memory.runbook_success(&body.name).ok();
     }
     Ok(Json(outcome).into_response())
+}
+
+#[derive(Deserialize)]
+struct ScreenshotQuery {
+    path: Option<String>,
+    full_page: Option<bool>,
+}
+
+async fn screenshot(
+    State(state): State<AppState>,
+    Query(q): Query<ScreenshotQuery>,
+) -> Result<Response, ApiError> {
+    let path = std::path::PathBuf::from(q.path.unwrap_or_else(|| "lightbrowse-shot.png".into()));
+    let full = q.full_page.unwrap_or(false);
+    let out = require_cdp(&state)?
+        .screenshot(&path, full)
+        .await
+        .map_err(ApiError::from)?;
+    let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+    Ok(Json(json!({ "path": out.display().to_string(), "bytes": size })).into_response())
 }
 
 async fn current_page(State(state): State<AppState>) -> Result<Response, ApiError> {

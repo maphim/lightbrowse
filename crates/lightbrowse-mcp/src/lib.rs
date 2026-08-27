@@ -325,6 +325,27 @@ impl McpServer {
                 }
                 Ok(pretty(&json!(outcome)))
             }
+            "screenshot" => {
+                let cdp = require_cdp(&s)?;
+                let full = args
+                    .get("full_page")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let name = args
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("lightbrowse-shot.png")
+                    .to_string();
+                let path = std::path::PathBuf::from(name);
+                let out = cdp
+                    .screenshot(&path, full)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+                Ok(pretty(
+                    &json!({ "path": out.display().to_string(), "bytes": size }),
+                ))
+            }
             "evaluate" => {
                 let expression = req_str(args, "expression")?;
                 let cdp = require_cdp(&s)?;
@@ -623,6 +644,17 @@ fn tools_schema() -> Vec<Value> {
                     "variables": { "type": "object", "description": "e.g. EMAIL/PASSWORD keys" }
                 },
                 "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "screenshot",
+            "description": "Capture the ACTIVE CDP tab as a PNG file. full_page=true stitches the whole document. Use to verify visual state or show a human what the agent sees.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "output file path (default lightbrowse-shot.png)" },
+                    "full_page": { "type": "boolean", "default": false }
+                }
             }
         }),
         json!({

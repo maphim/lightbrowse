@@ -445,6 +445,73 @@ impl CdpBackend {
         .await
     }
 
+    /// Capture the active tab as a PNG. `full_page` stitches the whole
+    /// scrollable document (requires `captureBeyondViewport`).
+    pub async fn screenshot(
+        &self,
+        path: &std::path::Path,
+        full_page: bool,
+    ) -> Result<std::path::PathBuf> {
+        let active = self
+            .active
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| Error::NotInitialized("no active page — navigate first".into()))?;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
+            .await
+            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+
+        // Stretch the viewport to the full content height for full-page shots.
+        if full_page {
+            let _ = rpc_expect(
+                &mut ws,
+                "Emulation.setDeviceMetricsOverride",
+                json!({
+                    "width": 1280,
+                    "height": 1000,
+                    "deviceScaleFactor": 1,
+                    "mobile": false
+                }),
+            )
+            .await;
+            let _ = rpc_expect(
+                &mut ws,
+                "Page.setDeviceMetricsOverride",
+                json!({ "width": 1280, "height": 1000 }),
+            )
+            .await;
+        }
+
+        let result = rpc_expect(
+            &mut ws,
+            "Page.captureScreenshot",
+            json!({
+                "format": "png",
+                "captureBeyondViewport": full_page,
+                "fromSurface": true
+            }),
+        )
+        .await?;
+        let b64 = result
+            .get("data")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Parse("screenshot: no data returned".into()))?;
+
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .map_err(|e| Error::Parse(format!("screenshot: base64: {e}")))?;
+
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).ok();
+        }
+        std::fs::write(path, &bytes).map_err(Error::Io)?;
+        let _ = ws.close(None).await;
+        self.touch();
+        Ok(path.to_path_buf())
+    }
+
     /// Serialize the active tab's rendered DOM (html, title, url).
     pub async fn current_dom(&self) -> Result<(String, String, String)> {
         let active = self
