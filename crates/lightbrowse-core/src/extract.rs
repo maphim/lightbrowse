@@ -14,6 +14,17 @@ pub fn clean(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Text belonging directly to this element (not its descendants).
+fn direct_text(elm: &ElementRef) -> String {
+    let mut s = String::new();
+    for child in elm.children() {
+        if let Node::Text(t) = child.value() {
+            s.push_str(&t.text);
+        }
+    }
+    clean(&s)
+}
+
 /// Element that should never contribute visible text.
 const SKIP_TAGS: &[&str] = &[
     "script", "style", "noscript", "template", "svg", "head", "title", "meta", "link", "iframe",
@@ -48,19 +59,30 @@ pub fn is_visible(elm: &ElementRef) -> bool {
 
 // ---------------------------------------------------------------------------
 /// Structural chrome detected via CSS classes (sidebars, menus, popups).
+/// Matches whole class tokens only — substring matching wrongly flags
+/// containers like `p-body-main--withSidebar` (which is the MAIN content).
 fn is_chrome_class(elm: &ElementRef) -> bool {
     elm.value().classes().any(|c| {
         let c = c.to_ascii_lowercase();
-        c.contains("sidebar")
-            || c.contains("menu")
-            || c.contains("popup")
-            || c == "theme"
-            || c.contains("theme-list")
-            || c.contains("toc")
-            || c.contains("breadcrumb")
-            || c.contains("toolbar")
-            || c == "search"
-            || c.contains("advert")
+        matches!(
+            c.as_str(),
+            "sidebar"
+                | "menu"
+                | "popup"
+                | "theme"
+                | "theme-list"
+                | "toc"
+                | "breadcrumb"
+                | "toolbar"
+                | "search"
+                | "advert"
+                | "advertisement"
+                | "navbar"
+                | "nav-menu"
+        ) || c.starts_with("sidebar-")
+            || c.starts_with("menu-")
+            || c.starts_with("popup-")
+            || c.starts_with("theme-list-")
     })
 }
 
@@ -385,6 +407,46 @@ pub fn extract_text(html: &str) -> TextExtract {
     if let Some(root) = root {
         collect_blocks(&root, &mut blocks, 0, 512);
     }
+
+    // Pass 2 fallback: when scoring picked a weak container (e.g. a thread
+    // header on XenForo), fall back to the element holding the most
+    // non-link text — the real content on link-dense pages.
+    if blocks
+        .iter()
+        .map(|b| b.text.split_whitespace().count())
+        .sum::<usize>()
+        < 300
+    {
+        let mut max_node: Option<ElementRef> = None;
+        let mut max_len = 0usize;
+        for elm in doc.select(&sel("*")) {
+            if !is_visible(&elm) {
+                continue;
+            }
+            let (score, _) = content_score(&elm);
+            if score == f64::NEG_INFINITY {
+                continue;
+            }
+            let text = elm.text().collect::<String>();
+            let link_text: usize = elm
+                .select(&sel("a"))
+                .map(|a| a.text().collect::<String>().len())
+                .sum();
+            let non_link = text.len().saturating_sub(link_text);
+            if non_link > max_len {
+                max_len = non_link;
+                max_node = Some(elm);
+            }
+        }
+        if let Some(node) = max_node {
+            let mut alt = Vec::new();
+            collect_blocks(&node, &mut alt, 0, 1024);
+            if !alt.is_empty() {
+                blocks = alt;
+            }
+        }
+    }
+
     // Fallback for tiny pages: grab body text directly.
     if blocks.is_empty() {
         if let Some(body) = doc.select(&sel("body")).next() {
@@ -417,7 +479,7 @@ pub fn extract_text(html: &str) -> TextExtract {
 
 /// Depth-first collection of text blocks under `root`.
 fn collect_blocks(elm: &ElementRef, blocks: &mut Vec<TextBlock>, depth: usize, max_blocks: usize) {
-    if blocks.len() >= max_blocks || depth > 32 {
+    if blocks.len() >= max_blocks || depth > 64 {
         return;
     }
     let e = elm.value();
@@ -435,19 +497,32 @@ fn collect_blocks(elm: &ElementRef, blocks: &mut Vec<TextBlock>, depth: usize, m
         if !t.is_empty() {
             blocks.push(TextBlock { level: 0, text: t });
         }
+    } else if matches!(tag, "div" | "span" | "section") {
+        // Div-heavy pages (XenForo, many forums) put paragraphs in <div>.
+        // Only push when the element has direct text of its own.
+        let dt = direct_text(elm);
+        if dt.chars().count() > 3 {
+            blocks.push(TextBlock { level: 0, text: dt });
+        } else {
+            descend(elm, blocks, depth, max_blocks);
+        }
     } else {
-        for child in elm.children() {
-            if let Node::Element(e2) = child.value() {
-                if let Some(cref) = ElementRef::wrap(child) {
-                    // Don't descend into nav/footer/aside when inside the main root.
-                    if matches!(e2.name(), "nav" | "header" | "footer" | "aside") && depth > 0 {
-                        continue;
-                    }
-                    if depth > 0 && is_chrome_class(&cref) {
-                        continue;
-                    }
-                    collect_blocks(&cref, blocks, depth + 1, max_blocks);
+        descend(elm, blocks, depth, max_blocks);
+    }
+}
+
+fn descend(elm: &ElementRef, blocks: &mut Vec<TextBlock>, depth: usize, max_blocks: usize) {
+    for child in elm.children() {
+        if let Node::Element(e2) = child.value() {
+            if let Some(cref) = ElementRef::wrap(child) {
+                // Don't descend into nav/footer/aside when inside the main root.
+                if matches!(e2.name(), "nav" | "header" | "footer" | "aside") && depth > 0 {
+                    continue;
                 }
+                if depth > 0 && is_chrome_class(&cref) {
+                    continue;
+                }
+                collect_blocks(&cref, blocks, depth + 1, max_blocks);
             }
         }
     }

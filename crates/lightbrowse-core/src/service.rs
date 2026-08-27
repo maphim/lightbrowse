@@ -7,11 +7,15 @@ use crate::page::Page;
 use crate::session::Session;
 
 /// A page that came out too empty to trust — a heuristic for "this site
-/// renders its content with JavaScript".
+/// renders its content with JavaScript" or threw a bot-challenge.
 pub fn looks_js_rendered(page: &Page) -> bool {
     let has_script = page.html.to_ascii_lowercase().contains("<script");
     let text_len = crate::extract::extract_text(&page.html).word_count;
-    has_script && text_len < 40
+    let challenge = page.title.contains("Just a moment")
+        || page.title.contains("Attention Required")
+        || page.title.contains("Access Denied")
+        || page.status >= 400;
+    has_script && (text_len < 40 || challenge)
 }
 
 /// Navigate using the requested engine.

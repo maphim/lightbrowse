@@ -748,6 +748,39 @@ async fn navigate_and_render(
         tracing::warn!("cdp: load event not fired within 30s, reading DOM anyway");
     }
 
+    // Cloudflare / Turnstile / PerimeterX challenges self-solve after a few
+    // seconds of JS execution. Poll until the title stops being a challenge
+    // page (max 15s), so we read the real content instead of a captcha.
+    let mut challenge_waits = 0u32;
+    while challenge_waits < 15 {
+        let title = rpc_expect(
+            &mut ws,
+            "Runtime.evaluate",
+            json!({ "expression": "document.title", "returnByValue": true }),
+        )
+        .await
+        .ok()
+        .and_then(|r| {
+            r.get("result")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
+        let is_challenge = title.contains("Just a moment")
+            || title.contains("Attention Required")
+            || title.contains("cf-chl")
+            || title.contains("Checking your browser")
+            || title.contains("Access Denied");
+        if !is_challenge {
+            break;
+        }
+        challenge_waits += 1;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    if challenge_waits > 0 {
+        tracing::info!("cdp: challenge page detected, waited {challenge_waits}s");
+    }
+
     // Serialize the rendered document.
     let expr = "JSON.stringify({title: document.title, url: location.href, html: document.documentElement.outerHTML})";
     let result = rpc_expect(
