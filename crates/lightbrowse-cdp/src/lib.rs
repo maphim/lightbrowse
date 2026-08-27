@@ -174,7 +174,7 @@ impl CdpBackend {
                     .map(|g| g.elapsed())
                     .unwrap_or_default();
                 if idle_elapsed > Duration::from_secs(idle) {
-                    this.suspend().await;
+                    this.suspend(idle).await;
                 }
             }
         });
@@ -196,8 +196,23 @@ impl CdpBackend {
 
     /// Close Chromium gracefully (cookies flushed to the profile) and
     /// release its RAM. Called on idle timeout / shutdown.
-    pub async fn suspend(&self) {
+    ///
+    /// Re-checks `last_used` AFTER acquiring the browser lock: between the
+    /// watcher's idle check and this lock, an action may have touched the
+    /// backend or a fresh browser may have been spawned after a crash
+    /// recovery — we must never kill that one (observed race: tab created
+    /// 16:47:29 → suspended 16:47:31, i.e. a 1.8s-old browser killed).
+    pub async fn suspend(&self, idle_secs: u64) {
         let mut guard = self.inner.lock().await;
+        let still_idle = self
+            .last_used
+            .lock()
+            .map(|g| g.elapsed() > Duration::from_secs(idle_secs))
+            .unwrap_or(true);
+        if !still_idle {
+            tracing::debug!("cdp: idle suspend skipped — activity detected after check");
+            return;
+        }
         if let Some(b) = guard.take() {
             b.close_gracefully().await;
             self.tabs.lock().await.clear();
@@ -511,6 +526,11 @@ impl CdpBackend {
     /// returns that session's tab. Enforces the per-tab budget (max_tabs)
     /// with LRU eviction when the limit is hit.
     async fn ensure_page(&self, session_id: &str, url: &str) -> Result<ActivePage> {
+        // Mark activity immediately: a navigate/action is starting (or a
+        // crash-recovery is re-creating the tab). This makes the idle
+        // watcher's re-check in `suspend()` skip killing the browser we're
+        // about to use.
+        self.touch();
         // The browser struct may be alive while the process is actually dead
         // (crashed/killed) — detect zombies FIRST so we never reuse a dead
         // tab's websocket (macOS: 'Connection refused' / 'closed connection').

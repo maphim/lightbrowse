@@ -197,9 +197,8 @@ async fn main() -> lightbrowse_core::Result<()> {
     {
         config.idle_timeout_secs = *t;
     }
-    if matches!(cli.cmd, Cmd::Serve { .. } | Cmd::Mcp { .. }) {
-        config.idle_timeout_secs = config.idle_timeout_secs.min(60);
-    }
+    // Note: an explicit --idle-timeout or LIGHTBROWSE_IDLE_TIMEOUT is honored
+    // as-is for serve/MCP too; the 60s default lives in Config::default().
 
     let fetch: Arc<dyn BrowserBackend> =
         Arc::new(FetchBackend::with_proxy(config.proxy.as_deref())?);
