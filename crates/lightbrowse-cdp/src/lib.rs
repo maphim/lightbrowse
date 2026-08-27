@@ -980,7 +980,11 @@ pub async fn run_runbook(
                             break;
                         }
                         Ok(v) => {
-                            detail = v.get("reason").and_then(|r| r.as_str()).unwrap_or("failed").to_string();
+                            detail = v
+                                .get("reason")
+                                .and_then(|r| r.as_str())
+                                .unwrap_or("failed")
+                                .to_string();
                         }
                         Err(e) => detail = e.to_string(),
                     }
