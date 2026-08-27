@@ -305,6 +305,7 @@ RAM" are opposing goals — so you only pay for what you need:
 | `LIGHTBROWSE_UI` | unset | set to enable GUI (roadmap) |
 | `LIGHTBROWSE_PROXY` | unset | same as `--proxy` |
 | `LIGHTBROWSE_MAX_TABS` | unset | same as `--max-tabs` |
+| `LIGHTBROWSE_UA` | auto | User-Agent override. CDP engine derives a version-matched UA from the Chrome binary by default; set this to force a custom UA for both engines |
 | `CHROME_PATH` | auto-detect | Chrome/Chromium binary |
 
 ## Sessions & isolation

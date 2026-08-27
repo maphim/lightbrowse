@@ -67,7 +67,13 @@ impl Session {
         Self {
             id,
             cookie_jar,
-            user_agent: DEFAULT_UA.into(),
+            // LIGHTBROWSE_UA overrides the default for the fetch engine too;
+            // the CDP engine auto-derives a UA matching the actual Chrome
+            // binary version (see chrome_version_ua) and only falls back here.
+            user_agent: std::env::var("LIGHTBROWSE_UA")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_UA.into()),
             history: Vec::new(),
             options,
         }
@@ -87,5 +93,9 @@ impl Default for Session {
 /// A modern Chrome UA so that most sites treat us like a real browser.
 /// Deliberately identical to stock Chrome: any `lightbrowse/` suffix would
 /// leak that the client is automated and get logins flagged.
+///
+/// Keep this within a major version or two of current Chrome; the CDP engine
+/// derives its UA from the actual Chrome binary (chrome_version_ua) so this
+/// constant only affects the fetch engine and pre-spawn fallbacks.
 pub const DEFAULT_UA: &str =
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
