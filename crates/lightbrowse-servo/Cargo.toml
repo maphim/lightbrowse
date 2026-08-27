@@ -1,0 +1,16 @@
+[package]
+name = "lightbrowse-servo"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "PoC: Servo (Rust-native engine) backend for lightbrowse — tier-1.5 JS rendering"
+
+[dependencies]
+lightbrowse-core = { workspace = true }
+servo = { version = "0.4.0", default-features = false, features = ["baked-in-resources", "no-wgl", "js_jit"] }
+crossbeam-channel = "0.5"
+url = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

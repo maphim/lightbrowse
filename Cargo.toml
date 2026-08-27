@@ -8,7 +8,11 @@ members = [
     "crates/lightbrowse-cli",
     "crates/lightbrowse-cdp",
     "crates/lightbrowse-memory",
+    "crates/lightbrowse-servo",
 ]
+
+[patch.crates-io]
+mozangle = { path = "vendor/mozangle" }
 
 [workspace.package]
 version = "0.1.0"
@@ -25,6 +29,7 @@ lightbrowse-mcp = { path = "crates/lightbrowse-mcp" }
 lightbrowse-http = { path = "crates/lightbrowse-http" }
 lightbrowse-cdp = { path = "crates/lightbrowse-cdp" }
 lightbrowse-memory = { path = "crates/lightbrowse-memory" }
+lightbrowse-servo = { path = "crates/lightbrowse-servo" }
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
