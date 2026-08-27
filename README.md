@@ -315,15 +315,13 @@ Requires Rust 1.75+. Binary is stripped + `opt-level=s` (size-oriented).
 
 ## Roadmap
 
-- [x] **fetch backend** — pure Rust, ~5 MB RAM
-- [x] **cdp backend** — hand-rolled CDP client, lazy Chromium spawn, idle suspension
-- [x] **auto engine** — fetch first, Chromium fallback for JS-rendered pages
-- [ ] interaction actions: `click(uid)`, `type(uid, text)`, `submit(form)` (CDP)
-- [ ] screenshots (CDP `Page.captureScreenshot`)
-- [ ] **webview backend** — optional GUI window (wry), off by default
-- [ ] session persistence to disk (survive restarts)
-- [ ] multi-tab resource manager with per-tab suspend
-- [ ] proxy / socks support, stealth fingerprinting options
+Single source of truth: **[ROADMAP.md](ROADMAP.md)** (kept in sync with code).
+
+Highlights:
+- ✅ done — fetch/CDP engines, auto-fallback, actions, runbooks, stealth +
+  profiles, memory, research, screenshots, self-healing, RAM telemetry
+- 🔭 next — proxy/SOCKS support, resource manager, Servo tier (blocked on
+  upstream dependency chain — see [issue #7](https://github.com/maphim/lightbrowse/issues/7))
 
 ## License
 
