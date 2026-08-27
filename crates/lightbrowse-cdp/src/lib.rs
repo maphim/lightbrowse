@@ -431,13 +431,17 @@ impl CdpBackend {
     /// Single navigation attempt (no retry) — see `navigate`.
     async fn try_navigate(&self, session: &Session, url: &str) -> Result<Page> {
         let active = self.ensure_page(&session.id, url).await?;
-        let result = navigate_and_render(
-            &active.ws_url,
-            url,
-            &session.user_agent,
-            self.config.js_wait_ms,
-        )
-        .await;
+        // CDP pages advertise the REAL Chrome version (chrome_version_ua) so
+        // version-gated sites (Slack, Google) don't block us — not the
+        // session default that may lag behind the installed binary.
+        let ua = self
+            .inner
+            .lock()
+            .await
+            .as_ref()
+            .map(|b| b.user_agent.clone())
+            .unwrap_or_else(|| session.user_agent.clone());
+        let result = navigate_and_render(&active.ws_url, url, &ua, self.config.js_wait_ms).await;
         if result.is_ok() {
             let ram = self.memory_usage_mb().await;
             if ram > self.config.memory_budget_mb {
@@ -596,9 +600,17 @@ impl CdpBackend {
         let fe = eval_across_frames(
             &active.ws_url,
             &format!(
-                "(() => {{ const el = document.querySelector({sel}); if (!el) return null; \
-                 el.scrollIntoView({{block:'center'}}); const r = el.getBoundingClientRect(); \
-                 return {{x: r.x + r.width/2, y: r.y + r.height/2, tag: el.tagName.toLowerCase()}}; }})()"
+                "(() => {{ const els = document.querySelectorAll({sel}); \
+                 for (const el of els) {{ \
+                   const r = el.getBoundingClientRect(); \
+                   if (r.width < 1 || r.height < 1) continue; \
+                   const cs = getComputedStyle(el); \
+                   if (cs.visibility === 'hidden' || cs.display === 'none') continue; \
+                   el.scrollIntoView({{block:'center'}}); \
+                   const r2 = el.getBoundingClientRect(); \
+                   return {{x: r2.x + r2.width/2, y: r2.y + r2.height/2, tag: el.tagName.toLowerCase()}}; \
+                 }} \
+                 return null; }})()"
             ),
         )
         .await?;
@@ -873,6 +885,10 @@ struct CdpBrowser {
     child: Child,
     port: u16,
     browser_ws: String,
+    /// Effective User-Agent: matches the actual Chrome binary version so
+    /// sites (Slack, Google) don't reject us as an "old browser" — see
+    /// `chrome_version_ua`. Overridable via LIGHTBROWSE_UA.
+    user_agent: String,
     _user_data_dir: std::path::PathBuf,
 }
 
@@ -978,6 +994,12 @@ impl CdpBrowser {
             child,
             port,
             browser_ws,
+            // Prefer an explicit override, else match the real binary version.
+            user_agent: std::env::var("LIGHTBROWSE_UA")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| chrome_version_ua(&chrome))
+                .unwrap_or_else(|| lightbrowse_core::session::DEFAULT_UA.to_string()),
             _user_data_dir: user_data,
         })
     }
@@ -1036,6 +1058,43 @@ impl CdpBrowser {
             .unwrap_or(0);
         (main + children) / 1024
     }
+}
+
+/// Build a stock-Chrome UA whose major version matches the installed binary
+/// (e.g. `google-chrome --version` → "Google Chrome 149.0.7827.200" →
+/// Chrome/149.0.0.0). Sites like Slack reject UAs that are too old, even
+/// though the real browser is recent — this keeps the advertised version in
+/// lockstep with reality (and consistent with UA-CH brands).
+fn chrome_version_ua(chrome: &str) -> Option<String> {
+    let out = std::process::Command::new(chrome)
+        .arg("--version")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8_lossy(&out.stdout);
+    // "Google Chrome 149.0.7827.200" | "Chromium 149.0.0.0" | "Mozilla ... Chrome/149.0"
+    let major = s
+        .split_whitespace()
+        .find(|t| t.chars().next().is_some_and(|c| c.is_ascii_digit()))?
+        .split('.')
+        .next()?
+        .parse::<u32>()
+        .ok()?;
+    if !(70..=999).contains(&major) {
+        return None;
+    }
+    let platform = if cfg!(windows) {
+        "(Windows NT 10.0; Win64; x64)"
+    } else if cfg!(target_os = "macos") {
+        "(Macintosh; Intel Mac OS X 10_15_7)"
+    } else {
+        "(X11; Linux x86_64)"
+    };
+    Some(format!(
+        "Mozilla/5.0 {platform} AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+    ))
 }
 
 fn detect_chrome() -> Option<String> {
@@ -1158,24 +1217,29 @@ async fn navigate_and_render(
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut loaded = false;
     while Instant::now() < deadline {
-        let msg = tokio::time::timeout(Duration::from_secs(1), ws.next())
-            .await
-            .ok()
-            .flatten()
-            .ok_or_else(|| Error::Transport("cdp: connection closed during load".into()))?;
-        let text = match msg {
-            Ok(WsMessage::Text(t)) => t,
-            Ok(WsMessage::Ping(p)) => {
-                let _ = ws.send(WsMessage::Pong(p)).await;
-                continue;
+        // 1s idle is normal mid-load (redirect chains, TLS, silent-auth
+        // round-trips) — keep waiting; only a real close aborts. Previously
+        // any 1s gap errored out as "connection closed during load" and
+        // triggered a full Chromium restart on healthy sessions.
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Err(_) => continue,
+            Ok(None) => {
+                return Err(Error::Transport(
+                    "cdp: connection closed during load".into(),
+                ))
             }
-            Ok(_) => continue,
-            Err(e) => return Err(Error::Transport(format!("cdp recv: {e}"))),
-        };
-        let v: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
-        if v.get("method").and_then(|m| m.as_str()) == Some("Page.loadEventFired") {
-            loaded = true;
-            break;
+            Ok(Some(Err(e))) => return Err(Error::Transport(format!("cdp recv: {e}"))),
+            Ok(Some(Ok(WsMessage::Text(t)))) => {
+                let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                if v.get("method").and_then(|m| m.as_str()) == Some("Page.loadEventFired") {
+                    loaded = true;
+                    break;
+                }
+            }
+            Ok(Some(Ok(WsMessage::Ping(p)))) => {
+                let _ = ws.send(WsMessage::Pong(p)).await;
+            }
+            Ok(Some(Ok(_))) => {}
         }
     }
 
@@ -1532,6 +1596,9 @@ async fn collect_frame_htmls(ws_url: &str) -> Vec<String> {
 }
 
 /// Send a command and wait for its response (ignoring events in between).
+/// The 20s deadline is the OVERALL cap; short 1s read timeouts (a busy page
+/// can stall longer between CDP messages) just keep waiting — only a real
+/// websocket close or protocol error aborts the call.
 async fn rpc_expect(ws: &mut CdpWs, method: &str, params: Value) -> Result<Value> {
     let id = next_id();
     ws.send(WsMessage::Text(
@@ -1540,15 +1607,18 @@ async fn rpc_expect(ws: &mut CdpWs, method: &str, params: Value) -> Result<Value
     .await
     .map_err(|e| Error::Transport(format!("cdp send {method}: {e}")))?;
 
-    let _deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let msg = tokio::time::timeout(Duration::from_secs(1), ws.next())
-            .await
-            .ok()
-            .flatten()
-            .ok_or_else(|| Error::Transport(format!("cdp: {method} timed out")))?;
-        match msg {
-            Ok(WsMessage::Text(t)) => {
+        if Instant::now() >= deadline {
+            return Err(Error::Transport(format!("cdp: {method} timed out")));
+        }
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            // 1s idle — page is busy; keep waiting until the deadline.
+            Err(_) => continue,
+            // Real websocket close → abort ("Trying to work with closed connection").
+            Ok(None) => return Err(Error::Transport(format!("cdp: {method} connection closed"))),
+            Ok(Some(Err(e))) => return Err(Error::Transport(format!("cdp recv {method}: {e}"))),
+            Ok(Some(Ok(WsMessage::Text(t)))) => {
                 let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
                 if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
                     if let Some(err) = v.get("error") {
@@ -1557,11 +1627,10 @@ async fn rpc_expect(ws: &mut CdpWs, method: &str, params: Value) -> Result<Value
                     return Ok(v.get("result").cloned().unwrap_or(Value::Null));
                 }
             }
-            Ok(WsMessage::Ping(p)) => {
+            Ok(Some(Ok(WsMessage::Ping(p)))) => {
                 let _ = ws.send(WsMessage::Pong(p)).await;
             }
-            Ok(_) => {}
-            Err(e) => return Err(Error::Transport(format!("cdp recv: {e}"))),
+            Ok(Some(Ok(_))) => {}
         }
     }
 }
