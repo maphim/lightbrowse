@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a bug in lightbrowse
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you run and what went wrong?
+      placeholder: "lightbrowse fetch <url> --engine auto returned ..."
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+      description: What should have happened?
+    validations:
+      required: true
+  - type: input
+    id: url
+    attributes:
+      label: URL (if site-specific)
+      placeholder: "https://example.com/page"
+  - type: dropdown
+    id: engine
+    attributes:
+      label: Engine
+      options:
+        - auto
+        - fetch
+        - cdp
+        - not sure
+  - type: textarea
+    id: env
+    attributes:
+      label: Environment
+      description: OS, lightbrowse version (`lightbrowse --version`), Chrome version if cdp
+      placeholder: "Ubuntu 24.04, lightbrowse 0.1.0, Chrome 149"
+    validations:
+      required: true
