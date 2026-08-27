@@ -36,16 +36,24 @@ pub struct SnapshotNode {
     pub role: String,
     pub tag: String,
     pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub href: Option<String>,
     /// `name` attribute (inputs).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub checked: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub alt: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<u8>,
     /// CSS selector path from the document root — lets an agent act on this
     /// node (click/type/submit) via `document.querySelector`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<SnapshotNode>,
 }
 

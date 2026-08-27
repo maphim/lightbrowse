@@ -224,7 +224,23 @@ impl McpServer {
                 let page = nav_page(&s, &url, engine).await?;
                 let m = s.memory.as_ref().ok_or("browsing memory disabled")?;
                 m.store_page(&page).map_err(|e| e.to_string())?;
-                let hits = m.search(&question, 6, None).map_err(|e| e.to_string())?;
+                let hits: Vec<serde_json::Value> = m
+                    .search(&question, 6, None)
+                    .map_err(|e| e.to_string())?
+                    .into_iter()
+                    .map(|h| {
+                        let mut v = serde_json::to_value(h).unwrap_or(serde_json::Value::Null);
+                        if let Some(obj) = v.as_object_mut() {
+                            if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
+                                obj.insert(
+                                    "text".into(),
+                                    serde_json::Value::String(text.chars().take(300).collect()),
+                                );
+                            }
+                        }
+                        v
+                    })
+                    .collect();
                 Ok(pretty(&json!({
                     "url": page.url,
                     "title": extract::extract_meta(&page.html).title,

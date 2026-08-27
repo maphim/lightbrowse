@@ -281,7 +281,22 @@ async fn main() -> lightbrowse_core::Result<()> {
             )
             .await?;
             memory.store_page(&page).ok();
-            let hits = memory.search(&question, 6, None).unwrap_or_default();
+            let mut hits: Vec<serde_json::Value> = memory
+                .search(&question, 6, None)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|h| {
+                    let mut v = serde_json::to_value(h).unwrap_or(serde_json::Value::Null);
+                    if let Some(obj) = v.as_object_mut() {
+                        if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
+                            let clipped: String = text.chars().take(300).collect();
+                            obj.insert("text".into(), serde_json::Value::String(clipped));
+                        }
+                    }
+                    v
+                })
+                .collect();
+            let _ = &mut hits;
             let meta = extract::extract_meta(&page.html);
             print_json(&json!({
                 "url": page.url,

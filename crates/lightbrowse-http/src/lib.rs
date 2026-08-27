@@ -279,10 +279,24 @@ async fn ask(
     let engine = parse_engine(q.engine.as_deref(), state.engine)?;
     let p = nav_page(&state, &q.url, engine).await?;
     state.memory.store_page(&p).map_err(ApiError::from)?;
-    let hits = state
+    let hits: Vec<Value> = state
         .memory
         .search(&q.question, 6, None)
-        .map_err(ApiError::from)?;
+        .map_err(ApiError::from)?
+        .into_iter()
+        .map(|h| {
+            let mut v = serde_json::to_value(h).unwrap_or(Value::Null);
+            if let Some(obj) = v.as_object_mut() {
+                if let Some(text) = obj.get("text").and_then(|t| t.as_str()) {
+                    obj.insert(
+                        "text".into(),
+                        Value::String(text.chars().take(300).collect()),
+                    );
+                }
+            }
+            v
+        })
+        .collect();
     let meta = extract::extract_meta(&p.html);
     Ok(Json(json!({
         "url": p.url,
