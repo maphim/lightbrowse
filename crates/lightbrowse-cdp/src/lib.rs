@@ -374,6 +374,7 @@ impl CdpBackend {
             Err(_) => return Vec::new(),
         };
         eval_across_frames_value(
+            active.port,
             &active.ws_url,
             &format!(
                 "(() => {{ const el = document.querySelector({sel}); if (!el) return null;              const out = [];              if (el.id) out.push('#' + CSS.escape(el.id));              if (el.name) out.push(`[name=\"${{el.name}}\"]`);              if (el.placeholder) out.push(`[placeholder=\"${{el.placeholder}}\"]`);              if (el.getAttribute('aria-label')) out.push(`[aria-label=\"${{el.getAttribute('aria-label')}}\"]`);              return out.slice(0,3); }})()"
@@ -598,6 +599,7 @@ impl CdpBackend {
         let sel = serde_json::to_string(selector).map_err(|e| Error::Parse(e.to_string()))?;
         let (sid, active) = self.active_page(session).await?;
         let fe = eval_across_frames(
+            active.port,
             &active.ws_url,
             &format!(
                 "(() => {{ const els = document.querySelectorAll({sel}); \
@@ -698,6 +700,7 @@ impl CdpBackend {
         // Confirm what landed in the field (may live in an iframe).
         let sel = serde_json::to_string(selector).map_err(|e| Error::Parse(e.to_string()))?;
         let value = eval_across_frames_value(
+            active.port,
             &active.ws_url,
             &format!(
                 "(() => {{ const el = document.querySelector({sel}); return el ? el.value : null; }})()"
@@ -764,6 +767,7 @@ impl CdpBackend {
         let sel = serde_json::to_string(selector).map_err(|e| Error::Parse(e.to_string()))?;
         let (_, active) = self.active_page(session).await?;
         eval_across_frames_value(
+            active.port,
             &active.ws_url,
             &format!(
                 "(() => {{ const el = document.querySelector({sel}); if (!el) return null;              const form = el.tagName === 'FORM' ? el : el.form; if (!form) return {{ok:false, reason:'no parent form'}};              form.requestSubmit(); return {{ok:true, action: form.action || null}}; }})()"
@@ -851,7 +855,7 @@ impl CdpBackend {
             .unwrap_or("")
             .to_string();
         // Append iframe contents so snapshot/ask see frame-hosted fields.
-        let frames = collect_frame_htmls(&active.ws_url).await;
+        let frames = collect_frame_htmls(active.port, &active.ws_url).await;
         if !frames.is_empty() {
             html.push_str(&format!("<div data-lb-frames=\"{}:\">", frames.len()));
             for (i, fh) in frames.iter().enumerate() {
@@ -1400,7 +1404,9 @@ struct FrameEval {
 /// (iframe), returning the first non-null value and its frame. Lets
 /// selectors reach elements inside iframes — e.g. Microsoft's
 /// `fpt.live.com` login fields, invisible to the top-level document.
-async fn eval_across_frames(ws_url: &str, expression: &str) -> Result<FrameEval> {
+/// Cross-origin iframes (OOPIFs) are discovered via Target.getTargets as a
+/// last resort — they never appear in Page.getFrameTree.
+async fn eval_across_frames(port: u16, ws_url: &str, expression: &str) -> Result<FrameEval> {
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
         .await
         .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
@@ -1486,16 +1492,99 @@ async fn eval_across_frames(ws_url: &str, expression: &str) -> Result<FrameEval>
             }
         }
     }
+    // OOPIF fallback: cross-site iframes are separate browser targets and
+    // never show up in Page.getFrameTree — reach them directly.
+    if let Some((tid, val)) = eval_oopif_targets(port, expression)
+        .await
+        .into_iter()
+        .next()
+    {
+        let _ = ws.close(None).await;
+        return Ok(FrameEval {
+            frame_id: Some(tid),
+            value: val,
+        });
+    }
     let _ = ws.close(None).await;
     Err(Error::Parse("no frame returned a value".into()))
 }
 
 /// Value-only wrapper (frame id discarded) — for callers that don't need
 /// frame-aware coordinates.
-async fn eval_across_frames_value(ws_url: &str, expression: &str) -> Result<Value> {
-    eval_across_frames(ws_url, expression)
+async fn eval_across_frames_value(port: u16, ws_url: &str, expression: &str) -> Result<Value> {
+    eval_across_frames(port, ws_url, expression)
         .await
         .map(|fe| fe.value)
+}
+
+/// Discover cross-origin iframes (OOPIFs) and evaluate `expression` in each
+/// one's own session. Out-of-process frames are invisible to the embedding
+/// page's `Page.getFrameTree` (verified on Chrome 149: an embedded
+/// login.live.com/Me.htm iframe never appears in the tree, even after
+/// `load`), so they must be reached through the browser-level target list.
+/// Returns (target_id, value) for every non-null result — target_id doubles
+/// as the frameId for DOM.getFrameOwner, so clicks/offset still work.
+async fn eval_oopif_targets(port: u16, expression: &str) -> Vec<(String, Value)> {
+    // Browser-level ws — Target.getTargets is browser-scoped.
+    let Ok(version) = reqwest::get(format!("http://127.0.0.1:{port}/json/version")).await else {
+        return Vec::new();
+    };
+    let Ok(version) = version.json::<Value>().await else {
+        return Vec::new();
+    };
+    let Some(browser_ws) = version.get("webSocketDebuggerUrl").and_then(|v| v.as_str()) else {
+        return Vec::new();
+    };
+    let Ok((mut ws, _)) = tokio_tungstenite::connect_async(browser_ws).await else {
+        return Vec::new();
+    };
+    let Ok(targets) = rpc_expect(&mut ws, "Target.getTargets", json!({})).await else {
+        let _ = ws.close(None).await;
+        return Vec::new();
+    };
+    let _ = ws.close(None).await;
+
+    let mut out = Vec::new();
+    let infos = targets
+        .pointer("/targetInfos")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    for t in infos {
+        if t.get("type").and_then(|v| v.as_str()) != Some("iframe") {
+            continue;
+        }
+        let Some(tid) = t.get("targetId").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let url = t.get("url").and_then(|v| v.as_str()).unwrap_or("");
+        if url.is_empty() || url == "about:blank" {
+            continue;
+        }
+        let iframe_ws = format!("ws://127.0.0.1:{port}/devtools/page/{tid}");
+        let Ok((mut iws, _)) = tokio_tungstenite::connect_async(&iframe_ws).await else {
+            continue;
+        };
+        if let Ok(v) = rpc_expect(
+            &mut iws,
+            "Runtime.evaluate",
+            json!({
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true
+            }),
+        )
+        .await
+        {
+            if let Some(val) = v.pointer("/result/value") {
+                if !val.is_null() && val.as_str() != Some("undefined") {
+                    out.push((tid.to_string(), val.clone()));
+                }
+            }
+        }
+        let _ = iws.close(None).await;
+    }
+    out
 }
 
 /// Top-viewport offset (x, y) of an iframe element inside its parent
@@ -1527,7 +1616,7 @@ async fn iframe_viewport_offset(ws: &mut CdpWs, frame_id: &str) -> Option<(f64, 
 
 /// Collect the rendered HTML of every child frame (iframe) of the page, so
 /// snapshot extraction sees login forms and other frame-hosted content.
-async fn collect_frame_htmls(ws_url: &str) -> Vec<String> {
+async fn collect_frame_htmls(port: u16, ws_url: &str) -> Vec<String> {
     let Ok((mut ws, _)) = tokio_tungstenite::connect_async(ws_url).await else {
         return Vec::new();
     };
@@ -1588,6 +1677,14 @@ async fn collect_frame_htmls(ws_url: &str) -> Vec<String> {
                 if !h.is_empty() {
                     htmls.push(h.to_string());
                 }
+            }
+        }
+    }
+    // OOPIF fallback: cross-site iframes don't show up in the frame tree.
+    for (_, val) in eval_oopif_targets(port, "document.documentElement.outerHTML").await {
+        if let Some(h) = val.as_str() {
+            if !h.is_empty() {
+                htmls.push(h.to_string());
             }
         }
     }
