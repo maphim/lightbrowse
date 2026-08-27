@@ -1044,21 +1044,54 @@ fn detect_chrome() -> Option<String> {
             return Some(p);
         }
     }
-    for name in [
-        "google-chrome",
-        "google-chrome-stable",
-        "chromium",
-        "chromium-browser",
-        "chrome",
-    ] {
-        if let Ok(out) = std::process::Command::new("which").arg(name).output() {
-            if out.status.success() {
-                if let Ok(s) = String::from_utf8(out.stdout) {
-                    let p = s.trim().to_string();
-                    if !p.is_empty() {
-                        return Some(p);
+    // Unix: look up browser names via `which`.
+    #[cfg(not(windows))]
+    {
+        for name in [
+            "google-chrome",
+            "google-chrome-stable",
+            "chromium",
+            "chromium-browser",
+            "chrome",
+        ] {
+            if let Ok(out) = std::process::Command::new("which").arg(name).output() {
+                if out.status.success() {
+                    if let Ok(s) = String::from_utf8(out.stdout) {
+                        let p = s.trim().to_string();
+                        if !p.is_empty() {
+                            return Some(p);
+                        }
                     }
                 }
+            }
+        }
+    }
+    // Windows: `where.exe` + well-known install paths (Chrome/Edge).
+    #[cfg(windows)]
+    {
+        for name in ["chrome", "msedge", "chromium"] {
+            if let Ok(out) = std::process::Command::new("where.exe").arg(name).output() {
+                if out.status.success() {
+                    if let Ok(s) = String::from_utf8(out.stdout) {
+                        let p = s.lines().next().unwrap_or("").trim().to_string();
+                        if !p.is_empty() {
+                            return Some(p);
+                        }
+                    }
+                }
+            }
+        }
+        let pf = std::env::var("ProgramFiles").unwrap_or_else(|_| "C:\\Program Files".to_string());
+        let pfx86 = std::env::var("ProgramFiles(x86)")
+            .unwrap_or_else(|_| "C:\\Program Files (x86)".to_string());
+        for p in [
+            format!("{pf}\\Google\\Chrome\\Application\\chrome.exe"),
+            format!("{pfx86}\\Google\\Chrome\\Application\\chrome.exe"),
+            format!("{pf}\\Microsoft\\Edge\\Application\\msedge.exe"),
+            format!("{pfx86}\\Microsoft\\Edge\\Application\\msedge.exe"),
+        ] {
+            if std::path::Path::new(&p).exists() {
+                return Some(p);
             }
         }
     }
@@ -1788,8 +1821,10 @@ mod tests {
 /// Integration test: CDP must self-heal when the Chromium process is killed
 /// mid-session (macOS report: "Trying to work with closed connection").
 /// Requires a Chrome/Chromium binary + network; runs in CI via --include-ignored.
+/// Uses unix-only `pkill`/`kill` — ignored on Windows.
 #[tokio::test]
 #[ignore = "requires Chrome + network"]
+#[cfg_attr(windows, ignore = "uses pkill/kill (unix-only)")]
 async fn recovers_after_chromium_killed() {
     let config = lightbrowse_core::config::Config {
         idle_timeout_secs: 300,

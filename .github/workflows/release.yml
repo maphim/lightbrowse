@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            targets: x86_64-unknown-linux-gnu
+            name: lightbrowse-linux-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            targets: x86_64-pc-windows-msvc
+            name: lightbrowse-windows-x86_64.exe
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            targets: x86_64-apple-darwin aarch64-apple-darwin
+            name: lightbrowse-macos
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # macOS: build BOTH arches in one job (Xcode clang is universal).
+      - name: Build (macOS, x86_64 + aarch64)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          mkdir -p dist
+          cp target/x86_64-apple-darwin/release/lightbrowse dist/lightbrowse-macos-x86_64
+          cp target/aarch64-apple-darwin/release/lightbrowse dist/lightbrowse-macos-aarch64
+
+      - name: Build (single target)
+        if: runner.os != 'macOS'
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage asset
+        if: runner.os != 'macOS'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp "target/${{ matrix.target }}/release/lightbrowse${{ runner.os == 'Windows' && '.exe' || '' }}" "dist/${{ matrix.name }}"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.os }}
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -lh artifacts/
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
