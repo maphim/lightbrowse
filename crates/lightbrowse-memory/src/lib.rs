@@ -53,6 +53,15 @@ CREATE TABLE IF NOT EXISTS html_cache (
     page_id     INTEGER PRIMARY KEY REFERENCES pages(id) ON DELETE CASCADE,
     html        TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS runbooks (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL UNIQUE,
+    url             TEXT NOT NULL,
+    steps           TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    last_used_at    INTEGER NOT NULL,
+    success_count   INTEGER NOT NULL DEFAULT 0
+);
 CREATE TRIGGER IF NOT EXISTS blocks_ai AFTER INSERT ON blocks BEGIN
     INSERT INTO blocks_fts(rowid, text) VALUES (new.id, new.text);
 END;
@@ -325,6 +334,63 @@ impl MemoryStore {
         Ok(out)
     }
 
+    /// Upsert a runbook (named action recipe) with its JSON steps.
+    pub fn save_runbook(&self, name: &str, url: &str, steps_json: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO runbooks (name, url, steps, created_at, last_used_at)
+             VALUES (?1, ?2, ?3, ?4, ?4)
+             ON CONFLICT(name) DO UPDATE SET url=excluded.url, steps=excluded.steps, last_used_at=excluded.last_used_at",
+            params![name, url, steps_json, now_secs()],
+        )
+        .map_err(|e| Error::Parse(e.to_string()))?;
+        Ok(())
+    }
+
+    /// All runbooks: (name, url, steps_json, success_count).
+    pub fn list_runbooks(&self) -> Result<Vec<(String, String, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT name, url, steps, success_count FROM runbooks ORDER BY last_used_at DESC",
+            )
+            .map_err(|e| Error::Parse(e.to_string()))?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .map_err(|e| Error::Parse(e.to_string()))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r.map_err(|e| Error::Parse(e.to_string()))?);
+        }
+        Ok(out)
+    }
+
+    /// Fetch one runbook by name.
+    pub fn get_runbook(&self, name: &str) -> Result<Option<(String, String, String, i64)>> {
+        let conn = self.conn.lock().unwrap();
+        let row = conn.query_row(
+            "SELECT name, url, steps, success_count FROM runbooks WHERE name = ?1",
+            params![name],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        );
+        match row {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(Error::Parse(e.to_string())),
+        }
+    }
+
+    /// Mark a runbook as used successfully.
+    pub fn runbook_success(&self, name: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE runbooks SET success_count = success_count + 1, last_used_at = ?1 WHERE name = ?2",
+            params![now_secs(), name],
+        )
+        .map_err(|e| Error::Parse(e.to_string()))?;
+        Ok(())
+    }
+
     /// Count stored pages (for stats/health).
     pub fn page_count(&self) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
@@ -425,6 +491,34 @@ mod tests {
         let c = m.find_cached("https://a.test/cache", None).unwrap();
         assert!(c.is_some());
         assert!(c.unwrap().html.contains("cached content"));
+    }
+
+    #[test]
+    fn runbook_crud() {
+        let m = MemoryStore::open(None).unwrap();
+        m.save_runbook(
+            "login-demo",
+            "https://demo.test/login",
+            r#"[{"action":"type"}]"#,
+        )
+        .unwrap();
+        let (name, url, steps, cnt) = m.get_runbook("login-demo").unwrap().unwrap();
+        assert_eq!(name, "login-demo");
+        assert_eq!(url, "https://demo.test/login");
+        assert!(steps.contains("type"));
+        assert_eq!(cnt, 0);
+        // upsert + success bump
+        m.save_runbook(
+            "login-demo",
+            "https://demo.test/login",
+            r#"[{"action":"press"}]"#,
+        )
+        .unwrap();
+        m.runbook_success("login-demo").unwrap();
+        let (_, _, steps, cnt) = m.get_runbook("login-demo").unwrap().unwrap();
+        assert!(steps.contains("press"));
+        assert_eq!(cnt, 1);
+        assert_eq!(m.list_runbooks().unwrap().len(), 1);
     }
 
     #[test]

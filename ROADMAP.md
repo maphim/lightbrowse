@@ -50,6 +50,8 @@
 - [x] **submit(selector)** — `form.requestSubmit()`
 - [x] **persistent profile** — logins survive restarts (graceful Browser.close)
 - [x] **stealth** — clean UA, webdriver/plugins/chrome spoof (bot.sannysoft ✓)
+- [x] **runbooks** — auto-record action trail → save/run/list/get recipes;
+      selector fallbacks + {{VAR}} substitution; final-state verification
 - [ ] **screenshot** — `Page.captureScreenshot` (CDP)
 - [ ] **session cookies across actions** — persist logged-in state
 - [ ] **waits** — wait-for-selector / network-idle helpers
@@ -57,7 +59,7 @@
 ## Interfaces
 
 - [x] CLI (`fetch`, `extract`, `snapshot`, `search`, `ask`, `memory-*`, `serve`, `mcp`)
-- [x] MCP server — navigate/extract/snapshot/search/ask/memory/click/type/submit
+- [x] MCP server — navigate/extract/snapshot/search/ask/memory/click/type/submit/runbook
 - [x] HTTP API — `/v1/{page,extract,snapshot,search,ask,memory,click,type,submit,current}`
 - [ ] WebSocket streaming for long-running research tasks
 - [ ] Optional GUI (wry) — off by default, for humans who want to watch

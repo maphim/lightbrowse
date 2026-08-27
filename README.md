@@ -175,6 +175,40 @@ with CAPTCHA — that's an arms race. For 2FA (TOTP/SMS) the agent should stop
 and ask the human; lightbrowse won't (and shouldn't) bypass that. Brokerages
 in VN are generally much lighter than Google.
 
+## Runbooks — stop re-discovering selectors
+
+The first time an agent does something fiddly (logging in, filling a form),
+it pokes around: snapshots, tries selectors, retries. That trial-and-error is
+**recorded automatically** — every successful `click`/`type`/`press` lands in
+the session trail — and can be saved as a named **runbook**:
+
+```
+# first time: agent fumbles through the login
+navigate("https://accounts.example/login", engine="cdp")
+type("#email", "me@example.com")   # recorded
+press("Tab")                        # recorded
+type("#password", "s3cret")        # recorded
+press("Enter")                      # recorded
+runbook/save {"name": "login-example"}
+
+# second time: no fumbling
+runbook/run {"name": "login-example"}
+# -> replays all steps, tries selector fallbacks (id/name/placeholder),
+#    returns the final page state so you can confirm "Logged in"
+```
+
+| Tool | What it does |
+|---|---|
+| `runbook/save {name}` | save the session trail as a runbook (auto-recorded actions) |
+| `runbook/run {name, variables?}` | replay; `{{EMAIL}}`-style placeholders get substituted |
+| `runbook/get {name}` | fetch steps — hand them to the agent as a plan |
+| `runbook/list` | all saved runbooks |
+| `trail/clear` | start a fresh recording |
+
+Steps carry **selector fallbacks** (`#id`, `[name=...]`, `[placeholder=...]`,
+`[aria-label=...]`) so replays survive small DOM changes. Runbooks live in
+the same SQLite store as browsing memory.
+
 ## Browsing memory (SQLite + FTS5)
 
 Everything the browser reads is cached and indexed at

@@ -25,7 +25,7 @@ use lightbrowse_core::session::Session;
 use lightbrowse_core::snapshot::{self, SnapshotOptions};
 use lightbrowse_memory::{navigate_cached, MemoryStore};
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -49,6 +49,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/memory/recent", get(memory_recent))
         .route("/v1/current", get(current_page))
         .route("/v1/evaluate", get(evaluate))
+        .route("/v1/runbook/list", get(runbook_list))
+        .route("/v1/runbook/get", get(runbook_get))
+        .route("/v1/runbook/run", axum::routing::post(runbook_run))
         .route("/v1/click", get(click_action))
         .route("/v1/type", get(type_action))
         .route("/v1/submit", get(submit_action))
@@ -326,6 +329,68 @@ async fn evaluate(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "result": res })).into_response())
+}
+
+async fn runbook_list(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let books = state.memory.list_runbooks().map_err(ApiError::from)?;
+    let out: Vec<Value> = books
+        .into_iter()
+        .map(|(name, url, _, cnt)| json!({ "name": name, "url": url, "success_count": cnt }))
+        .collect();
+    Ok(Json(json!({ "runbooks": out })).into_response())
+}
+
+#[derive(Deserialize)]
+struct RunbookGetQuery {
+    name: String,
+}
+
+async fn runbook_get(
+    State(state): State<AppState>,
+    Query(q): Query<RunbookGetQuery>,
+) -> Result<Response, ApiError> {
+    match state.memory.get_runbook(&q.name).map_err(ApiError::from)? {
+        Some((name, url, steps, cnt)) => {
+            let parsed: Value =
+                serde_json::from_str(&steps).map_err(|e| ApiError::internal(e.to_string()))?;
+            Ok(
+                Json(json!({ "name": name, "url": url, "success_count": cnt, "steps": parsed }))
+                    .into_response(),
+            )
+        }
+        None => Err(ApiError::bad_request(format!(
+            "runbook '{}' not found",
+            q.name
+        ))),
+    }
+}
+
+#[derive(Deserialize)]
+struct RunbookRunBody {
+    name: String,
+    #[serde(default)]
+    variables: std::collections::HashMap<String, String>,
+}
+
+async fn runbook_run(
+    State(state): State<AppState>,
+    Json(body): Json<RunbookRunBody>,
+) -> Result<Response, ApiError> {
+    let (_, url, steps_json, _) = state
+        .memory
+        .get_runbook(&body.name)
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::bad_request(format!("runbook '{}' not found", body.name)))?;
+    let steps: Vec<lightbrowse_cdp::RunbookStep> =
+        serde_json::from_str(&steps_json).map_err(|e| ApiError::internal(e.to_string()))?;
+    let cdp = require_cdp(&state)?;
+    let outcome = lightbrowse_cdp::run_runbook(cdp, &url, &steps, &body.variables)
+        .await
+        .map_err(ApiError::from)?;
+    if outcome.ok {
+        state.memory.runbook_success(&body.name).ok();
+    }
+    Ok(Json(outcome).into_response())
 }
 
 async fn current_page(State(state): State<AppState>) -> Result<Response, ApiError> {

@@ -253,6 +253,78 @@ impl McpServer {
                 let pages = m.recent(limit).map_err(|e| e.to_string())?;
                 Ok(pretty(&json!({ "pages": pages })))
             }
+            "trail/clear" => {
+                let cdp = require_cdp(&s)?;
+                cdp.clear_trail();
+                Ok(pretty(&json!({ "ok": true })))
+            }
+            "runbook/save" => {
+                let name = req_str(args, "name")?;
+                let cdp = require_cdp(&s)?;
+                let trail = cdp.trail();
+                if trail.is_empty() {
+                    return Err("no actions recorded yet — do some click/type/press first".into());
+                }
+                let url = cdp
+                    .current_url()
+                    .await
+                    .ok_or("no active page — navigate first")?;
+                let steps_json = serde_json::to_string(&trail).map_err(|e| e.to_string())?;
+                let m = s.memory.as_ref().ok_or("browsing memory disabled")?;
+                m.save_runbook(&name, &url, &steps_json)
+                    .map_err(|e| e.to_string())?;
+                Ok(pretty(&json!({
+                    "name": name,
+                    "url": url,
+                    "steps": trail.len(),
+                    "saved": true
+                })))
+            }
+            "runbook/list" => {
+                let m = s.memory.as_ref().ok_or("browsing memory disabled")?;
+                let books = m.list_runbooks().map_err(|e| e.to_string())?;
+                let out: Vec<Value> = books
+                    .into_iter()
+                    .map(|(name, url, _, cnt)| json!({ "name": name, "url": url, "success_count": cnt }))
+                    .collect();
+                Ok(pretty(&json!({ "runbooks": out })))
+            }
+            "runbook/get" => {
+                let name = req_str(args, "name")?;
+                let m = s.memory.as_ref().ok_or("browsing memory disabled")?;
+                match m.get_runbook(&name).map_err(|e| e.to_string())? {
+                    Some((_, url, steps, cnt)) => {
+                        let parsed: Value =
+                            serde_json::from_str(&steps).map_err(|e| e.to_string())?;
+                        Ok(pretty(
+                            &json!({ "name": name, "url": url, "success_count": cnt, "steps": parsed }),
+                        ))
+                    }
+                    None => Err(format!("runbook '{name}' not found")),
+                }
+            }
+            "runbook/run" => {
+                let name = req_str(args, "name")?;
+                let m = s.memory.as_ref().ok_or("browsing memory disabled")?;
+                let (_, url, steps_json, _) = m
+                    .get_runbook(&name)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("runbook '{name}' not found"))?;
+                let steps: Vec<lightbrowse_cdp::RunbookStep> =
+                    serde_json::from_str(&steps_json).map_err(|e| e.to_string())?;
+                let vars: std::collections::HashMap<String, String> = args
+                    .get("variables")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                let cdp = require_cdp(&s)?;
+                let outcome = lightbrowse_cdp::run_runbook(cdp, &url, &steps, &vars)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if outcome.ok {
+                    m.runbook_success(&name).ok();
+                }
+                Ok(pretty(&json!(outcome)))
+            }
             "evaluate" => {
                 let expression = req_str(args, "expression")?;
                 let cdp = require_cdp(&s)?;
@@ -507,6 +579,50 @@ fn tools_schema() -> Vec<Value> {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 8 }
                 },
                 "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "trail/clear",
+            "description": "Clear the recorded action trail (starts a fresh runbook).",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "runbook/save",
+            "description": "Save the recorded action trail (click/type/press done in this session) as a named runbook for later replay. Log in once by trial-and-error, save it, and never fumble again.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "e.g. login-gmail, chungkhoan-daily" }
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "runbook/list",
+            "description": "List saved runbooks.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "runbook/get",
+            "description": "Fetch a runbook's steps — use them as a plan, or hand them to the agent to avoid re-discovering selectors.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" }
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "runbook/run",
+            "description": "Replay a saved runbook automatically. Variables like {{EMAIL}}/{{PASSWORD}} are substituted from the 'variables' object. Each step tries its selector then fallbacks (id/name/placeholder).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "variables": { "type": "object", "description": "e.g. EMAIL/PASSWORD keys" }
+                },
+                "required": ["name"]
             }
         }),
         json!({

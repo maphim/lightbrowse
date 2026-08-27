@@ -41,11 +41,37 @@ pub struct ActivePage {
     pub ws_url: String,
 }
 
+/// One recorded action in the session trail (feed for runbook/save).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TrailStep {
+    pub action: String,
+    pub selector: Option<String>,
+    /// Alternative ways to find the same element (id/name/placeholder/...).
+    #[serde(default)]
+    pub fallbacks: Vec<String>,
+    pub text: Option<String>,
+    pub key: Option<String>,
+    pub ms: Option<u64>,
+}
+
+/// A replayable runbook step.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RunbookStep {
+    pub action: String,
+    pub selector: Option<String>,
+    #[serde(default)]
+    pub fallbacks: Vec<String>,
+    pub text: Option<String>,
+    pub key: Option<String>,
+    pub ms: Option<u64>,
+}
+
 /// CDP backend with lazy Chromium spawn + idle suspension.
 pub struct CdpBackend {
     config: Config,
     inner: tokio::sync::Mutex<Option<CdpBrowser>>,
     active: tokio::sync::Mutex<Option<ActivePage>>,
+    trail: Mutex<Vec<TrailStep>>,
     last_used: Mutex<Instant>,
     shutdown: CancellationToken,
 }
@@ -56,6 +82,7 @@ impl CdpBackend {
             config,
             inner: tokio::sync::Mutex::new(None),
             active: tokio::sync::Mutex::new(None),
+            trail: Mutex::new(Vec::new()),
             last_used: Mutex::new(Instant::now()),
             shutdown: CancellationToken::new(),
         }
@@ -116,6 +143,35 @@ impl CdpBackend {
         if let Ok(mut g) = self.last_used.lock() {
             *g = Instant::now();
         }
+    }
+
+    /// Session action trail (feed for `runbook/save`).
+    pub fn trail(&self) -> Vec<TrailStep> {
+        self.trail.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn clear_trail(&self) {
+        if let Ok(mut g) = self.trail.lock() {
+            g.clear();
+        }
+    }
+
+    fn record_step(&self, step: TrailStep) {
+        if let Ok(mut g) = self.trail.lock() {
+            g.push(step);
+        }
+    }
+
+    /// Collect alternative selectors for an element (id, name, placeholder,
+    /// aria-label) so replays survive small DOM changes.
+    async fn collect_fallbacks(&self, selector: &str) -> Vec<String> {
+        let sel = serde_json::to_string(selector).unwrap_or_default();
+        self.evaluate(&format!(
+            "(() => {{ const el = document.querySelector({sel}); if (!el) return [];              const out = [];              if (el.id) out.push('#' + CSS.escape(el.id));              if (el.name) out.push(`[name=\"${{el.name}}\"]`);              if (el.placeholder) out.push(`[placeholder=\"${{el.placeholder}}\"]`);              if (el.getAttribute('aria-label')) out.push(`[aria-label=\"${{el.getAttribute('aria-label')}}\"]`);              return out.slice(0,3); }})()"
+        ))
+        .await
+        .and_then(|v| serde_json::from_value(v).map_err(|e| Error::Parse(e.to_string())))
+        .unwrap_or_default()
     }
 }
 
@@ -282,6 +338,15 @@ impl CdpBackend {
         }
         let _ = ws.close(None).await;
         self.touch();
+        let fallbacks = self.collect_fallbacks(selector).await;
+        self.record_step(TrailStep {
+            action: "click".into(),
+            selector: Some(selector.to_string()),
+            fallbacks,
+            text: None,
+            key: None,
+            ms: None,
+        });
         Ok(json!({ "ok": true, "tag": tag, "x": x.round() as u64, "y": y.round() as u64 }))
     }
 
@@ -312,6 +377,15 @@ impl CdpBackend {
                 "(() => {{ const el = document.querySelector({sel}); return el ? el.value : null; }})()"
             ))
             .await?;
+        let fallbacks = self.collect_fallbacks(selector).await;
+        self.record_step(TrailStep {
+            action: "type".into(),
+            selector: Some(selector.to_string()),
+            fallbacks,
+            text: Some(text.to_string()),
+            key: None,
+            ms: None,
+        });
         Ok(json!({ "ok": true, "value": value }))
     }
 
@@ -352,6 +426,14 @@ impl CdpBackend {
         }
         let _ = ws.close(None).await;
         self.touch();
+        self.record_step(TrailStep {
+            action: "press".into(),
+            selector: None,
+            fallbacks: Vec::new(),
+            text: None,
+            key: Some(key.to_string()),
+            ms: None,
+        });
         Ok(json!({ "ok": true, "key": key }))
     }
 
@@ -825,6 +907,203 @@ fn urlencoding(s: &str) -> String {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Runbook execution (replay a recorded action recipe)
+// ---------------------------------------------------------------------------
+
+/// Result of running one step.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct StepOutcome {
+    pub step: usize,
+    pub action: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Result of a full runbook run.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RunbookOutcome {
+    pub url: String,
+    pub ok: bool,
+    pub steps: Vec<StepOutcome>,
+    /// Final page state after the run (title + text preview) so callers can
+    /// confirm the run actually achieved its goal (e.g. logged in).
+    pub final_title: String,
+    pub final_text_preview: String,
+}
+
+/// Substitute `{{VAR}}` placeholders in a string.
+fn fill_vars(template: &str, vars: &std::collections::HashMap<String, String>) -> String {
+    let mut out = template.to_string();
+    for (k, v) in vars {
+        out = out.replace(&format!("{{{{{k}}}}}"), v);
+    }
+    out
+}
+
+/// Replay a runbook against the CDP backend.
+///
+/// `steps` come from `runbook/save` (recorded trail). Each element step tries
+/// its primary selector, then fallbacks (id/name/placeholder), so replays
+/// survive small DOM changes.
+pub async fn run_runbook(
+    cdp: &CdpBackend,
+    url: &str,
+    steps: &[RunbookStep],
+    vars: &std::collections::HashMap<String, String>,
+) -> Result<RunbookOutcome> {
+    let mut outcomes = Vec::new();
+    let mut ok_all = true;
+
+    cdp.navigate(&Session::new(), url).await?;
+
+    for (i, step) in steps.iter().enumerate() {
+        let mut candidates: Vec<String> = Vec::new();
+        if let Some(sel) = &step.selector {
+            candidates.push(fill_vars(sel, vars));
+        }
+        for fb in &step.fallbacks {
+            candidates.push(fill_vars(fb, vars));
+        }
+
+        let outcome = match step.action.as_str() {
+            "click" => {
+                let mut detail = String::new();
+                let mut done = false;
+                for sel in &candidates {
+                    match cdp.click(sel).await {
+                        Ok(v) if v.get("ok").and_then(|x| x.as_bool()) == Some(true) => {
+                            detail = format!("clicked {sel}");
+                            done = true;
+                            break;
+                        }
+                        Ok(v) => {
+                            detail = v.get("reason").and_then(|r| r.as_str()).unwrap_or("failed").to_string();
+                        }
+                        Err(e) => detail = e.to_string(),
+                    }
+                }
+                StepOutcome {
+                    step: i,
+                    action: "click".into(),
+                    ok: done,
+                    detail,
+                }
+            }
+            "type" => {
+                let text = fill_vars(step.text.as_deref().unwrap_or(""), vars);
+                let mut detail = String::new();
+                let mut done = false;
+                for sel in &candidates {
+                    match cdp.type_text(sel, &text).await {
+                        Ok(v) if v.get("ok").and_then(|x| x.as_bool()) == Some(true) => {
+                            detail = format!("typed into {sel}");
+                            done = true;
+                            break;
+                        }
+                        Ok(v) => {
+                            detail = v
+                                .get("reason")
+                                .and_then(|r| r.as_str())
+                                .unwrap_or("failed")
+                                .to_string();
+                        }
+                        Err(e) => detail = e.to_string(),
+                    }
+                }
+                StepOutcome {
+                    step: i,
+                    action: "type".into(),
+                    ok: done,
+                    detail,
+                }
+            }
+            "press" => {
+                let key = fill_vars(step.key.as_deref().unwrap_or("Enter"), vars);
+                match cdp.press_key(&key).await {
+                    Ok(v) if v.get("ok").and_then(|x| x.as_bool()) == Some(true) => StepOutcome {
+                        step: i,
+                        action: "press".into(),
+                        ok: true,
+                        detail: format!("pressed {key}"),
+                    },
+                    Ok(v) => StepOutcome {
+                        step: i,
+                        action: "press".into(),
+                        ok: false,
+                        detail: v.to_string(),
+                    },
+                    Err(e) => StepOutcome {
+                        step: i,
+                        action: "press".into(),
+                        ok: false,
+                        detail: e.to_string(),
+                    },
+                }
+            }
+            "wait" => {
+                let ms = step.ms.unwrap_or(1000).min(60_000);
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+                StepOutcome {
+                    step: i,
+                    action: "wait".into(),
+                    ok: true,
+                    detail: format!("waited {ms}ms"),
+                }
+            }
+            "assert" => {
+                let mut found = false;
+                for sel in &candidates {
+                    if let Ok(v) = cdp
+                        .evaluate(&format!(
+                            "(() => !!document.querySelector({}))",
+                            serde_json::to_string(sel).unwrap_or_default()
+                        ))
+                        .await
+                    {
+                        if v.as_bool() == Some(true) {
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+                StepOutcome {
+                    step: i,
+                    action: "assert".into(),
+                    ok: found,
+                    detail: if found {
+                        format!("found {candidates:?}")
+                    } else {
+                        "assertion failed".into()
+                    },
+                }
+            }
+            other => StepOutcome {
+                step: i,
+                action: other.into(),
+                ok: false,
+                detail: format!("unknown action '{other}'"),
+            },
+        };
+        if !outcome.ok {
+            ok_all = false;
+        }
+        outcomes.push(outcome);
+    }
+
+    // Capture the final page state so callers can verify the goal.
+    let (html, title, _) = cdp.current_dom().await.unwrap_or_default();
+    let text = lightbrowse_core::extract::extract_text(&html);
+
+    Ok(RunbookOutcome {
+        url: url.to_string(),
+        ok: ok_all,
+        steps: outcomes,
+        final_title: title,
+        final_text_preview: text.text.chars().take(2000).collect(),
+    })
 }
 
 #[cfg(test)]
