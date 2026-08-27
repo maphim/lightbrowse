@@ -207,6 +207,21 @@ lightbrowse is built to get *past* login walls, not to fight CAPTCHAs:
    ```
    Chromium is closed with CDP `Browser.close` (not SIGKILL) so cookies are
    flushed to the profile.
+
+**SSO across sessions:** every CDP session (`?session=<id>` / `session:` arg)
+shares the SAME Chromium profile — one login works everywhere. Log into
+Microsoft SSO once and Outlook, Teams, SharePoint, Office apps are all
+auto-authenticated in any session, e.g. an enterprise setup:
+
+   ```bash
+   # session=office365: log in via CDP actions once
+   # session=outlook, session=teams, ...: already authenticated
+   ```
+
+   Caveats: (1) you MUST run with `--profile` (the default is a throwaway
+   stateless temp profile — no sharing, no persistence); (2) authenticated
+   sessions must use `engine=cdp` — the fetch engine has its own cookie
+   jars and cannot see Chromium cookies.
 2. **Stealth by default** — clean Chrome UA (no `HeadlessChrome`, no
    `lightbrowse/` marker), `navigator.webdriver` neutered, `window.chrome` /
    `plugins` / `languages` spoofed. Verified against bot.sannysoft.com.
