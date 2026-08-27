@@ -11,6 +11,7 @@ description = "MCP (Model Context Protocol) server for lightbrowse — lets any 
 lightbrowse-core = { workspace = true }
 lightbrowse-fetch = { workspace = true }
 lightbrowse-memory = { workspace = true }
+lightbrowse-cdp = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

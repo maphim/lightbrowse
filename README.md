@@ -98,8 +98,19 @@ Available tools:
 |---|---|
 | `navigate(url, engine?)` | title/status/word-count + text preview |
 | `extract(url, mode, engine?)` | structured `text` \| `links` \| `forms` \| `meta` \| `headings` |
-| `snapshot(url, max_nodes?, engine?)` | accessibility tree with stable uids |
+| `snapshot(url, max_nodes?, engine?)` | accessibility tree with stable uids + CSS selectors |
+| `ask(url, question, engine?)` | intent-aware: fetch/cache + scored relevant blocks |
+| `click(selector)` | click an element on the active CDP tab (from snapshot) |
+| `type(selector, text)` | type into an input (React-compatible events) |
+| `submit(selector)` | submit the element's form |
+| `page/current` | read the active CDP tab after actions |
+| `memory/search(query)` | BM25 search over everything read |
+| `memory/recent(limit?)` | recently read pages |
 | `search(query, max_results?)` | DuckDuckGo results (title/url/snippet) |
+
+**Agent interaction loop:** `navigate(url, engine="cdp")` → `snapshot()` → act
+(`click`/`type`/`submit` with a snapshot `selector`) → `page/current` to see
+the result. `engine="cdp"` keeps the tab open; cached pages are read-only.
 
 `engine` is `auto` by default: fetch first, headless Chromium fallback for
 JS-rendered pages.`
@@ -137,6 +148,21 @@ crates/
 ├── lightbrowse-http/   axum REST API
 └── lightbrowse-cli/    the `lightbrowse` binary
 ```
+
+## Browsing memory (SQLite + FTS5)
+
+Everything the browser reads is cached and indexed at
+`~/.cache/lightbrowse/memory.db` (or `--memory <path>`):
+
+- **URL cache with TTL** — repeat fetches of the same page skip the network
+- **BM25 search** — `memory/search "what did we read about X"` finds blocks
+  across pages (with a substring fallback for stopword-heavy queries)
+- **Recent history** — `memory/recent`
+- **Intent-aware ask** — `ask <url> "question"` returns only the relevant
+  blocks + scores instead of the whole page (token-efficient for agents)
+
+No vector DB and no knowledge graph inside the browser by design: semantic
+retrieval is delegated to the host's memory system (e.g. MemPalace via MCP).
 
 ## Engines & RAM strategy
 

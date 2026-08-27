@@ -32,10 +32,20 @@ static RPC_ID: AtomicU64 = AtomicU64::new(1);
 // Backend
 // ---------------------------------------------------------------------------
 
+/// A live browser tab kept open so actions (click/type/submit) can run
+/// against the page an agent is currently looking at.
+#[derive(Clone)]
+pub struct ActivePage {
+    pub port: u16,
+    pub target_id: String,
+    pub ws_url: String,
+}
+
 /// CDP backend with lazy Chromium spawn + idle suspension.
 pub struct CdpBackend {
     config: Config,
     inner: tokio::sync::Mutex<Option<CdpBrowser>>,
+    active: tokio::sync::Mutex<Option<ActivePage>>,
     last_used: Mutex<Instant>,
     shutdown: CancellationToken,
 }
@@ -45,6 +55,7 @@ impl CdpBackend {
         Self {
             config,
             inner: tokio::sync::Mutex::new(None),
+            active: tokio::sync::Mutex::new(None),
             last_used: Mutex::new(Instant::now()),
             shutdown: CancellationToken::new(),
         }
@@ -80,6 +91,7 @@ impl CdpBackend {
         let mut guard = self.inner.lock().await;
         if let Some(b) = guard.take() {
             b.kill();
+            *self.active.lock().await = None;
             tracing::info!("cdp: Chromium suspended (RAM released)");
         }
     }
@@ -123,21 +135,49 @@ impl BrowserBackend for CdpBackend {
     }
 
     async fn navigate(&self, _session: &Session, url: &str) -> Result<Page> {
-        // Lazily spawn Chromium on first use. (Do not hold the guard across
-        // awaits that need `self` — everything is cloned before the await.)
-        let (port, _browser_ws) = {
+        let active = self.ensure_page(url).await?;
+        let result = navigate_and_render(&active.ws_url, url, self.config.js_wait_ms).await;
+        if result.is_ok() {
+            let ram = self.memory_usage_mb().await;
+            if ram > self.config.memory_budget_mb {
+                tracing::warn!(
+                    "cdp: actual Chromium RAM {ram} MB exceeds budget {} MB — consider --engine fetch for this site or raise LIGHTBROWSE_MEMORY_MB",
+                    self.config.memory_budget_mb
+                );
+            }
+        }
+        let (html, title, final_url) = result?;
+        self.touch();
+        Ok(Page {
+            url: final_url,
+            title,
+            status: 200,
+            headers: Default::default(),
+            html,
+            truncated: false,
+            mime: Some("text/html".into()),
+        })
+    }
+}
+
+impl CdpBackend {
+    /// Make sure Chromium is alive and a tab exists; returns the active page.
+    async fn ensure_page(&self, url: &str) -> Result<ActivePage> {
+        // Reuse the open tab if we have one.
+        if let Some(p) = self.active.lock().await.clone() {
+            tracing::debug!("cdp: reusing active tab for {url}");
+            return Ok(p);
+        }
+        tracing::debug!("cdp: creating new tab for {url}");
+        let port = {
             let mut guard = self.inner.lock().await;
             if guard.is_none() {
                 tracing::info!("cdp: spawning headless Chromium (lazy)");
                 *guard = Some(CdpBrowser::spawn(&self.config).await?);
             }
-            let b = guard.as_ref().expect("just spawned");
-            (b.port, b.ws_url.clone())
+            guard.as_ref().expect("just spawned").port
         };
-
         let http = reqwest::Client::new();
-
-        // Create a tab and attach to its debugger websocket.
         let target = http
             .put(format!(
                 "http://127.0.0.1:{port}/json/new?{}",
@@ -159,38 +199,91 @@ impl BrowserBackend for CdpBackend {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+        let active = ActivePage {
+            port,
+            target_id,
+            ws_url: page_ws,
+        };
+        *self.active.lock().await = Some(active.clone());
+        tracing::info!("cdp: active tab set (target={})", active.target_id);
+        Ok(active)
+    }
 
-        let result = navigate_and_render(&page_ws, url, self.config.js_wait_ms).await;
+    /// The URL the active tab is currently showing (via JS).
+    pub async fn current_url(&self) -> Option<String> {
+        let ws = self.active.lock().await.clone()?.ws_url;
+        let v = evaluate_js(&ws, "location.href").await.ok()?;
+        v.as_str().map(|s| s.to_string())
+    }
 
-        // Honesty check: report when real RAM exceeds the configured budget.
-        if result.is_ok() {
-            let ram = self.memory_usage_mb().await;
-            if ram > self.config.memory_budget_mb {
-                tracing::warn!(
-                    "cdp: actual Chromium RAM {ram} MB exceeds budget {} MB — consider --engine fetch for this site or raise LIGHTBROWSE_MEMORY_MB",
-                    self.config.memory_budget_mb
-                );
-            }
-        }
-
-        // Close the tab regardless of outcome.
-        let _ = http
-            .get(format!("http://127.0.0.1:{port}/json/close/{target_id}"))
-            .send()
-            .await;
-
-        let (html, title, final_url) = result?;
+    /// Evaluate JS on the active tab; returns the result value.
+    pub async fn evaluate(&self, expr: &str) -> Result<Value> {
+        let active = self.active.lock().await.clone().ok_or_else(|| {
+            tracing::warn!("cdp: evaluate called with no active page");
+            Error::NotInitialized("no active page — navigate first".into())
+        })?;
+        let v = evaluate_js(&active.ws_url, expr).await?;
         self.touch();
+        Ok(v)
+    }
 
-        Ok(Page {
-            url: final_url,
-            title,
-            status: 200,
-            headers: Default::default(),
-            html,
-            truncated: false,
-            mime: Some("text/html".into()),
-        })
+    /// Click an element by CSS selector (from a snapshot's `selector` field).
+    pub async fn click(&self, selector: &str) -> Result<Value> {
+        let sel = serde_json::to_string(selector).map_err(|e| Error::Parse(e.to_string()))?;
+        self.evaluate(&format!(
+            "(() => {{ const el = document.querySelector({sel}); if (!el) return {{ok:false, reason:'element not found'}};              el.scrollIntoView({{block:'center'}}); el.focus(); el.click(); return {{ok:true, tag: el.tagName.toLowerCase()}}; }})()"
+        ))
+        .await
+    }
+
+    /// Type text into an input/textarea (React-compatible value setter).
+    pub async fn type_text(&self, selector: &str, text: &str) -> Result<Value> {
+        let sel = serde_json::to_string(selector).map_err(|e| Error::Parse(e.to_string()))?;
+        let txt = serde_json::to_string(text).map_err(|e| Error::Parse(e.to_string()))?;
+        self.evaluate(&format!(
+            "(() => {{ const el = document.querySelector({sel}); if (!el) return {{ok:false, reason:'element not found'}};              el.focus(); const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;              const setter = Object.getOwnPropertyDescriptor(proto, 'value').set; setter.call(el, {txt});              el.dispatchEvent(new Event('input', {{bubbles:true}})); el.dispatchEvent(new Event('change', {{bubbles:true}}));              return {{ok:true, value: el.value}}; }})()"
+        ))
+        .await
+    }
+
+    /// Submit the form containing `selector` (or the form itself).
+    pub async fn submit(&self, selector: &str) -> Result<Value> {
+        let sel = serde_json::to_string(selector).map_err(|e| Error::Parse(e.to_string()))?;
+        self.evaluate(&format!(
+            "(() => {{ const el = document.querySelector({sel}); if (!el) return {{ok:false, reason:'element not found'}};              const form = el.tagName === 'FORM' ? el : el.form; if (!form) return {{ok:false, reason:'no parent form'}};              form.requestSubmit(); return {{ok:true, action: form.action || null}}; }})()"
+        ))
+        .await
+    }
+
+    /// Serialize the active tab's rendered DOM (html, title, url).
+    pub async fn current_dom(&self) -> Result<(String, String, String)> {
+        let active = self
+            .active
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| Error::NotInitialized("no active page — navigate first".into()))?;
+        let expr = "JSON.stringify({title: document.title, url: location.href, html: document.documentElement.outerHTML})";
+        let v = evaluate_js(&active.ws_url, expr).await?;
+        let parsed: Value = serde_json::from_str(v.as_str().unwrap_or("{}"))
+            .map_err(|e| Error::Parse(e.to_string()))?;
+        Ok((
+            parsed
+                .get("html")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            parsed
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            parsed
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        ))
     }
 }
 
@@ -201,7 +294,6 @@ impl BrowserBackend for CdpBackend {
 struct CdpBrowser {
     child: Child,
     port: u16,
-    ws_url: String,
     _user_data_dir: std::path::PathBuf,
 }
 
@@ -278,12 +370,11 @@ impl CdpBrowser {
 
         // Wait for the DevTools endpoint to come up.
         let http = reqwest::Client::new();
-        let ws_url = wait_for_devtools(&http, port).await?;
+        wait_for_devtools(&http, port).await?;
 
         Ok(Self {
             child,
             port,
-            ws_url,
             _user_data_dir: user_data,
         })
     }
@@ -471,6 +562,25 @@ async fn navigate_and_render(
 
     let _ = ws.close(None).await;
     Ok((html, title, final_url))
+}
+
+/// One-shot JS evaluation on a page websocket (opens + closes its own ws).
+async fn evaluate_js(ws_url: &str, expression: &str) -> Result<Value> {
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
+        .await
+        .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+    let result = rpc_expect(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({ "expression": expression, "returnByValue": true, "awaitPromise": true }),
+    )
+    .await?;
+    let _ = ws.close(None).await;
+    result
+        .get("result")
+        .and_then(|r| r.get("value"))
+        .cloned()
+        .ok_or_else(|| Error::Parse("evaluate: no value returned".into()))
 }
 
 /// Send a command and wait for its response (ignoring events in between).

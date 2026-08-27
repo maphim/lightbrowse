@@ -22,7 +22,7 @@
 - [x] Readability text, links, forms, meta, headings extractors
 - [x] Accessibility snapshot with stable `uid`s
 - [x] CSS `selector` on snapshot nodes (for actions)
-- [~] **Intent-aware `ask`** — pass a question, get relevant blocks + score
+- [x] **Intent-aware `ask`** — pass a question, get relevant blocks + score
 - [ ] **Page summarization** — optional LLM-less extractive summary
 - [ ] **Diff mode** — compare two versions of a page
 - [ ] **Multi-page research** — batch N URLs, aggregated answer
@@ -38,23 +38,24 @@
 - [x] **URL cache** with TTL — skip re-fetching what we already have
 - [x] **Search what we read** — `memory/search` over page blocks (BM25)
 - [x] **Recent history** — `memory/recent`
-- [ ] **Session persistence** — survive restarts (file-backed store)
-- [ ] **Entity extraction** — emit entities/facts to host memory (MCP hook)
+- [x] **Session persistence** (file-backed store)
+- [x] **Entity extraction** — emit entities/facts to host memory (MCP hook) — survive restarts (file-backed store)
+
 
 ## Actions (make the browser *do* things)
 
-- [ ] **click(selector)** via CDP — currently: `document.querySelector().click()`
-- [ ] **type(selector, text)** — native value setter + input/change events
-- [ ] **submit(selector)** — `form.requestSubmit()`
+- [x] **click(selector)** via CDP — `document.querySelector().click()`
+- [x] **type(selector, text)** — native value setter + input/change events
+- [x] **submit(selector)** — `form.requestSubmit()`
 - [ ] **screenshot** — `Page.captureScreenshot` (CDP)
 - [ ] **session cookies across actions** — persist logged-in state
 - [ ] **waits** — wait-for-selector / network-idle helpers
 
 ## Interfaces
 
-- [x] CLI (`fetch`, `extract`, `snapshot`, `search`, `ask`, `serve`, `mcp`)
-- [x] MCP server — navigate/extract/snapshot/search/ask/memory tools
-- [x] HTTP API — `/v1/{page,extract,snapshot,search,ask,memory}`
+- [x] CLI (`fetch`, `extract`, `snapshot`, `search`, `ask`, `memory-*`, `serve`, `mcp`)
+- [x] MCP server — navigate/extract/snapshot/search/ask/memory/click/type/submit
+- [x] HTTP API — `/v1/{page,extract,snapshot,search,ask,memory,click,type,submit,current}`
 - [ ] WebSocket streaming for long-running research tasks
 - [ ] Optional GUI (wry) — off by default, for humans who want to watch
 

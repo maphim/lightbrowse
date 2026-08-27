@@ -1125,6 +1125,7 @@ dependencies = [
 name = "lightbrowse-mcp"
 version = "0.1.0"
 dependencies = [
+ "lightbrowse-cdp",
  "lightbrowse-core",
  "lightbrowse-fetch",
  "lightbrowse-memory",

@@ -253,6 +253,39 @@ impl McpServer {
                 let pages = m.recent(limit).map_err(|e| e.to_string())?;
                 Ok(pretty(&json!({ "pages": pages })))
             }
+            "page/current" => {
+                let cdp = require_cdp(&s)?;
+                let (html, title, url) = cdp.current_dom().await.map_err(|e| e.to_string())?;
+                let text = extract::extract_text(&html);
+                Ok(pretty(&json!({
+                    "url": url,
+                    "title": title,
+                    "word_count": text.word_count,
+                    "text_preview": text.text.chars().take(3000).collect::<String>(),
+                })))
+            }
+            "click" => {
+                let selector = req_str(args, "selector")?;
+                let cdp = require_cdp(&s)?;
+                let res = cdp.click(&selector).await.map_err(|e| e.to_string())?;
+                Ok(pretty(&json!({ "selector": selector, "result": res })))
+            }
+            "type" => {
+                let selector = req_str(args, "selector")?;
+                let text = req_str(args, "text")?;
+                let cdp = require_cdp(&s)?;
+                let res = cdp
+                    .type_text(&selector, &text)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(pretty(&json!({ "selector": selector, "result": res })))
+            }
+            "submit" => {
+                let selector = req_str(args, "selector")?;
+                let cdp = require_cdp(&s)?;
+                let res = cdp.submit(&selector).await.map_err(|e| e.to_string())?;
+                Ok(pretty(&json!({ "selector": selector, "result": res })))
+            }
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -270,6 +303,19 @@ async fn nav_page(
         .lock()
         .map_err(|_| "session lock poisoned".to_string())?
         .clone();
+    // engine=cdp must bypass the cache: the tab stays open so click/type/
+    // submit can act on it. Cached pages are static snapshots — no tab.
+    if engine == Engine::Cdp {
+        return lightbrowse_core::service::navigate(
+            &*s.backend,
+            s.cdp.as_deref(),
+            &session,
+            url,
+            engine,
+        )
+        .await
+        .map_err(|e| e.to_string());
+    }
     match &s.memory {
         Some(m) => navigate_cached(m, &*s.backend, s.cdp.as_deref(), &session, url, engine, 300)
             .await
@@ -285,6 +331,17 @@ async fn nav_page(
         .await
         .map_err(|e| e.to_string()),
     }
+}
+
+/// Downcast the shared CDP backend so actions can run on the active tab.
+fn require_cdp(s: &McpState) -> Result<&lightbrowse_cdp::CdpBackend, String> {
+    let cdp = s
+        .cdp
+        .as_ref()
+        .ok_or("cdp engine not available — start with --engine cdp or auto")?;
+    cdp.as_any()
+        .and_then(|b| b.downcast_ref::<lightbrowse_cdp::CdpBackend>())
+        .ok_or("cdp backend is not a CdpBackend".into())
 }
 
 fn parse_engine_arg(args: &Map<String, Value>, default: Engine) -> Result<Engine, String> {
@@ -438,6 +495,45 @@ fn tools_schema() -> Vec<Value> {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 8 }
                 },
                 "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "page/current",
+            "description": "Read the ACTIVE CDP tab: url, title, rendered text preview. Use after click/type/submit to see the result.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "click",
+            "description": "Click an element on the ACTIVE CDP tab using its CSS selector (from snapshot). Navigate with engine=cdp first.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string", "description": "CSS selector from a snapshot node" }
+                },
+                "required": ["selector"]
+            }
+        }),
+        json!({
+            "name": "type",
+            "description": "Type text into an input/textarea on the ACTIVE CDP tab (React-compatible events).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string" },
+                    "text": { "type": "string" }
+                },
+                "required": ["selector", "text"]
+            }
+        }),
+        json!({
+            "name": "submit",
+            "description": "Submit the form containing an element on the ACTIVE CDP tab.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string" }
+                },
+                "required": ["selector"]
             }
         }),
         json!({

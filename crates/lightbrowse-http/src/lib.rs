@@ -47,6 +47,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/ask", get(ask))
         .route("/v1/memory/search", get(memory_search))
         .route("/v1/memory/recent", get(memory_recent))
+        .route("/v1/current", get(current_page))
+        .route("/v1/click", get(click_action))
+        .route("/v1/type", get(type_action))
+        .route("/v1/submit", get(submit_action))
         .with_state(state)
 }
 
@@ -106,6 +110,17 @@ async fn nav_page(
         .lock()
         .map_err(|_| ApiError::internal("session lock poisoned"))?
         .clone();
+    if engine == Engine::Cdp {
+        return lightbrowse_core::service::navigate(
+            &*state.backend,
+            state.cdp.as_deref(),
+            &session,
+            url,
+            engine,
+        )
+        .await
+        .map_err(ApiError::from);
+    }
     navigate_cached(
         &state.memory,
         &*state.backend,
@@ -277,6 +292,72 @@ async fn memory_recent(
         .recent(q.limit.unwrap_or(10).clamp(1, 50))
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "pages": pages })).into_response())
+}
+
+#[derive(Deserialize)]
+struct ActionQuery {
+    selector: String,
+    text: Option<String>,
+}
+
+/// Downcast the shared CDP backend for stateful actions.
+fn require_cdp(state: &AppState) -> Result<&lightbrowse_cdp::CdpBackend, ApiError> {
+    let cdp = state
+        .cdp
+        .as_ref()
+        .ok_or_else(|| ApiError::bad_request("cdp engine not available"))?;
+    cdp.as_any()
+        .and_then(|b| b.downcast_ref::<lightbrowse_cdp::CdpBackend>())
+        .ok_or_else(|| ApiError::internal("cdp backend type mismatch"))
+}
+
+async fn current_page(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let (html, title, url) = require_cdp(&state)?
+        .current_dom()
+        .await
+        .map_err(ApiError::from)?;
+    let t = extract::extract_text(&html);
+    Ok(Json(json!({
+        "url": url,
+        "title": title,
+        "word_count": t.word_count,
+        "text_preview": t.text.chars().take(3000).collect::<String>(),
+    }))
+    .into_response())
+}
+
+async fn click_action(
+    State(state): State<AppState>,
+    Query(q): Query<ActionQuery>,
+) -> Result<Response, ApiError> {
+    let res = require_cdp(&state)?
+        .click(&q.selector)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "selector": q.selector, "result": res })).into_response())
+}
+
+async fn type_action(
+    State(state): State<AppState>,
+    Query(q): Query<ActionQuery>,
+) -> Result<Response, ApiError> {
+    let text = q.text.as_deref().unwrap_or("");
+    let res = require_cdp(&state)?
+        .type_text(&q.selector, text)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "selector": q.selector, "result": res })).into_response())
+}
+
+async fn submit_action(
+    State(state): State<AppState>,
+    Query(q): Query<ActionQuery>,
+) -> Result<Response, ApiError> {
+    let res = require_cdp(&state)?
+        .submit(&q.selector)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "selector": q.selector, "result": res })).into_response())
 }
 
 // ---------------------------------------------------------------------------
