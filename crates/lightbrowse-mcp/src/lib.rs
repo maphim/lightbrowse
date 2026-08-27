@@ -224,7 +224,7 @@ impl McpServer {
                 let page = nav_page(&s, &url, engine).await?;
                 let m = s.memory.as_ref().ok_or("browsing memory disabled")?;
                 m.store_page(&page).map_err(|e| e.to_string())?;
-                let hits = m.search(&question, 6).map_err(|e| e.to_string())?;
+                let hits = m.search(&question, 6, None).map_err(|e| e.to_string())?;
                 Ok(pretty(&json!({
                     "url": page.url,
                     "title": extract::extract_meta(&page.html).title,
@@ -240,7 +240,7 @@ impl McpServer {
                     .unwrap_or(8)
                     .clamp(1, 50) as usize;
                 let m = s.memory.as_ref().ok_or("browsing memory disabled")?;
-                let hits = m.search(&query, limit).map_err(|e| e.to_string())?;
+                let hits = m.search(&query, limit, None).map_err(|e| e.to_string())?;
                 Ok(pretty(&json!({ "query": query, "hits": hits })))
             }
             "memory/recent" => {
@@ -302,6 +302,31 @@ impl McpServer {
                     }
                     None => Err(format!("runbook '{name}' not found")),
                 }
+            }
+            "research" => {
+                let topic = req_str(args, "topic")?;
+                let urls: Vec<String> = args
+                    .get("urls")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+                if urls.is_empty() {
+                    return Err("urls[] is required".into());
+                }
+                let engine = parse_engine_arg(args, s.engine)?;
+                let mut results = Vec::new();
+                for url in &urls {
+                    let page = nav_page(&s, url, engine).await?;
+                    if let Some(m) = &s.memory {
+                        m.store_page(&page).map_err(|e| e.to_string())?;
+                        let hits = m.search(&topic, 4, Some(&page.url)).map_err(|e| e.to_string())?;
+                        results.push(json!({
+                            "url": page.url,
+                            "title": extract::extract_meta(&page.html).title,
+                            "hits": hits,
+                        }));
+                    }
+                }
+                Ok(pretty(&json!({ "topic": topic, "pages": results.len(), "results": results })))
             }
             "runbook/run" => {
                 let name = req_str(args, "name")?;
@@ -600,6 +625,19 @@ fn tools_schema() -> Vec<Value> {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 8 }
                 },
                 "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "research",
+            "description": "Multi-page research: read several URLs about one topic and return the most relevant blocks from each, aggregated. Uses memory cache where possible.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "topic": { "type": "string" },
+                    "urls": { "type": "array", "items": { "type": "string" } },
+                    "engine": { "type": "string", "enum": ["auto", "fetch", "cdp"] }
+                },
+                "required": ["topic", "urls"]
             }
         }),
         json!({

@@ -118,6 +118,17 @@ enum Cmd {
     },
     /// Browsing-memory stats.
     MemoryStats,
+    /// Multi-page research: read several URLs about one topic and aggregate
+    /// the most relevant blocks from each (pairs with the memory cache).
+    Research {
+        topic: String,
+        /// One or more URLs to read.
+        urls: Vec<String>,
+        #[arg(long, default_value_t = 4)]
+        per_page: usize,
+        #[arg(long, default_value = "auto", value_parser = parse_engine)]
+        engine: Engine,
+    },
 }
 
 #[tokio::main]
@@ -270,7 +281,7 @@ async fn main() -> lightbrowse_core::Result<()> {
             )
             .await?;
             memory.store_page(&page).ok();
-            let hits = memory.search(&question, 6).unwrap_or_default();
+            let hits = memory.search(&question, 6, None).unwrap_or_default();
             let meta = extract::extract_meta(&page.html);
             print_json(&json!({
                 "url": page.url,
@@ -281,7 +292,7 @@ async fn main() -> lightbrowse_core::Result<()> {
             }));
         }
         Cmd::MemorySearch { query, limit } => {
-            let hits = memory.search(&query, limit)?;
+            let hits = memory.search(&query, limit, None)?;
             print_json(&json!({ "query": query, "hits": hits }));
         }
         Cmd::MemoryRecent { limit } => {
@@ -293,6 +304,27 @@ async fn main() -> lightbrowse_core::Result<()> {
                 "pages": memory.page_count().unwrap_or(0),
                 "memory_db": memory_db_path(cli.memory.as_deref()).display().to_string(),
             }));
+        }
+        Cmd::Research {
+            topic,
+            urls,
+            per_page,
+            engine,
+        } => {
+            let mut results = Vec::new();
+            for url in &urls {
+                let (page, _) =
+                    nav_cached(&memory, &*fetch, Some(&*cdp_trait), &session, url, engine, ttl).await?;
+                memory.store_page(&page).ok();
+                let hits = memory.search(&topic, per_page, Some(&page.url)).unwrap_or_default();
+                let title = extract::extract_meta(&page.html).title;
+                results.push(json!({
+                    "url": page.url,
+                    "title": title,
+                    "hits": hits,
+                }));
+            }
+            print_json(&json!({ "topic": topic, "pages": results.len(), "results": results }));
         }
         Cmd::Serve {
             port,

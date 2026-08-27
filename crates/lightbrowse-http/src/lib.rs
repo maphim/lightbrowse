@@ -254,7 +254,7 @@ async fn ask(
     state.memory.store_page(&p).map_err(ApiError::from)?;
     let hits = state
         .memory
-        .search(&q.question, 6)
+        .search(&q.question, 6, None)
         .map_err(ApiError::from)?;
     let meta = extract::extract_meta(&p.html);
     Ok(Json(json!({
@@ -278,7 +278,7 @@ async fn memory_search(
 ) -> Result<Response, ApiError> {
     let hits = state
         .memory
-        .search(&q.q, q.limit.unwrap_or(8).clamp(1, 50))
+        .search(&q.q, q.limit.unwrap_or(8).clamp(1, 50), None)
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "query": q.q, "hits": hits })).into_response())
 }

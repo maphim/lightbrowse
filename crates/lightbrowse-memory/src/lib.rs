@@ -232,21 +232,41 @@ impl MemoryStore {
 
     /// BM25 search over everything we've read. Falls back to a token
     /// substring scan when FTS5 finds nothing (e.g. stopword-heavy queries).
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+    ///
+    /// Pass `page_url` to scope results to a single page (research mode).
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        page_url: Option<&str>,
+    ) -> Result<Vec<SearchHit>> {
         let conn = self.conn.lock().unwrap();
 
         // 1) FTS5 BM25 (all tokens must match).
         let mut out = Vec::new();
-        if let Ok(mut stmt) = conn.prepare(
+        let sql = if page_url.is_some() {
+            "SELECT p.url, p.title, b.text, bm25(blocks_fts)
+             FROM blocks_fts
+             JOIN blocks b ON b.id = blocks_fts.rowid
+             JOIN pages p ON p.id = b.page_id
+             WHERE blocks_fts MATCH ?1 AND p.url = ?3
+             ORDER BY bm25(blocks_fts)
+             LIMIT ?2"
+        } else {
             "SELECT p.url, p.title, b.text, bm25(blocks_fts)
              FROM blocks_fts
              JOIN blocks b ON b.id = blocks_fts.rowid
              JOIN pages p ON p.id = b.page_id
              WHERE blocks_fts MATCH ?1
              ORDER BY bm25(blocks_fts)
-             LIMIT ?2",
-        ) {
-            if let Ok(rows) = stmt.query_map(params![query, limit as i64], |r| {
+             LIMIT ?2"
+        };
+        if let Ok(mut stmt) = conn.prepare(sql) {
+            let qparams: Vec<String> = vec![query.to_string(), limit.to_string()]
+                .into_iter()
+                .chain(page_url.map(|u| u.to_string()))
+                .collect();
+            if let Ok(rows) = stmt.query_map(rusqlite::params_from_iter(qparams), |r| {
                 Ok(SearchHit {
                     url: r.get(0)?,
                     title: r.get(1)?,
@@ -289,6 +309,11 @@ impl MemoryStore {
         let mut scored: Vec<(f64, SearchHit)> = Vec::new();
         for r in rows {
             let (url, title, text) = r.map_err(|e| Error::Parse(e.to_string()))?;
+            if let Some(scope) = page_url {
+                if url != scope {
+                    continue;
+                }
+            }
             let lower = text.to_lowercase();
             let matched = tokens.iter().filter(|t| lower.contains(t.as_str())).count();
             if matched > 0 {
@@ -474,7 +499,7 @@ mod tests {
             "<html><body><h1>Browsers</h1><p>Chromium renders JavaScript for the browser.</p></body></html>",
         ))
         .unwrap();
-        let hits = m.search("async runtime", 5).unwrap();
+        let hits = m.search("async runtime", 5, None).unwrap();
         assert!(!hits.is_empty());
         assert!(hits[0].url.contains("rust"));
     }
