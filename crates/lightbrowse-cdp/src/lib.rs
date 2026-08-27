@@ -270,8 +270,8 @@ impl CdpBrowser {
             ]);
         }
         cmd.stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .stdin(Stdio::null());
+            .stderr(Stdio::null())
+            .stdin(Stdio::null());
         let child = cmd
             .spawn()
             .map_err(|e| Error::Transport(format!("failed to launch Chrome ({chrome}): {e}")))?;

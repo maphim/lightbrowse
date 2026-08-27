@@ -43,6 +43,9 @@ pub struct SnapshotNode {
     pub checked: Option<bool>,
     pub alt: Option<String>,
     pub level: Option<u8>,
+    /// CSS selector path from the document root — lets an agent act on this
+    /// node (click/type/submit) via `document.querySelector`.
+    pub selector: Option<String>,
     pub children: Vec<SnapshotNode>,
 }
 
@@ -108,6 +111,50 @@ fn role_for(elm: &ElementRef) -> Option<String> {
         _ => return None,
     };
     Some(role.to_string())
+}
+
+/// Build a unique-ish CSS selector path for an element, e.g.
+/// `body > main:nth-child(2) > button:nth-child(1)`.
+/// Stops early at an element with a valid `id` (shortest robust path).
+fn css_path(elm: &ElementRef) -> String {
+    fn is_css_ident(s: &str) -> bool {
+        let mut chars = s.chars();
+        match chars.next() {
+            Some(c) if c.is_ascii_alphabetic() || c == '_' || c == '-' => {}
+            _ => return false,
+        }
+        chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = Some(*elm);
+    while let Some(e) = cur {
+        let node = e.value();
+        let name = node.name();
+        if let Some(id) = node.attr("id") {
+            if is_css_ident(id) {
+                parts.push(format!("#{id}"));
+                break;
+            }
+        }
+        // nth-child position among element siblings.
+        let mut idx: usize = 1;
+        let mut prev = e.prev_sibling();
+        while let Some(sib) = prev {
+            if sib.value().is_element() {
+                idx += 1;
+            }
+            prev = sib.prev_sibling();
+        }
+        parts.push(format!("{name}:nth-child({idx})"));
+        cur = e.parent().and_then(ElementRef::wrap);
+    }
+    parts.reverse();
+    if parts.is_empty() {
+        "body".into()
+    } else {
+        parts.join(" > ")
+    }
 }
 
 fn heading_level(tag: &str) -> Option<u8> {
@@ -234,6 +281,7 @@ fn build_node(elm: &ElementRef, ctx: &mut Ctx, depth: usize) -> Option<SnapshotN
             .or_else(|| e.attr("aria-checked").map(|v| v == "true")),
         alt: e.attr("alt").map(|s| s.to_string()),
         level: heading_level(tag),
+        selector: Some(css_path(elm)),
         children: collect_children(elm, ctx, depth),
     };
 
@@ -262,6 +310,7 @@ fn collect_children_only(elm: &ElementRef, ctx: &mut Ctx, depth: usize) -> Optio
             checked: None,
             alt: None,
             level: None,
+            selector: None,
             children,
         })
     }
@@ -314,5 +363,22 @@ mod tests {
         }
         let unique: std::collections::HashSet<u64> = uids.iter().copied().collect();
         assert_eq!(unique.len(), uids.len());
+        // Every interactive node carries a usable CSS selector.
+        fn find_selector(n: &SnapshotNode, acc: &mut Vec<String>) {
+            if let Some(s) = &n.selector {
+                acc.push(s.clone());
+            }
+            for c in &n.children {
+                find_selector(c, acc);
+            }
+        }
+        let mut sels = Vec::new();
+        for n in &t.nodes {
+            find_selector(n, &mut sels);
+        }
+        assert!(!sels.is_empty());
+        assert!(sels
+            .iter()
+            .any(|s| s.contains("go") || s.contains("button")));
     }
 }

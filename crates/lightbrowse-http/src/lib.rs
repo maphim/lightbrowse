@@ -21,9 +21,9 @@ use axum::{Json, Router};
 use lightbrowse_core::backend::BrowserBackend;
 use lightbrowse_core::config::{Config, Engine};
 use lightbrowse_core::extract::{self, ExtractMode};
-use lightbrowse_core::service;
 use lightbrowse_core::session::Session;
 use lightbrowse_core::snapshot::{self, SnapshotOptions};
+use lightbrowse_memory::{navigate_cached, MemoryStore};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -34,6 +34,7 @@ pub struct AppState {
     pub session: Arc<Mutex<Session>>,
     pub engine: Engine,
     pub config: Arc<Config>,
+    pub memory: Arc<MemoryStore>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -43,6 +44,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/extract", get(extract))
         .route("/v1/snapshot", get(snapshot))
         .route("/v1/search", get(search))
+        .route("/v1/ask", get(ask))
+        .route("/v1/memory/search", get(memory_search))
+        .route("/v1/memory/recent", get(memory_recent))
         .with_state(state)
 }
 
@@ -102,9 +106,18 @@ async fn nav_page(
         .lock()
         .map_err(|_| ApiError::internal("session lock poisoned"))?
         .clone();
-    service::navigate(&*state.backend, state.cdp.as_deref(), &session, url, engine)
-        .await
-        .map_err(ApiError::from)
+    navigate_cached(
+        &state.memory,
+        &*state.backend,
+        state.cdp.as_deref(),
+        &session,
+        url,
+        engine,
+        300,
+    )
+    .await
+    .map(|(p, _)| p)
+    .map_err(ApiError::from)
 }
 
 fn parse_engine(s: Option<&str>, default: Engine) -> Result<Engine, ApiError> {
@@ -203,6 +216,67 @@ async fn search(
     let mut results = extract::extract_search_results(&p.html);
     results.truncate(q.max_results.unwrap_or(8).clamp(1, 20));
     Ok(Json(json!({ "query": q.q, "results": results })).into_response())
+}
+
+#[derive(Deserialize)]
+struct AskQuery {
+    url: String,
+    question: String,
+    engine: Option<String>,
+}
+
+async fn ask(
+    State(state): State<AppState>,
+    Query(q): Query<AskQuery>,
+) -> Result<Response, ApiError> {
+    let engine = parse_engine(q.engine.as_deref(), state.engine)?;
+    let p = nav_page(&state, &q.url, engine).await?;
+    state.memory.store_page(&p).map_err(ApiError::from)?;
+    let hits = state
+        .memory
+        .search(&q.question, 6)
+        .map_err(ApiError::from)?;
+    let meta = extract::extract_meta(&p.html);
+    Ok(Json(json!({
+        "url": p.url,
+        "title": meta.title,
+        "question": q.question,
+        "hits": hits,
+    }))
+    .into_response())
+}
+
+#[derive(Deserialize)]
+struct MemorySearchQuery {
+    q: String,
+    limit: Option<usize>,
+}
+
+async fn memory_search(
+    State(state): State<AppState>,
+    Query(q): Query<MemorySearchQuery>,
+) -> Result<Response, ApiError> {
+    let hits = state
+        .memory
+        .search(&q.q, q.limit.unwrap_or(8).clamp(1, 50))
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "query": q.q, "hits": hits })).into_response())
+}
+
+#[derive(Deserialize)]
+struct MemoryRecentQuery {
+    limit: Option<usize>,
+}
+
+async fn memory_recent(
+    State(state): State<AppState>,
+    Query(q): Query<MemoryRecentQuery>,
+) -> Result<Response, ApiError> {
+    let pages = state
+        .memory
+        .recent(q.limit.unwrap_or(10).clamp(1, 50))
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "pages": pages })).into_response())
 }
 
 // ---------------------------------------------------------------------------

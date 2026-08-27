@@ -6,6 +6,8 @@
 //! lightbrowse extract  https://example.com --mode links
 //! lightbrowse snapshot https://example.com
 //! lightbrowse search   "rust async runtime"
+//! lightbrowse ask      https://example.com "what is this page about"
+//! lightbrowse memory-search "tokio async"
 //! lightbrowse serve    --port 8787 --engine auto
 //! lightbrowse mcp
 //! ```
@@ -17,9 +19,9 @@ use lightbrowse_cdp::CdpBackend;
 use lightbrowse_core::backend::BrowserBackend;
 use lightbrowse_core::config::{Config, Engine};
 use lightbrowse_core::extract::{self, ExtractMode};
-use lightbrowse_core::service;
 use lightbrowse_core::snapshot::{self, SnapshotOptions};
 use lightbrowse_fetch::FetchBackend;
+use lightbrowse_memory::{navigate_cached, MemoryStore};
 use serde_json::{json, Value};
 
 #[derive(Parser)]
@@ -29,6 +31,13 @@ use serde_json::{json, Value};
     about = "A featherweight, AI-native browser in Rust (headless-first)"
 )]
 struct Cli {
+    /// Browsing-memory database path (default: ~/.cache/lightbrowse/memory.db).
+    /// Read pages are cached + indexed here; `ask` and `memory-*` use it.
+    #[arg(long, global = true)]
+    memory: Option<std::path::PathBuf>,
+    /// Cache TTL in seconds for repeated fetches (default 300).
+    #[arg(long, global = true, default_value_t = 300)]
+    cache_ttl: i64,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -83,6 +92,27 @@ enum Cmd {
         #[arg(long, default_value = "auto", value_parser = parse_engine)]
         engine: Engine,
     },
+    /// Ask a question about a page — fetch (or reuse cache), then return the
+    /// most relevant text blocks with scores (intent-aware reading).
+    Ask {
+        url: String,
+        question: String,
+        #[arg(long, default_value = "auto", value_parser = parse_engine)]
+        engine: Engine,
+    },
+    /// Search everything this browser has read (BM25 over page blocks).
+    MemorySearch {
+        query: String,
+        #[arg(long, default_value_t = 8)]
+        limit: usize,
+    },
+    /// List the most recently read pages.
+    MemoryRecent {
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+    },
+    /// Browsing-memory stats.
+    MemoryStats,
 }
 
 #[tokio::main]
@@ -109,8 +139,6 @@ async fn main() -> lightbrowse_core::Result<()> {
     {
         config.idle_timeout_secs = *t;
     }
-    // A long-lived serve/MCP process should suspend idle Chromium promptly;
-    // one-shot commands do not spawn Chromium unless the page needs JS.
     if matches!(cli.cmd, Cmd::Serve { .. } | Cmd::Mcp { .. }) {
         config.idle_timeout_secs = config.idle_timeout_secs.min(60);
     }
@@ -121,11 +149,21 @@ async fn main() -> lightbrowse_core::Result<()> {
     let cdp_trait: Arc<dyn BrowserBackend> = cdp.clone();
 
     let session = FetchBackend::new_session(Default::default());
+    let memory = open_memory(cli.memory.as_deref());
+    let ttl = cli.cache_ttl;
 
     match cli.cmd {
         Cmd::Fetch { url, raw, engine } => {
-            let page =
-                service::navigate(&*fetch, Some(&*cdp_trait), &session, &url, engine).await?;
+            let (page, cached) = nav_cached(
+                &memory,
+                &*fetch,
+                Some(&*cdp_trait),
+                &session,
+                &url,
+                engine,
+                ttl,
+            )
+            .await?;
             if raw {
                 print!("{}", page.html);
                 return Ok(());
@@ -136,6 +174,7 @@ async fn main() -> lightbrowse_core::Result<()> {
                 "title": t.title,
                 "status": page.status,
                 "engine": engine_name(engine),
+                "cached": cached,
                 "mime": page.mime,
                 "body_bytes": page.body_len(),
                 "truncated": page.truncated,
@@ -146,21 +185,40 @@ async fn main() -> lightbrowse_core::Result<()> {
             print_json(&out);
         }
         Cmd::Extract { url, mode, engine } => {
-            let page =
-                service::navigate(&*fetch, Some(&*cdp_trait), &session, &url, engine).await?;
+            let (page, _) = nav_cached(
+                &memory,
+                &*fetch,
+                Some(&*cdp_trait),
+                &session,
+                &url,
+                engine,
+                ttl,
+            )
+            .await?;
             let mode = parse_mode(&mode)?;
             let data = extract::extract(&page.html, &page.url, mode);
-            print_json(
-                &json!({ "url": page.url, "engine": engine_name(engine), "mode": mode_str(mode), "data": data }),
-            );
+            print_json(&json!({
+                "url": page.url,
+                "engine": engine_name(engine),
+                "mode": mode_str(mode),
+                "data": data
+            }));
         }
         Cmd::Snapshot {
             url,
             max_nodes,
             engine,
         } => {
-            let page =
-                service::navigate(&*fetch, Some(&*cdp_trait), &session, &url, engine).await?;
+            let (page, _) = nav_cached(
+                &memory,
+                &*fetch,
+                Some(&*cdp_trait),
+                &session,
+                &url,
+                engine,
+                ttl,
+            )
+            .await?;
             let opts = SnapshotOptions {
                 max_nodes: max_nodes.unwrap_or(400).clamp(10, 2000),
                 ..SnapshotOptions::default()
@@ -178,15 +236,52 @@ async fn main() -> lightbrowse_core::Result<()> {
             results.truncate(max_results.unwrap_or(8).clamp(1, 20));
             print_json(&json!({ "query": query, "results": results }));
         }
+        Cmd::Ask {
+            url,
+            question,
+            engine,
+        } => {
+            let (page, cached) = nav_cached(
+                &memory,
+                &*fetch,
+                Some(&*cdp_trait),
+                &session,
+                &url,
+                engine,
+                ttl,
+            )
+            .await?;
+            memory.store_page(&page).ok();
+            let hits = memory.search(&question, 6).unwrap_or_default();
+            let meta = extract::extract_meta(&page.html);
+            print_json(&json!({
+                "url": page.url,
+                "title": meta.title,
+                "cached": cached,
+                "question": question,
+                "hits": hits,
+            }));
+        }
+        Cmd::MemorySearch { query, limit } => {
+            let hits = memory.search(&query, limit)?;
+            print_json(&json!({ "query": query, "hits": hits }));
+        }
+        Cmd::MemoryRecent { limit } => {
+            let pages = memory.recent(limit)?;
+            print_json(&json!({ "pages": pages }));
+        }
+        Cmd::MemoryStats => {
+            print_json(&json!({
+                "pages": memory.page_count().unwrap_or(0),
+                "memory_db": memory_db_path(cli.memory.as_deref()).display().to_string(),
+            }));
+        }
         Cmd::Serve {
             port,
             host,
             engine,
-            idle_timeout,
+            idle_timeout: _,
         } => {
-            if let Some(t) = idle_timeout {
-                config.idle_timeout_secs = t;
-            }
             let session = Arc::new(Mutex::new(FetchBackend::new_session(Default::default())));
             let state = lightbrowse_http::AppState {
                 backend: fetch,
@@ -194,16 +289,70 @@ async fn main() -> lightbrowse_core::Result<()> {
                 session,
                 engine,
                 config: Arc::new(config),
+                memory: Arc::new(memory),
             };
             lightbrowse_http::serve(&format!("{host}:{port}"), state).await?;
         }
         Cmd::Mcp { engine } => {
             let session = Arc::new(Mutex::new(FetchBackend::new_session(Default::default())));
-            let server = lightbrowse_mcp::McpServer::new(fetch, Some(cdp_trait), session, engine);
+            let server = lightbrowse_mcp::McpServer::new(
+                fetch,
+                Some(cdp_trait),
+                session,
+                engine,
+                Some(Arc::new(memory)),
+            );
             server.run().await?;
         }
     }
     Ok(())
+}
+
+/// Open the browsing-memory store (file-backed by default).
+fn open_memory(path: Option<&std::path::Path>) -> MemoryStore {
+    let p = memory_db_path(path);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    MemoryStore::open(Some(p.to_str().unwrap_or(":memory:")))
+        .unwrap_or_else(|_| MemoryStore::open(None).expect("in-memory store"))
+}
+
+fn memory_db_path(path: Option<&std::path::Path>) -> std::path::PathBuf {
+    match path {
+        Some(p) => p.to_path_buf(),
+        None => {
+            let base = std::env::var("XDG_CACHE_HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|_| {
+                    std::env::var("HOME")
+                        .map(|h| std::path::PathBuf::from(h).join(".cache"))
+                        .unwrap_or_else(|_| std::env::temp_dir())
+                });
+            base.join("lightbrowse").join("memory.db")
+        }
+    }
+}
+
+/// navigate with memory cache; store failures degrade to direct fetch.
+async fn nav_cached(
+    memory: &MemoryStore,
+    fetch: &dyn BrowserBackend,
+    cdp: Option<&dyn BrowserBackend>,
+    session: &lightbrowse_core::session::Session,
+    url: &str,
+    engine: Engine,
+    ttl: i64,
+) -> lightbrowse_core::Result<(lightbrowse_core::Page, bool)> {
+    match navigate_cached(memory, fetch, cdp, session, url, engine, ttl).await {
+        Ok(v) => Ok(v),
+        Err(e) => {
+            tracing::warn!("memory store degraded, direct fetch: {e}");
+            let page =
+                lightbrowse_core::service::navigate(fetch, cdp, session, url, engine).await?;
+            Ok((page, false))
+        }
+    }
 }
 
 fn init_tracing() {

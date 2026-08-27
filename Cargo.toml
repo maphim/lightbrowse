@@ -7,6 +7,7 @@ members = [
     "crates/lightbrowse-http",
     "crates/lightbrowse-cli",
     "crates/lightbrowse-cdp",
+    "crates/lightbrowse-memory",
 ]
 
 [workspace.package]
@@ -23,6 +24,7 @@ lightbrowse-fetch = { path = "crates/lightbrowse-fetch" }
 lightbrowse-mcp = { path = "crates/lightbrowse-mcp" }
 lightbrowse-http = { path = "crates/lightbrowse-http" }
 lightbrowse-cdp = { path = "crates/lightbrowse-cdp" }
+lightbrowse-memory = { path = "crates/lightbrowse-memory" }
 
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }

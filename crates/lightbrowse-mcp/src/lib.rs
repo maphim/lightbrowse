@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use lightbrowse_core::backend::BrowserBackend;
 use lightbrowse_core::config::Engine;
 use lightbrowse_core::extract::{self, ExtractMode};
-use lightbrowse_core::service;
 use lightbrowse_core::session::Session;
 use lightbrowse_core::snapshot::{self, SnapshotOptions};
+use lightbrowse_memory::{navigate_cached, MemoryStore};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
@@ -27,6 +27,7 @@ pub struct McpState {
     pub cdp: Option<Arc<dyn BrowserBackend>>,
     pub session: Arc<Mutex<Session>>,
     pub engine: Engine,
+    pub memory: Option<Arc<MemoryStore>>,
 }
 
 pub struct McpServer {
@@ -39,6 +40,7 @@ impl McpServer {
         cdp: Option<Arc<dyn BrowserBackend>>,
         session: Arc<Mutex<Session>>,
         engine: Engine,
+        memory: Option<Arc<MemoryStore>>,
     ) -> Self {
         Self {
             state: McpState {
@@ -46,6 +48,7 @@ impl McpServer {
                 cdp,
                 session,
                 engine,
+                memory,
             },
         }
     }
@@ -214,12 +217,49 @@ impl McpServer {
                 results.truncate(max);
                 Ok(pretty(&json!({ "query": query, "results": results })))
             }
+            "ask" => {
+                let url = req_str(args, "url")?;
+                let question = req_str(args, "question")?;
+                let engine = parse_engine_arg(args, s.engine)?;
+                let page = nav_page(&s, &url, engine).await?;
+                let m = s.memory.as_ref().ok_or("browsing memory disabled")?;
+                m.store_page(&page).map_err(|e| e.to_string())?;
+                let hits = m.search(&question, 6).map_err(|e| e.to_string())?;
+                Ok(pretty(&json!({
+                    "url": page.url,
+                    "title": extract::extract_meta(&page.html).title,
+                    "question": question,
+                    "hits": hits,
+                })))
+            }
+            "memory/search" => {
+                let query = req_str(args, "query")?;
+                let limit = args
+                    .get("limit")
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(8)
+                    .clamp(1, 50) as usize;
+                let m = s.memory.as_ref().ok_or("browsing memory disabled")?;
+                let hits = m.search(&query, limit).map_err(|e| e.to_string())?;
+                Ok(pretty(&json!({ "query": query, "hits": hits })))
+            }
+            "memory/recent" => {
+                let limit = args
+                    .get("limit")
+                    .and_then(|n| n.as_u64())
+                    .unwrap_or(10)
+                    .clamp(1, 50) as usize;
+                let m = s.memory.as_ref().ok_or("browsing memory disabled")?;
+                let pages = m.recent(limit).map_err(|e| e.to_string())?;
+                Ok(pretty(&json!({ "pages": pages })))
+            }
             other => Err(format!("unknown tool: {other}")),
         }
     }
 }
 
-/// Navigate honoring per-call engine selection.
+/// Navigate honoring per-call engine selection; pages flow through the
+/// browsing-memory cache (URL cache + block index) when available.
 async fn nav_page(
     s: &McpState,
     url: &str,
@@ -230,9 +270,21 @@ async fn nav_page(
         .lock()
         .map_err(|_| "session lock poisoned".to_string())?
         .clone();
-    service::navigate(&*s.backend, s.cdp.as_deref(), &session, url, engine)
+    match &s.memory {
+        Some(m) => navigate_cached(m, &*s.backend, s.cdp.as_deref(), &session, url, engine, 300)
+            .await
+            .map(|(p, _)| p)
+            .map_err(|e| e.to_string()),
+        None => lightbrowse_core::service::navigate(
+            &*s.backend,
+            s.cdp.as_deref(),
+            &session,
+            url,
+            engine,
+        )
         .await
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string()),
+    }
 }
 
 fn parse_engine_arg(args: &Map<String, Value>, default: Engine) -> Result<Engine, String> {
@@ -361,6 +413,41 @@ fn tools_schema() -> Vec<Value> {
                     "max_results": { "type": "integer", "minimum": 1, "maximum": 20, "default": 8 }
                 },
                 "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "ask",
+            "description": "Intent-aware reading: fetch (or reuse cache) a URL and return the most relevant text blocks for your question, scored. Pages read are stored in browsing memory automatically.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string" },
+                    "question": { "type": "string", "description": "What you want to know from the page" },
+                    "engine": { "type": "string", "enum": ["auto", "fetch", "cdp"] }
+                },
+                "required": ["url", "question"]
+            }
+        }),
+        json!({
+            "name": "memory/search",
+            "description": "Search everything this browser has read (BM25 over page blocks). Great for 'what did we read about X' without re-fetching.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 8 }
+                },
+                "required": ["query"]
+            }
+        }),
+        json!({
+            "name": "memory/recent",
+            "description": "Most recently read pages.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 }
+                }
             }
         }),
     ]

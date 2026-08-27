@@ -16,6 +16,7 @@ lightbrowse-core = { workspace = true }
 lightbrowse-fetch = { workspace = true }
 lightbrowse-mcp = { workspace = true }
 lightbrowse-http = { workspace = true }
+lightbrowse-memory = { workspace = true }
 lightbrowse-cdp = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

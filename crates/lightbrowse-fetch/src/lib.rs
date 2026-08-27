@@ -59,6 +59,7 @@ impl FetchBackend {
             .gzip(true)
             .brotli(true)
             .deflate(true)
+            .http1_only()
             .pool_idle_timeout(std::time::Duration::from_secs(90))
             .build()
             .map_err(|e| Error::Transport(e.to_string()))?;
@@ -94,10 +95,7 @@ fn base_headers(session: &Session) -> HeaderMap {
         ACCEPT_LANGUAGE,
         HeaderValue::from_str(&session.options.accept_language).unwrap(),
     );
-    headers.insert(
-        ACCEPT_ENCODING,
-        HeaderValue::from_static("gzip, deflate, br"),
-    );
+    headers.insert(ACCEPT_ENCODING, HeaderValue::from_static("gzip, deflate"));
     headers
 }
 

@@ -31,6 +31,12 @@ pub fn is_visible(elm: &ElementRef) -> bool {
     if e.attr("aria-hidden") == Some("true") {
         return false;
     }
+    // CSS-hidden via class (mdBook popups, mobile menus, etc.).
+    if e.classes()
+        .any(|c| c == "hidden" || c == "d-none" || c == "visually-hidden")
+    {
+        return false;
+    }
     if let Some(style) = e.attr("style") {
         let s = style.to_ascii_lowercase();
         if s.contains("display:none") || s.contains("visibility:hidden") {
@@ -41,6 +47,23 @@ pub fn is_visible(elm: &ElementRef) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+/// Structural chrome detected via CSS classes (sidebars, menus, popups).
+fn is_chrome_class(elm: &ElementRef) -> bool {
+    elm.value().classes().any(|c| {
+        let c = c.to_ascii_lowercase();
+        c.contains("sidebar")
+            || c.contains("menu")
+            || c.contains("popup")
+            || c == "theme"
+            || c.contains("theme-list")
+            || c.contains("toc")
+            || c.contains("breadcrumb")
+            || c.contains("toolbar")
+            || c == "search"
+            || c.contains("advert")
+    })
+}
+
 // Meta
 // ---------------------------------------------------------------------------
 
@@ -300,16 +323,28 @@ fn content_score(elm: &ElementRef) -> (f64, usize) {
         return (f64::NEG_INFINITY, 0);
     }
     let non_link = total.saturating_sub(link_text) as f64;
+    // Hard-exclude chrome regions outright — a nav/header/footer can contain
+    // a lot of text (e.g. mdBook's keyboard-help overlay) and would otherwise
+    // beat the real content on raw length. Body/html are also excluded as
+    // candidates: their raw text dwarfs every child, so they'd always win;
+    // we only fall back to body when nothing else qualifies.
+    if matches!(
+        tag,
+        "nav" | "header" | "footer" | "aside" | "form" | "body" | "html"
+    ) {
+        return (f64::NEG_INFINITY, 0);
+    }
     let mut score = non_link;
+    // Main/article containers get a strong structural bonus so they beat
+    // link-heavy content or text-heavy popups (mdBook help, cookie banners).
     let bonus = match tag {
-        "article" => 80.0,
-        "main" => 70.0,
-        "section" => 30.0,
-        "div" => 0.0,
+        "article" => 300.0,
+        "main" => 280.0,
+        "section" => 80.0,
         "pre" => 20.0,
         "table" => 10.0,
         "ul" | "ol" => 10.0,
-        "nav" | "header" | "footer" | "aside" | "form" => -150.0,
+        "div" => -20.0,
         _ => -5.0,
     };
     score += bonus;
@@ -405,7 +440,10 @@ fn collect_blocks(elm: &ElementRef, blocks: &mut Vec<TextBlock>, depth: usize, m
             if let Node::Element(e2) = child.value() {
                 if let Some(cref) = ElementRef::wrap(child) {
                     // Don't descend into nav/footer/aside when inside the main root.
-                    if matches!(e2.name(), "nav" | "footer" | "aside") && depth > 0 {
+                    if matches!(e2.name(), "nav" | "header" | "footer" | "aside") && depth > 0 {
+                        continue;
+                    }
+                    if depth > 0 && is_chrome_class(&cref) {
                         continue;
                     }
                     collect_blocks(&cref, blocks, depth + 1, max_blocks);

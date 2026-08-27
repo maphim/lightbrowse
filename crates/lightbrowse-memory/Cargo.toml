@@ -1,17 +1,15 @@
 [package]
-name = "lightbrowse-mcp"
+name = "lightbrowse-memory"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "MCP (Model Context Protocol) server for lightbrowse — lets any LLM agent drive the browser"
+description = "Browsing memory for lightbrowse: SQLite + FTS5 page cache, history and intent search"
 
 [dependencies]
 lightbrowse-core = { workspace = true }
-lightbrowse-fetch = { workspace = true }
-lightbrowse-memory = { workspace = true }
-tokio = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
