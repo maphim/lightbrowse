@@ -85,6 +85,30 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         (false, 0)
     };
+    // Own process RSS (the featherweight engine's real footprint).
+    let self_ram_mb = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|st| {
+            st.lines()
+                .find(|l| l.starts_with("VmRSS:"))
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|kb| kb.parse::<u64>().ok())
+        })
+        .map(|kb| kb / 1024)
+        .unwrap_or(0);
+
+    let (cdp_peak_mb, cdp_navs) = if let Some(cdp) = &state.cdp {
+        let backend = cdp.clone();
+        let cdp = backend
+            .as_any()
+            .and_then(|b| b.downcast_ref::<lightbrowse_cdp::CdpBackend>());
+        match cdp {
+            Some(c) => (c.peak_ram_mb(), c.navigate_count()),
+            None => (0, 0),
+        }
+    } else {
+        (0, 0)
+    };
     Json(json!({
         "status": "ok",
         "service": "lightbrowse",
@@ -93,8 +117,11 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "headless": !state.config.ui,
         "memory_budget_mb": state.config.memory_budget_mb,
         "idle_timeout_secs": state.config.idle_timeout_secs,
+        "self_ram_mb": self_ram_mb,
         "cdp_running": cdp_running,
         "cdp_ram_mb": cdp_ram_mb,
+        "cdp_peak_ram_mb": cdp_peak_mb,
+        "cdp_navigations": cdp_navs,
     }))
 }
 

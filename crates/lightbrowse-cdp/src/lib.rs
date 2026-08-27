@@ -74,6 +74,10 @@ pub struct CdpBackend {
     trail: Mutex<Vec<TrailStep>>,
     last_used: Mutex<Instant>,
     shutdown: CancellationToken,
+    /// Highest Chromium RAM ever observed (MB) — for monitoring.
+    peak_ram: std::sync::atomic::AtomicU64,
+    /// Navigations performed since start.
+    navigations: std::sync::atomic::AtomicU64,
 }
 
 impl CdpBackend {
@@ -85,6 +89,8 @@ impl CdpBackend {
             trail: Mutex::new(Vec::new()),
             last_used: Mutex::new(Instant::now()),
             shutdown: CancellationToken::new(),
+            peak_ram: std::sync::atomic::AtomicU64::new(0),
+            navigations: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -137,6 +143,16 @@ impl CdpBackend {
             .as_ref()
             .map(|b| b.memory_usage_mb())
             .unwrap_or(0)
+    }
+
+    /// Peak Chromium RAM observed (MB).
+    pub fn peak_ram_mb(&self) -> u64 {
+        self.peak_ram.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total navigations performed.
+    pub fn navigate_count(&self) -> u64 {
+        self.navigations.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn touch(&self) {
@@ -210,6 +226,11 @@ impl BrowserBackend for CdpBackend {
             }
         }
         let (html, title, final_url) = result?;
+        self.navigations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ram = self.memory_usage_mb().await;
+        self.peak_ram
+            .fetch_max(ram as u64, std::sync::atomic::Ordering::Relaxed);
         self.touch();
         Ok(Page {
             url: final_url,
