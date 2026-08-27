@@ -50,6 +50,9 @@ pub struct TabInfo {
     pub last_used: Instant,
     /// When the tab was created — for age reporting.
     pub created: Instant,
+    /// URL the tab was created/navigated with — used to re-create the tab
+    /// after a renderer crash (with_recovery).
+    pub url: String,
 }
 
 /// One recorded action in the session trail (feed for runbook/save).
@@ -326,6 +329,38 @@ impl CdpBackend {
 
     /// Resolve the tab an action should target: the named session's tab, or
     /// (when `None`) the most-recently-used tab. Returns (session_id, page).
+    /// Run a CDP operation with one self-healing retry. If the tab's
+    /// renderer died mid-call (genuine ws reset — e.g. "Connection reset
+    /// without closing handshake" after a heavy SPA like Teams OOMs its
+    /// renderer), drop the dead tab, re-create it against its last URL and
+    /// retry the operation once. Mirrors `navigate`'s reset-and-retry for
+    /// the read-only tools (current/screenshot/evaluate).
+    async fn with_recovery<T, F, Fut>(&self, session: Option<&str>, op: F) -> Result<T>
+    where
+        F: Fn(&ActivePage) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let (sid, active) = self.active_page(session).await?;
+        match op(&active).await {
+            Err(e) if is_recoverable_error(&e) => {
+                let last_url = {
+                    let tabs = self.tabs.lock().await;
+                    tabs.get(&sid).map(|t| t.url.clone()).unwrap_or_default()
+                };
+                tracing::warn!(
+                    "cdp: tab connection died ({e}) — re-creating tab for session {sid} and retrying once"
+                );
+                self.tabs.lock().await.remove(&sid);
+                let active2 = self.ensure_page(&sid, &last_url).await?;
+                // The fresh tab starts loading last_url asynchronously — give
+                // it a moment to produce a document before the retry runs.
+                wait_for_tab_ready(&active2.ws_url).await;
+                op(&active2).await
+            }
+            other => other,
+        }
+    }
+
     async fn active_page(&self, session: Option<&str>) -> Result<(String, ActivePage)> {
         let tabs = self.tabs.lock().await;
         match session {
@@ -525,7 +560,7 @@ impl CdpBackend {
                         cfg.proxy = Some(proxy);
                     }
                 }
-                *guard = Some(CdpBrowser::spawn(&cfg).await?);
+                *guard = Some(CdpBrowser::spawn(&cfg, self.shutdown.clone()).await?);
             }
             guard.as_ref().expect("just spawned").port
         };
@@ -562,6 +597,7 @@ impl CdpBackend {
                 page: active.clone(),
                 last_used: Instant::now(),
                 created: Instant::now(),
+                url: url.to_string(),
             },
         );
         tracing::info!(
@@ -581,12 +617,20 @@ impl CdpBackend {
 
     /// Evaluate JS on the targeted tab; returns the result value.
     pub async fn evaluate(&self, expr: &str, session: Option<&str>) -> Result<Value> {
-        let (sid, active) = self.active_page(session).await.inspect_err(|_| {
-            tracing::warn!("cdp: evaluate called with no active page");
-        })?;
-        let v = evaluate_js(&active.ws_url, expr).await?;
-        self.touch();
-        self.touch_tab(&sid).await;
+        let v = self
+            .with_recovery(session, |active| {
+                let ws_url = active.ws_url.clone();
+                let expr = expr.to_string();
+                async move { evaluate_js(&ws_url, &expr).await }
+            })
+            .await
+            .inspect_err(|_| {
+                tracing::warn!("cdp: evaluate called with no active page");
+            })?;
+        if let Ok((sid, _)) = self.active_page(session).await {
+            self.touch();
+            self.touch_tab(&sid).await;
+        }
         Ok(v)
     }
 
@@ -784,100 +828,120 @@ impl CdpBackend {
         full_page: bool,
         session: Option<&str>,
     ) -> Result<std::path::PathBuf> {
-        let (sid, active) = self.active_page(session).await?;
-        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
-            .await
-            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+        let out = self
+            .with_recovery(session, |active| {
+                let ws_url = active.ws_url.clone();
+                let path = path.to_path_buf();
+                async move {
+                    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+                        .await
+                        .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
 
-        // Stretch the viewport to the full content height for full-page shots.
-        if full_page {
-            let _ = rpc_expect(
-                &mut ws,
-                "Emulation.setDeviceMetricsOverride",
-                json!({
-                    "width": 1280,
-                    "height": 1000,
-                    "deviceScaleFactor": 1,
-                    "mobile": false
-                }),
-            )
-            .await;
-            let _ = rpc_expect(
-                &mut ws,
-                "Page.setDeviceMetricsOverride",
-                json!({ "width": 1280, "height": 1000 }),
-            )
-            .await;
+                    // Stretch the viewport to the full content height for full-page shots.
+                    if full_page {
+                        let _ = rpc_expect(
+                            &mut ws,
+                            "Emulation.setDeviceMetricsOverride",
+                            json!({
+                                "width": 1280,
+                                "height": 1000,
+                                "deviceScaleFactor": 1,
+                                "mobile": false
+                            }),
+                        )
+                        .await;
+                        let _ = rpc_expect(
+                            &mut ws,
+                            "Page.setDeviceMetricsOverride",
+                            json!({ "width": 1280, "height": 1000 }),
+                        )
+                        .await;
+                    }
+
+                    let result = rpc_expect(
+                        &mut ws,
+                        "Page.captureScreenshot",
+                        json!({
+                            "format": "png",
+                            "captureBeyondViewport": full_page,
+                            "fromSurface": true
+                        }),
+                    )
+                    .await?;
+                    let b64 = result
+                        .get("data")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| Error::Parse("screenshot: no data returned".into()))?;
+
+                    use base64::Engine as _;
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(b64)
+                        .map_err(|e| Error::Parse(format!("screenshot: base64: {e}")))?;
+
+                    if let Some(dir) = path.parent() {
+                        std::fs::create_dir_all(dir).ok();
+                    }
+                    std::fs::write(&path, &bytes).map_err(Error::Io)?;
+                    let _ = ws.close(None).await;
+                    Ok(path)
+                }
+            })
+            .await?;
+        if let Ok((sid, _)) = self.active_page(session).await {
+            self.touch();
+            self.touch_tab(&sid).await;
         }
-
-        let result = rpc_expect(
-            &mut ws,
-            "Page.captureScreenshot",
-            json!({
-                "format": "png",
-                "captureBeyondViewport": full_page,
-                "fromSurface": true
-            }),
-        )
-        .await?;
-        let b64 = result
-            .get("data")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::Parse("screenshot: no data returned".into()))?;
-
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(b64)
-            .map_err(|e| Error::Parse(format!("screenshot: base64: {e}")))?;
-
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).ok();
-        }
-        std::fs::write(path, &bytes).map_err(Error::Io)?;
-        let _ = ws.close(None).await;
-        self.touch();
-        self.touch_tab(&sid).await;
-        Ok(path.to_path_buf())
+        Ok(out)
     }
 
     /// Serialize the targeted tab's rendered DOM (html, title, url).
     /// Child-frame (iframe) HTML is appended so agents can see login forms
     /// hosted in iframes (e.g. Microsoft's fpt.live.com).
     pub async fn current_dom(&self, session: Option<&str>) -> Result<(String, String, String)> {
-        let (sid, active) = self.active_page(session).await?;
-        let expr = "JSON.stringify({title: document.title, url: location.href, html: document.documentElement.outerHTML})";
-        let v = evaluate_js(&active.ws_url, expr).await?;
-        let parsed: Value = serde_json::from_str(v.as_str().unwrap_or("{}"))
-            .map_err(|e| Error::Parse(e.to_string()))?;
-        let mut html = parsed
-            .get("html")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        // Append iframe contents so snapshot/ask see frame-hosted fields.
-        let frames = collect_frame_htmls(active.port, &active.ws_url).await;
-        if !frames.is_empty() {
-            html.push_str(&format!("<div data-lb-frames=\"{}:\">", frames.len()));
-            for (i, fh) in frames.iter().enumerate() {
-                html.push_str(&format!("<div data-lb-frame=\"{i}\">{fh}</div>"));
-            }
-            html.push_str("</div>");
+        let (html, title, url) = self
+            .with_recovery(session, |active| {
+                let ws_url = active.ws_url.clone();
+                let port = active.port;
+                async move {
+                    let expr = "JSON.stringify({title: document.title, url: location.href, html: document.documentElement.outerHTML})";
+                    let v = evaluate_js(&ws_url, expr).await?;
+                    let parsed: Value = serde_json::from_str(v.as_str().unwrap_or("{}"))
+                        .map_err(|e| Error::Parse(e.to_string()))?;
+                    let mut html = parsed
+                        .get("html")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    // Append iframe contents so snapshot/ask see frame-hosted fields.
+                    let frames = collect_frame_htmls(port, &ws_url).await;
+                    if !frames.is_empty() {
+                        html.push_str(&format!("<div data-lb-frames=\"{}:\">", frames.len()));
+                        for (i, fh) in frames.iter().enumerate() {
+                            html.push_str(&format!("<div data-lb-frame=\"{i}\">{fh}</div>"));
+                        }
+                        html.push_str("</div>");
+                    }
+                    Ok((
+                        html,
+                        parsed
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        parsed
+                            .get("url")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                    ))
+                }
+            })
+            .await?;
+        if let Ok((sid, _)) = self.active_page(session).await {
+            self.touch();
+            self.touch_tab(&sid).await;
         }
-        self.touch();
-        self.touch_tab(&sid).await;
-        Ok((
-            html,
-            parsed
-                .get("title")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            parsed
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        ))
+        Ok((html, title, url))
     }
 }
 
@@ -897,7 +961,7 @@ struct CdpBrowser {
 }
 
 impl CdpBrowser {
-    async fn spawn(config: &Config) -> Result<Self> {
+    async fn spawn(config: &Config, shutdown: CancellationToken) -> Result<Self> {
         let chrome = config
             .chrome_path
             .clone()
@@ -994,6 +1058,12 @@ impl CdpBrowser {
         let http = reqwest::Client::new();
         let browser_ws = wait_for_devtools(&http, port).await?;
 
+        // Log renderer crashes (Target.targetCrashed) so "Connection reset
+        // without closing handshake" failures can be attributed to a real
+        // renderer death (e.g. heavy SPA OOM) instead of guessed network
+        // issues. Runs until the backend shuts down.
+        spawn_crash_listener(browser_ws.clone(), shutdown);
+
         Ok(Self {
             child,
             port,
@@ -1061,6 +1131,25 @@ impl CdpBrowser {
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(0);
         (main + children) / 1024
+    }
+}
+
+/// Poll a tab until it has a document (readyState != "loading", max ~5s).
+/// Used after re-creating a tab in `with_recovery` so the retried
+/// read-only op sees real content instead of an about:blank mid-load page.
+async fn wait_for_tab_ready(ws_url: &str) {
+    for _ in 0..10 {
+        let ready = evaluate_js(
+            ws_url,
+            "document.readyState === 'loading' ? null : document.readyState",
+        )
+        .await
+        .ok()
+        .and_then(|v| v.as_str().map(|s| s.to_string()));
+        if ready.is_some() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
 
@@ -1743,6 +1832,94 @@ fn is_connection_error(e: &Error) -> bool {
         || msg.contains("unexpected eof")
         || msg.contains("broken pipe")
         || msg.contains("i/o error: connection")
+}
+
+/// Errors a read-only op should self-heal from: a dead/restarted renderer
+/// surfaces either as a ws reset (`is_connection_error`) or — when the
+/// browser keeps the socket open but the renderer never answers (SIGKILL /
+/// OOM-killed renderer) — as a 20s `timed out`. In both cases the tab is
+/// gone and retrying on a re-created tab is the only useful outcome.
+fn is_recoverable_error(e: &Error) -> bool {
+    is_connection_error(e) || e.to_string().to_ascii_lowercase().contains("timed out")
+}
+
+/// Background listener on the browser-level CDP socket that logs renderer
+/// crashes (`Target.targetCrashed`). A crashed renderer closes its tab's
+/// DevTools socket with "Connection reset without closing handshake" — this
+/// event is what tells us it was a crash (e.g. a heavy SPA like Teams
+/// exceeding the V8 heap cap), not a network problem. Reconnects on socket
+/// death (browser restart) and exits on backend shutdown.
+fn spawn_crash_listener(browser_ws: String, shutdown: CancellationToken) {
+    tokio::spawn(async move {
+        loop {
+            if shutdown.is_cancelled() {
+                return;
+            }
+            let Ok((mut ws, _)) = tokio_tungstenite::connect_async(&browser_ws).await else {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            };
+            // Snapshot targetId → URL for crash diagnostics.
+            let mut urls: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            if let Ok(t) = rpc_expect(&mut ws, "Target.getTargets", json!({})).await {
+                if let Some(infos) = t.pointer("/targetInfos").and_then(|v| v.as_array()) {
+                    for i in infos {
+                        if let (Some(tid), Some(u)) = (
+                            i.get("targetId").and_then(|v| v.as_str()),
+                            i.get("url").and_then(|v| v.as_str()),
+                        ) {
+                            urls.insert(tid.to_string(), u.to_string());
+                        }
+                    }
+                }
+            }
+            loop {
+                if shutdown.is_cancelled() {
+                    let _ = ws.close(None).await;
+                    return;
+                }
+                match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+                    // Idle is fine for a listener — keep waiting.
+                    Err(_) => continue,
+                    Ok(None) => break,
+                    Ok(Some(Err(e))) => {
+                        tracing::debug!("cdp: crash listener ws error: {e}");
+                        break;
+                    }
+                    Ok(Some(Ok(WsMessage::Ping(p)))) => {
+                        let _ = ws.send(WsMessage::Pong(p)).await;
+                    }
+                    Ok(Some(Ok(WsMessage::Text(t)))) => {
+                        if let Ok(v) = serde_json::from_str::<Value>(&t) {
+                            if v.get("method").and_then(|m| m.as_str())
+                                == Some("Target.targetCrashed")
+                            {
+                                let tid = v
+                                    .pointer("/params/targetId")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("?");
+                                let status = v
+                                    .pointer("/params/status")
+                                    .and_then(|x| x.as_str())
+                                    .unwrap_or("?");
+                                let code = v
+                                    .pointer("/params/errorCode")
+                                    .and_then(|x| x.as_i64())
+                                    .unwrap_or(-1);
+                                let url = urls.get(tid).cloned().unwrap_or_else(|| "?".into());
+                                tracing::warn!(
+                                    "cdp: TARGET CRASHED target={tid} url={url} status={status} errorCode={code} — this tab's DevTools socket will reset (Connection reset without closing handshake)"
+                                );
+                            }
+                        }
+                    }
+                    Ok(Some(Ok(_))) => {}
+                }
+            }
+            let _ = ws.close(None).await;
+        }
+    });
 }
 
 fn next_id() -> u64 {
