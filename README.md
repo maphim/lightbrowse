@@ -298,12 +298,48 @@ RAM" are opposing goals — so you only pay for what you need:
 |---|---|---|
 | `--engine auto\|fetch\|cdp` | `auto` | engine selection (CLI/MCP/HTTP) |
 | `--proxy <url>` | unset | route all traffic via proxy (see below) |
+| `--max-tabs <n>` | budget/250 | max concurrent CDP tabs (LRU eviction) |
 | `--idle-timeout <secs>` | `60` | suspend Chromium after idle (serve) |
 | `LIGHTBROWSE_MEMORY_MB` | `1024` | RAM budget |
 | `LIGHTBROWSE_IDLE_TIMEOUT` | `60` | idle timeout for one-shot modes |
 | `LIGHTBROWSE_UI` | unset | set to enable GUI (roadmap) |
 | `LIGHTBROWSE_PROXY` | unset | same as `--proxy` |
+| `LIGHTBROWSE_MAX_TABS` | unset | same as `--max-tabs` |
 | `CHROME_PATH` | auto-detect | Chrome/Chromium binary |
+
+## Sessions & isolation
+
+Every `?session=<id>` (HTTP) names a private browsing context: its own
+cookies **and** its own CDP tab. Concurrent agents never step on each other:
+
+```bash
+# agent A
+curl 'localhost:8787/v1/page?url=https://gmail.com&engine=cdp&session=alice'
+curl 'localhost:8787/v1/click?selector=%23identifierId&session=alice'  # tab của alice
+
+# agent B — tab riêng, cookies riêng, không đụng alice
+curl 'localhost:8787/v1/page?url=https://outlook.com&engine=cdp&session=bob'
+curl 'localhost:8787/v1/current?session=bob'
+```
+
+MCP: mỗi process là một session riêng; tools `click/type/submit/press/…`
+nhận thêm `session` (optional) để nhắm đúng tab.
+
+## Resource manager
+
+CDP tabs are capped at `--max-tabs` (default: memory budget ÷ 250 MB,
+clamped 1–8). When the limit is hit the **least-recently-used tab is
+closed** (LRU eviction); when total Chromium RAM exceeds the budget, idle
+tabs are evicted until it fits. All activity (navigate/click/type/…) refreshes
+a tab's recency.
+
+```bash
+curl localhost:8787/v1/tabs             # → { "count": 2, "tabs": [{session, age_secs, idle_secs}] }
+curl 'localhost:8787/v1/tab/close?session=alice'   # đóng thủ công, trả RAM
+# MCP: tabs/list, tab/close
+```
+
+`/health` báo `tabs` và `max_tabs` hiện tại.
 
 ## Proxy / SOCKS
 

@@ -49,6 +49,10 @@ struct Cli {
     /// Also settable via LIGHTBROWSE_PROXY.
     #[arg(long, global = true)]
     proxy: Option<String>,
+    /// Max concurrent CDP tabs (per-session). Beyond this, the least
+    /// recently used tab is evicted. Also settable via LIGHTBROWSE_MAX_TABS.
+    #[arg(long, global = true)]
+    max_tabs: Option<usize>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -175,6 +179,16 @@ async fn main() -> lightbrowse_core::Result<()> {
     if let Some(p) = &config.proxy {
         lightbrowse_core::parse_proxy(p)?;
     }
+    // Per-tab budget: explicit flag > env > default (derived from memory
+    // budget, ~250 MB per headless tab).
+    config.max_tabs = cli
+        .max_tabs
+        .or_else(|| {
+            std::env::var("LIGHTBROWSE_MAX_TABS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or_else(|| config.max_tabs_for_budget());
     // Per-command overrides must land in config BEFORE backends are built.
     if let Cmd::Serve {
         idle_timeout: Some(t),
@@ -378,6 +392,7 @@ async fn main() -> lightbrowse_core::Result<()> {
                 backend: fetch,
                 cdp: Some(cdp),
                 session,
+                sessions: Arc::new(Mutex::new(std::collections::HashMap::new())),
                 engine,
                 config: Arc::new(config),
                 memory: Arc::new(memory),

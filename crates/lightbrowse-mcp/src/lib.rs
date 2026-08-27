@@ -282,7 +282,7 @@ impl McpServer {
                     return Err("no actions recorded yet — do some click/type/press first".into());
                 }
                 let url = cdp
-                    .current_url()
+                    .current_url(None)
                     .await
                     .ok_or("no active page — navigate first")?;
                 let steps_json = serde_json::to_string(&trail).map_err(|e| e.to_string())?;
@@ -382,8 +382,9 @@ impl McpServer {
                     .unwrap_or("lightbrowse-shot.png")
                     .to_string();
                 let path = std::path::PathBuf::from(name);
+                let session = opt_str(args, "session");
                 let out = cdp
-                    .screenshot(&path, full)
+                    .screenshot(&path, full, session.as_deref())
                     .await
                     .map_err(|e| e.to_string())?;
                 let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
@@ -394,12 +395,20 @@ impl McpServer {
             "evaluate" => {
                 let expression = req_str(args, "expression")?;
                 let cdp = require_cdp(&s)?;
-                let res = cdp.evaluate(&expression).await.map_err(|e| e.to_string())?;
+                let session = opt_str(args, "session");
+                let res = cdp
+                    .evaluate(&expression, session.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(pretty(&json!({ "result": res })))
             }
             "page/current" => {
                 let cdp = require_cdp(&s)?;
-                let (html, title, url) = cdp.current_dom().await.map_err(|e| e.to_string())?;
+                let session = opt_str(args, "session");
+                let (html, title, url) = cdp
+                    .current_dom(session.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let text = extract::extract_text(&html);
                 Ok(pretty(&json!({
                     "url": url,
@@ -411,15 +420,20 @@ impl McpServer {
             "click" => {
                 let selector = req_str(args, "selector")?;
                 let cdp = require_cdp(&s)?;
-                let res = cdp.click(&selector).await.map_err(|e| e.to_string())?;
+                let session = opt_str(args, "session");
+                let res = cdp
+                    .click(&selector, session.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(pretty(&json!({ "selector": selector, "result": res })))
             }
             "type" => {
                 let selector = req_str(args, "selector")?;
                 let text = req_str(args, "text")?;
                 let cdp = require_cdp(&s)?;
+                let session = opt_str(args, "session");
                 let res = cdp
-                    .type_text(&selector, &text)
+                    .type_text(&selector, &text, session.as_deref())
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok(pretty(&json!({ "selector": selector, "result": res })))
@@ -427,14 +441,33 @@ impl McpServer {
             "submit" => {
                 let selector = req_str(args, "selector")?;
                 let cdp = require_cdp(&s)?;
-                let res = cdp.submit(&selector).await.map_err(|e| e.to_string())?;
+                let session = opt_str(args, "session");
+                let res = cdp
+                    .submit(&selector, session.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(pretty(&json!({ "selector": selector, "result": res })))
             }
             "press" => {
                 let key = req_str(args, "key")?;
                 let cdp = require_cdp(&s)?;
-                let res = cdp.press_key(&key).await.map_err(|e| e.to_string())?;
+                let session = opt_str(args, "session");
+                let res = cdp
+                    .press_key(&key, session.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
                 Ok(pretty(&json!({ "key": key, "result": res })))
+            }
+            "tabs/list" => {
+                let cdp = require_cdp(&s)?;
+                let tabs = cdp.tabs_snapshot().await;
+                Ok(pretty(&json!({ "tabs": tabs, "count": tabs.len() })))
+            }
+            "tab/close" => {
+                let session = req_str(args, "session")?;
+                let cdp = require_cdp(&s)?;
+                cdp.close_tab(&session).await.map_err(|e| e.to_string())?;
+                Ok(pretty(&json!({ "ok": true, "closed": session })))
             }
             "proxy/get" => {
                 let fetch_proxy = s
@@ -564,6 +597,13 @@ fn req_str(args: &Map<String, Value>, key: &str) -> Result<String, String> {
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| format!("missing required argument '{key}'"))
+}
+
+/// Optional string argument (e.g. `session`) — `None` when absent.
+fn opt_str(args: &Map<String, Value>, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
 }
 
 fn parse_mode(m: &str) -> Result<ExtractMode, String> {
@@ -783,25 +823,48 @@ fn tools_schema() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "path": { "type": "string", "description": "output file path (default lightbrowse-shot.png)" },
-                    "full_page": { "type": "boolean", "default": false }
+                    "full_page": { "type": "boolean", "default": false },
+                    "session": { "type": "string", "description": "optional session id (from navigate) to target its tab" }
                 }
             }
         }),
         json!({
             "name": "evaluate",
-            "description": "Run arbitrary JavaScript on the ACTIVE CDP tab and return the value. For advanced inspection.",
+            "description": "Run arbitrary JavaScript on the targeted CDP tab and return the value. For advanced inspection.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "expression": { "type": "string" }
+                    "expression": { "type": "string" },
+                    "session": { "type": "string", "description": "optional session id (from navigate) to target its tab" }
                 },
                 "required": ["expression"]
             }
         }),
         json!({
             "name": "page/current",
-            "description": "Read the ACTIVE CDP tab: url, title, rendered text preview. Use after click/type/submit to see the result.",
+            "description": "Read the targeted CDP tab: url, title, rendered text preview. Use after click/type/submit to see the result.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string", "description": "optional session id (from navigate) to target its tab" }
+                }
+            }
+        }),
+        json!({
+            "name": "tabs/list",
+            "description": "Resource manager: list open CDP tabs (per-session) with age and idle time, plus the current count vs the per-tab budget.",
             "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "tab/close",
+            "description": "Resource manager: close the tab of one session, freeing its Chromium RAM (e.g. after finishing a task).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string", "description": "session id whose tab to close" }
+                },
+                "required": ["session"]
+            }
         }),
         json!({
             "name": "click",
@@ -809,7 +872,8 @@ fn tools_schema() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "selector": { "type": "string", "description": "CSS selector from a snapshot node" }
+                    "selector": { "type": "string", "description": "CSS selector from a snapshot node" },
+                    "session": { "type": "string", "description": "optional session id (from navigate) to target its tab" }
                 },
                 "required": ["selector"]
             }
@@ -821,7 +885,8 @@ fn tools_schema() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "selector": { "type": "string" },
-                    "text": { "type": "string" }
+                    "text": { "type": "string" },
+                    "session": { "type": "string", "description": "optional session id (from navigate) to target its tab" }
                 },
                 "required": ["selector", "text"]
             }
@@ -832,7 +897,8 @@ fn tools_schema() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "selector": { "type": "string" }
+                    "selector": { "type": "string" },
+                    "session": { "type": "string", "description": "optional session id (from navigate) to target its tab" }
                 },
                 "required": ["selector"]
             }
@@ -843,7 +909,8 @@ fn tools_schema() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "key": { "type": "string", "enum": ["Enter", "Tab", "Backspace", "Escape", "ArrowDown", "ArrowUp"] }
+                    "key": { "type": "string", "enum": ["Enter", "Tab", "Backspace", "Escape", "ArrowDown", "ArrowUp"] },
+                    "session": { "type": "string", "description": "optional session id (from navigate) to target its tab" }
                 },
                 "required": ["key"]
             }

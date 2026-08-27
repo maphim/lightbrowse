@@ -32,6 +32,9 @@ pub struct AppState {
     pub backend: Arc<dyn BrowserBackend>,
     pub cdp: Option<Arc<dyn BrowserBackend>>,
     pub session: Arc<Mutex<Session>>,
+    /// Named sessions created on demand via `?session=<id>` — each gets its
+    /// own cookies + CDP tab, so concurrent clients never share state.
+    pub sessions: Arc<Mutex<std::collections::HashMap<String, Session>>>,
     pub engine: Engine,
     pub config: Arc<Config>,
     pub memory: Arc<MemoryStore>,
@@ -56,6 +59,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/click", get(click_action))
         .route("/v1/type", get(type_action))
         .route("/v1/submit", get(submit_action))
+        .route("/v1/tabs", get(tabs_list))
+        .route("/v1/tab/close", get(tab_close))
         .route("/v1/proxy", get(proxy_get).put(proxy_set))
         .with_state(state)
 }
@@ -110,6 +115,18 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
     } else {
         (0, 0)
     };
+    let (cdp_tabs, cdp_max_tabs) = if let Some(cdp) = &state.cdp {
+        let backend = cdp.clone();
+        let cdp = backend
+            .as_any()
+            .and_then(|b| b.downcast_ref::<lightbrowse_cdp::CdpBackend>());
+        match cdp {
+            Some(c) => (c.tab_count().await, state.config.max_tabs),
+            None => (0, 0),
+        }
+    } else {
+        (0, 0)
+    };
     Json(json!({
         "status": "ok",
         "service": "lightbrowse",
@@ -123,6 +140,8 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "cdp_ram_mb": cdp_ram_mb,
         "cdp_peak_ram_mb": cdp_peak_mb,
         "cdp_navigations": cdp_navs,
+        "tabs": cdp_tabs,
+        "max_tabs": cdp_max_tabs,
     }))
 }
 
@@ -211,19 +230,51 @@ async fn proxy_set(State(state): State<AppState>, Json(body): Json<ProxyBody>) -
 struct UrlQuery {
     url: String,
     engine: Option<String>,
+    /// Optional named session: its own cookies + CDP tab (isolation between
+    /// concurrent clients). Omit to use the shared default session.
+    session: Option<String>,
+}
+
+/// Resolve a named session to the CDP tab key (the session's real id).
+/// `None` input → `None` (actions fall back to the most-recently-used tab).
+fn resolve_cdp_session(state: &AppState, sid: Option<&str>) -> Result<Option<String>, ApiError> {
+    match sid {
+        None => Ok(None),
+        Some(id) => Ok(Some(session_for(state, Some(id))?.id)),
+    }
+}
+
+/// Resolve the session to use: a named one (created on demand) or the
+/// shared default. Cookies are per-session, so named sessions are isolated.
+fn session_for(state: &AppState, sid: Option<&str>) -> Result<Session, ApiError> {
+    match sid {
+        None => Ok(state
+            .session
+            .lock()
+            .map_err(|_| ApiError::internal("session lock poisoned"))?
+            .clone()),
+        Some(id) => {
+            let mut map = state
+                .sessions
+                .lock()
+                .map_err(|_| ApiError::internal("sessions lock poisoned"))?;
+            let entry = map.entry(id.to_string()).or_insert_with(|| {
+                tracing::info!("http: new named session '{id}'");
+                Session::new()
+            });
+            Ok(entry.clone())
+        }
+    }
 }
 
 async fn nav_page(
     state: &AppState,
     url: &str,
     engine: Engine,
+    session_id: Option<&str>,
 ) -> Result<lightbrowse_core::Page, ApiError> {
     // Clone out of the lock: MutexGuard is !Send and must not cross .await.
-    let session = state
-        .session
-        .lock()
-        .map_err(|_| ApiError::internal("session lock poisoned"))?
-        .clone();
+    let session = session_for(state, session_id)?;
     if engine == Engine::Cdp {
         return lightbrowse_core::service::navigate(
             &*state.backend,
@@ -263,7 +314,7 @@ async fn page(
     Query(q): Query<UrlQuery>,
 ) -> Result<Response, ApiError> {
     let engine = parse_engine(q.engine.as_deref(), state.engine)?;
-    let p = nav_page(&state, &q.url, engine).await?;
+    let p = nav_page(&state, &q.url, engine, q.session.as_deref()).await?;
     let t = extract::extract_text(&p.html);
     let body = json!({
         "url": p.url,
@@ -284,6 +335,7 @@ struct ExtractQuery {
     url: String,
     mode: Option<String>,
     engine: Option<String>,
+    session: Option<String>,
 }
 
 async fn extract(
@@ -291,7 +343,7 @@ async fn extract(
     Query(q): Query<ExtractQuery>,
 ) -> Result<Response, ApiError> {
     let engine = parse_engine(q.engine.as_deref(), state.engine)?;
-    let p = nav_page(&state, &q.url, engine).await?;
+    let p = nav_page(&state, &q.url, engine, q.session.as_deref()).await?;
     let mode = match q.mode.as_deref().unwrap_or("text") {
         "text" => ExtractMode::Text,
         "links" => ExtractMode::Links,
@@ -314,6 +366,7 @@ struct SnapshotQuery {
     url: String,
     max_nodes: Option<usize>,
     engine: Option<String>,
+    session: Option<String>,
 }
 
 async fn snapshot(
@@ -321,7 +374,7 @@ async fn snapshot(
     Query(q): Query<SnapshotQuery>,
 ) -> Result<Response, ApiError> {
     let engine = parse_engine(q.engine.as_deref(), state.engine)?;
-    let p = nav_page(&state, &q.url, engine).await?;
+    let p = nav_page(&state, &q.url, engine, q.session.as_deref()).await?;
     let opts = SnapshotOptions {
         max_nodes: q.max_nodes.unwrap_or(400).clamp(10, 2000),
         ..SnapshotOptions::default()
@@ -341,7 +394,7 @@ async fn search(
     Query(q): Query<SearchQuery>,
 ) -> Result<Response, ApiError> {
     let ddg = format!("https://html.duckduckgo.com/html/?q={}", urlencoding(&q.q));
-    let p = nav_page(&state, &ddg, Engine::Fetch).await?;
+    let p = nav_page(&state, &ddg, Engine::Fetch, None).await?;
     let mut results = extract::extract_search_results(&p.html);
     results.truncate(q.max_results.unwrap_or(8).clamp(1, 20));
     Ok(Json(json!({ "query": q.q, "results": results })).into_response())
@@ -352,6 +405,7 @@ struct AskQuery {
     url: String,
     question: String,
     engine: Option<String>,
+    session: Option<String>,
 }
 
 async fn ask(
@@ -359,7 +413,7 @@ async fn ask(
     Query(q): Query<AskQuery>,
 ) -> Result<Response, ApiError> {
     let engine = parse_engine(q.engine.as_deref(), state.engine)?;
-    let p = nav_page(&state, &q.url, engine).await?;
+    let p = nav_page(&state, &q.url, engine, q.session.as_deref()).await?;
     state.memory.store_page(&p).map_err(ApiError::from)?;
     let hits: Vec<Value> = state
         .memory
@@ -426,6 +480,14 @@ async fn memory_recent(
 struct ActionQuery {
     selector: String,
     text: Option<String>,
+    /// Optional session id — target the tab of this session instead of the
+    /// most-recently-used one (see `navigate`'s `session` parameter).
+    session: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct SessionQuery {
+    session: Option<String>,
 }
 
 /// Downcast the shared CDP backend for stateful actions.
@@ -442,14 +504,16 @@ fn require_cdp(state: &AppState) -> Result<&lightbrowse_cdp::CdpBackend, ApiErro
 #[derive(Deserialize)]
 struct EvaluateQuery {
     expression: String,
+    session: Option<String>,
 }
 
 async fn evaluate(
     State(state): State<AppState>,
     Query(q): Query<EvaluateQuery>,
 ) -> Result<Response, ApiError> {
+    let cdp_session = resolve_cdp_session(&state, q.session.as_deref())?;
     let res = require_cdp(&state)?
-        .evaluate(&q.expression)
+        .evaluate(&q.expression, cdp_session.as_deref())
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "result": res })).into_response())
@@ -521,6 +585,7 @@ async fn runbook_run(
 struct ScreenshotQuery {
     path: Option<String>,
     full_page: Option<bool>,
+    session: Option<String>,
 }
 
 async fn screenshot(
@@ -529,17 +594,22 @@ async fn screenshot(
 ) -> Result<Response, ApiError> {
     let path = std::path::PathBuf::from(q.path.unwrap_or_else(|| "lightbrowse-shot.png".into()));
     let full = q.full_page.unwrap_or(false);
+    let cdp_session = resolve_cdp_session(&state, q.session.as_deref())?;
     let out = require_cdp(&state)?
-        .screenshot(&path, full)
+        .screenshot(&path, full, cdp_session.as_deref())
         .await
         .map_err(ApiError::from)?;
     let size = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
     Ok(Json(json!({ "path": out.display().to_string(), "bytes": size })).into_response())
 }
 
-async fn current_page(State(state): State<AppState>) -> Result<Response, ApiError> {
+async fn current_page(
+    State(state): State<AppState>,
+    Query(q): Query<SessionQuery>,
+) -> Result<Response, ApiError> {
+    let cdp_session = resolve_cdp_session(&state, q.session.as_deref())?;
     let (html, title, url) = require_cdp(&state)?
-        .current_dom()
+        .current_dom(cdp_session.as_deref())
         .await
         .map_err(ApiError::from)?;
     let t = extract::extract_text(&html);
@@ -556,8 +626,9 @@ async fn click_action(
     State(state): State<AppState>,
     Query(q): Query<ActionQuery>,
 ) -> Result<Response, ApiError> {
+    let cdp_session = resolve_cdp_session(&state, q.session.as_deref())?;
     let res = require_cdp(&state)?
-        .click(&q.selector)
+        .click(&q.selector, cdp_session.as_deref())
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "selector": q.selector, "result": res })).into_response())
@@ -568,8 +639,9 @@ async fn type_action(
     Query(q): Query<ActionQuery>,
 ) -> Result<Response, ApiError> {
     let text = q.text.as_deref().unwrap_or("");
+    let cdp_session = resolve_cdp_session(&state, q.session.as_deref())?;
     let res = require_cdp(&state)?
-        .type_text(&q.selector, text)
+        .type_text(&q.selector, text, cdp_session.as_deref())
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "selector": q.selector, "result": res })).into_response())
@@ -579,11 +651,34 @@ async fn submit_action(
     State(state): State<AppState>,
     Query(q): Query<ActionQuery>,
 ) -> Result<Response, ApiError> {
+    let cdp_session = resolve_cdp_session(&state, q.session.as_deref())?;
     let res = require_cdp(&state)?
-        .submit(&q.selector)
+        .submit(&q.selector, cdp_session.as_deref())
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "selector": q.selector, "result": res })).into_response())
+}
+
+/// Resource manager — list open CDP tabs (per-session) with age/idle.
+async fn tabs_list(State(state): State<AppState>) -> Result<Response, ApiError> {
+    let tabs = require_cdp(&state)?.tabs_snapshot().await;
+    Ok(Json(json!({ "tabs": tabs, "count": tabs.len() })).into_response())
+}
+
+/// Resource manager — close the tab of one session (manual eviction).
+async fn tab_close(
+    State(state): State<AppState>,
+    Query(q): Query<SessionQuery>,
+) -> Result<Response, ApiError> {
+    let session = q
+        .session
+        .ok_or_else(|| ApiError::bad_request("missing ?session=<id>"))?;
+    let cdp_key = session_for(&state, Some(&session))?.id;
+    require_cdp(&state)?
+        .close_tab(&cdp_key)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "ok": true, "closed": session })).into_response())
 }
 
 // ---------------------------------------------------------------------------

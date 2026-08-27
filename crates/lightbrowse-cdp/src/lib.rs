@@ -10,6 +10,7 @@
 //! 3. **Zero magic deps** — the CDP client is ~250 lines over a websocket;
 //!    no chromiumoxide, no browser driver.
 
+use std::collections::HashMap;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -41,6 +42,16 @@ pub struct ActivePage {
     pub ws_url: String,
 }
 
+/// Per-session tab bookkeeping for the resource manager.
+#[derive(Clone)]
+pub struct TabInfo {
+    pub page: ActivePage,
+    /// Last activity (navigate/action) — used for LRU eviction.
+    pub last_used: Instant,
+    /// When the tab was created — for age reporting.
+    pub created: Instant,
+}
+
 /// One recorded action in the session trail (feed for runbook/save).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrailStep {
@@ -70,7 +81,9 @@ pub struct RunbookStep {
 pub struct CdpBackend {
     config: Config,
     inner: tokio::sync::Mutex<Option<CdpBrowser>>,
-    active: tokio::sync::Mutex<Option<ActivePage>>,
+    /// Open tabs, keyed by session id. Each session gets its own tab so
+    /// concurrent agents never step on each other's page state.
+    tabs: tokio::sync::Mutex<HashMap<String, TabInfo>>,
     trail: Mutex<Vec<TrailStep>>,
     last_used: Mutex<Instant>,
     shutdown: CancellationToken,
@@ -88,7 +101,7 @@ impl CdpBackend {
         Self {
             config,
             inner: tokio::sync::Mutex::new(None),
-            active: tokio::sync::Mutex::new(None),
+            tabs: tokio::sync::Mutex::new(HashMap::new()),
             trail: Mutex::new(Vec::new()),
             last_used: Mutex::new(Instant::now()),
             shutdown: CancellationToken::new(),
@@ -164,8 +177,8 @@ impl CdpBackend {
         });
     }
 
-    /// Reset browser state: kill any Chromium (alive or zombie), drop the
-    /// active tab. Used when a connection dies so the next call starts fresh.
+    /// Reset browser state: kill any Chromium (alive or zombie), drop all
+    /// tabs. Used when a connection dies so the next call starts fresh.
     pub async fn reset_browser(&self) {
         let mut guard = self.inner.lock().await;
         if let Some(mut b) = guard.take() {
@@ -175,7 +188,7 @@ impl CdpBackend {
                 tracing::warn!("cdp: Chromium process was already dead — cleaned up");
             }
         }
-        *self.active.lock().await = None;
+        self.tabs.lock().await.clear();
     }
 
     /// Close Chromium gracefully (cookies flushed to the profile) and
@@ -184,7 +197,7 @@ impl CdpBackend {
         let mut guard = self.inner.lock().await;
         if let Some(b) = guard.take() {
             b.close_gracefully().await;
-            *self.active.lock().await = None;
+            self.tabs.lock().await.clear();
             tracing::info!("cdp: Chromium suspended (RAM released, cookies flushed)");
         }
     }
@@ -220,6 +233,120 @@ impl CdpBackend {
         }
     }
 
+    /// Resource manager — mark a session's tab as recently used.
+    async fn touch_tab(&self, session_id: &str) {
+        let mut g = self.tabs.lock().await;
+        if let Some(t) = g.get_mut(session_id) {
+            t.last_used = Instant::now();
+        }
+    }
+
+    /// Resource manager — current open tab count (per-session).
+    pub async fn tab_count(&self) -> usize {
+        self.tabs.lock().await.len()
+    }
+
+    /// Resource manager — snapshot of open tabs for monitoring (/health).
+    pub async fn tabs_snapshot(&self) -> Vec<serde_json::Value> {
+        self.tabs
+            .lock()
+            .await
+            .iter()
+            .map(|(sid, t)| {
+                serde_json::json!({
+                    "session": sid,
+                    "age_secs": t.created.elapsed().as_secs_f64().round(),
+                    "idle_secs": t.last_used.elapsed().as_secs_f64().round(),
+                })
+            })
+            .collect()
+    }
+
+    /// Close the tab of one session (manual eviction). Returns an error when
+    /// the session has no open tab.
+    pub async fn close_tab(&self, session_id: &str) -> Result<()> {
+        let page = {
+            let mut tabs = self.tabs.lock().await;
+            match tabs.remove(session_id) {
+                Some(t) => t.page,
+                None => {
+                    return Err(Error::NotInitialized(format!(
+                        "no open tab for session '{session_id}'"
+                    )))
+                }
+            }
+        };
+        let url = format!(
+            "http://127.0.0.1:{}/json/close/{}",
+            page.port, page.target_id
+        );
+        if let Err(e) = reqwest::Client::new().get(&url).send().await {
+            tracing::warn!("cdp: close tab {session_id}: {e}");
+        }
+        tracing::info!("cdp: closed tab of session {session_id}");
+        Ok(())
+    }
+
+    /// Resource manager — evict the least-recently-used tab (LRU policy),
+    /// never the one in `except`. Returns the evicted session id, if any.
+    async fn evict_lru_tab(&self, except: Option<&str>) -> Option<String> {
+        let victim = {
+            let tabs = self.tabs.lock().await;
+            tabs.iter()
+                .filter(|(sid, _)| Some(sid.as_str()) != except)
+                .min_by_key(|(_, t)| t.last_used)
+                .map(|(sid, _)| sid.clone())
+        };
+        if let Some(ref v) = victim {
+            self.close_tab(v).await.ok();
+        }
+        victim
+    }
+
+    /// Resource manager — RAM governor: while Chromium RAM exceeds the
+    /// budget, evict idle tabs (never the one in `keep`) until we fit or
+    /// only the kept tab remains.
+    async fn enforce_ram_budget(&self, keep: &str) {
+        let mut rounds = 0;
+        while self.memory_usage_mb().await > self.config.memory_budget_mb
+            && self.tab_count().await > 1
+            && rounds < 8
+        {
+            rounds += 1;
+            let ram = self.memory_usage_mb().await;
+            match self.evict_lru_tab(Some(keep)).await {
+                Some(victim) => tracing::warn!(
+                    "cdp: RAM {ram} MB > budget {} MB — evicted LRU tab (session {victim})",
+                    self.config.memory_budget_mb
+                ),
+                None => break,
+            }
+        }
+    }
+
+    /// Resolve the tab an action should target: the named session's tab, or
+    /// (when `None`) the most-recently-used tab. Returns (session_id, page).
+    async fn active_page(&self, session: Option<&str>) -> Result<(String, ActivePage)> {
+        let tabs = self.tabs.lock().await;
+        match session {
+            Some(id) => tabs
+                .get(id)
+                .map(|t| (id.to_string(), t.page.clone()))
+                .ok_or_else(|| {
+                    Error::NotInitialized(format!(
+                        "no tab for session '{id}' — navigate with engine=cdp first"
+                    ))
+                }),
+            None => tabs
+                .iter()
+                .max_by_key(|(_, t)| t.last_used)
+                .map(|(sid, t)| (sid.clone(), t.page.clone()))
+                .ok_or_else(|| {
+                    Error::NotInitialized("no active page — navigate with engine=cdp first".into())
+                }),
+        }
+    }
+
     /// Session action trail (feed for `runbook/save`).
     pub fn trail(&self) -> Vec<TrailStep> {
         self.trail.lock().unwrap_or_else(|e| e.into_inner()).clone()
@@ -238,12 +365,20 @@ impl CdpBackend {
     }
 
     /// Collect alternative selectors for an element (id, name, placeholder,
-    /// aria-label) so replays survive small DOM changes.
-    async fn collect_fallbacks(&self, selector: &str) -> Vec<String> {
+    /// aria-label) so replays survive small DOM changes. Searches across
+    /// frames so iframe-hosted fields get fallbacks too.
+    async fn collect_fallbacks(&self, selector: &str, session: Option<&str>) -> Vec<String> {
         let sel = serde_json::to_string(selector).unwrap_or_default();
-        self.evaluate(&format!(
-            "(() => {{ const el = document.querySelector({sel}); if (!el) return [];              const out = [];              if (el.id) out.push('#' + CSS.escape(el.id));              if (el.name) out.push(`[name=\"${{el.name}}\"]`);              if (el.placeholder) out.push(`[placeholder=\"${{el.placeholder}}\"]`);              if (el.getAttribute('aria-label')) out.push(`[aria-label=\"${{el.getAttribute('aria-label')}}\"]`);              return out.slice(0,3); }})()"
-        ))
+        let (_, active) = match self.active_page(session).await {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        eval_across_frames_value(
+            &active.ws_url,
+            &format!(
+                "(() => {{ const el = document.querySelector({sel}); if (!el) return null;              const out = [];              if (el.id) out.push('#' + CSS.escape(el.id));              if (el.name) out.push(`[name=\"${{el.name}}\"]`);              if (el.placeholder) out.push(`[placeholder=\"${{el.placeholder}}\"]`);              if (el.getAttribute('aria-label')) out.push(`[aria-label=\"${{el.getAttribute('aria-label')}}\"]`);              return out.slice(0,3); }})()"
+            ),
+        )
         .await
         .and_then(|v| serde_json::from_value(v).map_err(|e| Error::Parse(e.to_string())))
         .unwrap_or_default()
@@ -295,7 +430,7 @@ impl BrowserBackend for CdpBackend {
 impl CdpBackend {
     /// Single navigation attempt (no retry) — see `navigate`.
     async fn try_navigate(&self, session: &Session, url: &str) -> Result<Page> {
-        let active = self.ensure_page(url).await?;
+        let active = self.ensure_page(&session.id, url).await?;
         let result = navigate_and_render(
             &active.ws_url,
             url,
@@ -307,9 +442,10 @@ impl CdpBackend {
             let ram = self.memory_usage_mb().await;
             if ram > self.config.memory_budget_mb {
                 tracing::warn!(
-                    "cdp: actual Chromium RAM {ram} MB exceeds budget {} MB — consider --engine fetch for this site or raise LIGHTBROWSE_MEMORY_MB",
+                    "cdp: actual Chromium RAM {ram} MB exceeds budget {} MB — evicting idle tabs",
                     self.config.memory_budget_mb
                 );
+                self.enforce_ram_budget(&session.id).await;
             }
         }
         let (html, title, final_url) = result?;
@@ -319,6 +455,7 @@ impl CdpBackend {
         self.peak_ram
             .fetch_max(ram as u64, std::sync::atomic::Ordering::Relaxed);
         self.touch();
+        self.touch_tab(&session.id).await;
         Ok(Page {
             url: final_url,
             title,
@@ -330,8 +467,10 @@ impl CdpBackend {
         })
     }
 
-    /// Make sure Chromium is alive and a tab exists; returns the active page.
-    async fn ensure_page(&self, url: &str) -> Result<ActivePage> {
+    /// Make sure Chromium is alive and a tab exists for `session_id`;
+    /// returns that session's tab. Enforces the per-tab budget (max_tabs)
+    /// with LRU eviction when the limit is hit.
+    async fn ensure_page(&self, session_id: &str, url: &str) -> Result<ActivePage> {
         // The browser struct may be alive while the process is actually dead
         // (crashed/killed) — detect zombies FIRST so we never reuse a dead
         // tab's websocket (macOS: 'Connection refused' / 'closed connection').
@@ -345,10 +484,29 @@ impl CdpBackend {
                 }
             }
         }
-        // Reuse the open tab if we have one.
-        if let Some(p) = self.active.lock().await.clone() {
-            tracing::debug!("cdp: reusing active tab for {url}");
-            return Ok(p);
+        // Reuse this session's tab if it already has one.
+        {
+            let mut tabs = self.tabs.lock().await;
+            if let Some(t) = tabs.get_mut(session_id) {
+                t.last_used = Instant::now();
+                tracing::debug!("cdp: reusing tab of session {session_id} for {url}");
+                return Ok(t.page.clone());
+            }
+            // Resource manager: cap concurrent tabs (per-tab budget).
+            let max_tabs = self.config.max_tabs.clamp(1, 16);
+            if tabs.len() >= max_tabs {
+                let victim = tabs
+                    .iter()
+                    .min_by_key(|(_, t)| t.last_used)
+                    .map(|(sid, _)| sid.clone());
+                drop(tabs);
+                if let Some(v) = victim {
+                    tracing::warn!(
+                        "cdp: {max_tabs} tab limit reached — evicting LRU tab (session {v})"
+                    );
+                    self.close_tab(&v).await.ok();
+                }
+            }
         }
         tracing::debug!("cdp: creating new tab for {url}");
         let port = {
@@ -393,57 +551,84 @@ impl CdpBackend {
             target_id,
             ws_url: page_ws,
         };
-        *self.active.lock().await = Some(active.clone());
-        tracing::info!("cdp: active tab set (target={})", active.target_id);
+        self.tabs.lock().await.insert(
+            session_id.to_string(),
+            TabInfo {
+                page: active.clone(),
+                last_used: Instant::now(),
+                created: Instant::now(),
+            },
+        );
+        tracing::info!(
+            "cdp: tab created for session {session_id} (target={})",
+            active.target_id
+        );
         Ok(active)
     }
 
-    /// The URL the active tab is currently showing (via JS).
-    pub async fn current_url(&self) -> Option<String> {
-        let ws = self.active.lock().await.clone()?.ws_url;
-        let v = evaluate_js(&ws, "location.href").await.ok()?;
+    /// The URL the currently-targeted tab is showing (via JS).
+    pub async fn current_url(&self, session: Option<&str>) -> Option<String> {
+        let (sid, active) = self.active_page(session).await.ok()?;
+        let v = evaluate_js(&active.ws_url, "location.href").await.ok()?;
+        self.touch_tab(&sid).await;
         v.as_str().map(|s| s.to_string())
     }
 
-    /// Evaluate JS on the active tab; returns the result value.
-    pub async fn evaluate(&self, expr: &str) -> Result<Value> {
-        let active = self.active.lock().await.clone().ok_or_else(|| {
+    /// Evaluate JS on the targeted tab; returns the result value.
+    pub async fn evaluate(&self, expr: &str, session: Option<&str>) -> Result<Value> {
+        let (sid, active) = self.active_page(session).await.inspect_err(|_| {
             tracing::warn!("cdp: evaluate called with no active page");
-            Error::NotInitialized("no active page — navigate first".into())
         })?;
         let v = evaluate_js(&active.ws_url, expr).await?;
         self.touch();
+        self.touch_tab(&sid).await;
         Ok(v)
     }
 
     /// Click an element by CSS selector using REAL mouse events (moved →
     /// pressed → released at the element's center), which is far harder for
-    /// anti-bot systems to flag than `el.click()`.
-    pub async fn click(&self, selector: &str) -> Result<Value> {
+    /// anti-bot systems to flag than `el.click()`. Works across iframes
+    /// (selectors are resolved in every frame; coordinates are viewport
+    /// based so the CDP mouse events land correctly).
+    pub async fn click(&self, selector: &str, session: Option<&str>) -> Result<Value> {
         let sel = serde_json::to_string(selector).map_err(|e| Error::Parse(e.to_string()))?;
-        let point = self
-            .evaluate(&format!(
+        let (sid, active) = self.active_page(session).await?;
+        let fe = eval_across_frames(
+            &active.ws_url,
+            &format!(
                 "(() => {{ const el = document.querySelector({sel}); if (!el) return null; \
                  el.scrollIntoView({{block:'center'}}); const r = el.getBoundingClientRect(); \
                  return {{x: r.x + r.width/2, y: r.y + r.height/2, tag: el.tagName.toLowerCase()}}; }})()"
-            ))
-            .await?;
+            ),
+        )
+        .await?;
+        let point = &fe.value;
         let x = point.get("x").and_then(|v| v.as_f64());
         let y = point.get("y").and_then(|v| v.as_f64());
-        let Some((x, y)) = x.zip(y) else {
+        let Some((mut x, mut y)) = x.zip(y) else {
             return Ok(json!({"ok": false, "reason": "element not found"}));
         };
+        // When the element lives in an iframe, its rect is frame-relative —
+        // add the iframe's own offset in the top viewport so the mouse event
+        // lands on the real element.
+        if let Some(fid) = &fe.frame_id {
+            tracing::debug!("cdp: element found in frame {fid}");
+            if let Ok((mut ws, _)) = tokio_tungstenite::connect_async(&active.ws_url).await {
+                if let Some((ox, oy)) = iframe_viewport_offset(&mut ws, fid).await {
+                    tracing::debug!("cdp: iframe offset ({ox}, {oy})");
+                    x += ox;
+                    y += oy;
+                } else {
+                    tracing::warn!("cdp: could not compute iframe offset for frame {fid}");
+                }
+                let _ = ws.close(None).await;
+            }
+        }
         let tag = point
             .get("tag")
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let active = self
-            .active
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| Error::NotInitialized("no active page — navigate first".into()))?;
         let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
             .await
             .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
@@ -464,7 +649,8 @@ impl CdpBackend {
         }
         let _ = ws.close(None).await;
         self.touch();
-        let fallbacks = self.collect_fallbacks(selector).await;
+        self.touch_tab(&sid).await;
+        let fallbacks = self.collect_fallbacks(selector, session).await;
         self.record_step(TrailStep {
             action: "click".into(),
             selector: Some(selector.to_string()),
@@ -478,32 +664,35 @@ impl CdpBackend {
 
     /// Type text like a real keyboard (CDP `Input.insertText` — fires genuine
     /// input events; React and anti-bot both see a human typing).
-    pub async fn type_text(&self, selector: &str, text: &str) -> Result<Value> {
+    pub async fn type_text(
+        &self,
+        selector: &str,
+        text: &str,
+        session: Option<&str>,
+    ) -> Result<Value> {
         // Focus the field first with a real click.
-        let clicked = self.click(selector).await?;
+        let clicked = self.click(selector, session).await?;
         if clicked.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             return Ok(clicked);
         }
-        let active = self
-            .active
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| Error::NotInitialized("no active page — navigate first".into()))?;
+        let (sid, active) = self.active_page(session).await?;
         let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
             .await
             .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
         rpc_expect(&mut ws, "Input.insertText", json!({ "text": text })).await?;
         let _ = ws.close(None).await;
         self.touch();
-        // Confirm what landed in the field.
+        self.touch_tab(&sid).await;
+        // Confirm what landed in the field (may live in an iframe).
         let sel = serde_json::to_string(selector).map_err(|e| Error::Parse(e.to_string()))?;
-        let value = self
-            .evaluate(&format!(
+        let value = eval_across_frames_value(
+            &active.ws_url,
+            &format!(
                 "(() => {{ const el = document.querySelector({sel}); return el ? el.value : null; }})()"
-            ))
-            .await?;
-        let fallbacks = self.collect_fallbacks(selector).await;
+            ),
+        )
+        .await?;
+        let fallbacks = self.collect_fallbacks(selector, session).await;
         self.record_step(TrailStep {
             action: "type".into(),
             selector: Some(selector.to_string()),
@@ -516,7 +705,7 @@ impl CdpBackend {
     }
 
     /// Press a physical key on the focused element (Enter, Tab, Backspace...).
-    pub async fn press_key(&self, key: &str) -> Result<Value> {
+    pub async fn press_key(&self, key: &str, session: Option<&str>) -> Result<Value> {
         let (key_code, text) = match key {
             "Enter" => (13, "\r"),
             "Tab" => (9, "\t"),
@@ -526,12 +715,7 @@ impl CdpBackend {
             "ArrowUp" => (38, ""),
             other => return Err(Error::Unsupported(format!("unsupported key '{other}'"))),
         };
-        let active = self
-            .active
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| Error::NotInitialized("no active page — navigate first".into()))?;
+        let (sid, active) = self.active_page(session).await?;
         let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
             .await
             .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
@@ -552,6 +736,7 @@ impl CdpBackend {
         }
         let _ = ws.close(None).await;
         self.touch();
+        self.touch_tab(&sid).await;
         self.record_step(TrailStep {
             action: "press".into(),
             selector: None,
@@ -563,27 +748,27 @@ impl CdpBackend {
         Ok(json!({ "ok": true, "key": key }))
     }
 
-    pub async fn submit(&self, selector: &str) -> Result<Value> {
+    pub async fn submit(&self, selector: &str, session: Option<&str>) -> Result<Value> {
         let sel = serde_json::to_string(selector).map_err(|e| Error::Parse(e.to_string()))?;
-        self.evaluate(&format!(
-            "(() => {{ const el = document.querySelector({sel}); if (!el) return {{ok:false, reason:'element not found'}};              const form = el.tagName === 'FORM' ? el : el.form; if (!form) return {{ok:false, reason:'no parent form'}};              form.requestSubmit(); return {{ok:true, action: form.action || null}}; }})()"
-        ))
+        let (_, active) = self.active_page(session).await?;
+        eval_across_frames_value(
+            &active.ws_url,
+            &format!(
+                "(() => {{ const el = document.querySelector({sel}); if (!el) return null;              const form = el.tagName === 'FORM' ? el : el.form; if (!form) return {{ok:false, reason:'no parent form'}};              form.requestSubmit(); return {{ok:true, action: form.action || null}}; }})()"
+            ),
+        )
         .await
     }
 
-    /// Capture the active tab as a PNG. `full_page` stitches the whole
+    /// Capture the targeted tab as a PNG. `full_page` stitches the whole
     /// scrollable document (requires `captureBeyondViewport`).
     pub async fn screenshot(
         &self,
         path: &std::path::Path,
         full_page: bool,
+        session: Option<&str>,
     ) -> Result<std::path::PathBuf> {
-        let active = self
-            .active
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| Error::NotInitialized("no active page — navigate first".into()))?;
+        let (sid, active) = self.active_page(session).await?;
         let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
             .await
             .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
@@ -635,27 +820,37 @@ impl CdpBackend {
         std::fs::write(path, &bytes).map_err(Error::Io)?;
         let _ = ws.close(None).await;
         self.touch();
+        self.touch_tab(&sid).await;
         Ok(path.to_path_buf())
     }
 
-    /// Serialize the active tab's rendered DOM (html, title, url).
-    pub async fn current_dom(&self) -> Result<(String, String, String)> {
-        let active = self
-            .active
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| Error::NotInitialized("no active page — navigate first".into()))?;
+    /// Serialize the targeted tab's rendered DOM (html, title, url).
+    /// Child-frame (iframe) HTML is appended so agents can see login forms
+    /// hosted in iframes (e.g. Microsoft's fpt.live.com).
+    pub async fn current_dom(&self, session: Option<&str>) -> Result<(String, String, String)> {
+        let (sid, active) = self.active_page(session).await?;
         let expr = "JSON.stringify({title: document.title, url: location.href, html: document.documentElement.outerHTML})";
         let v = evaluate_js(&active.ws_url, expr).await?;
         let parsed: Value = serde_json::from_str(v.as_str().unwrap_or("{}"))
             .map_err(|e| Error::Parse(e.to_string()))?;
+        let mut html = parsed
+            .get("html")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        // Append iframe contents so snapshot/ask see frame-hosted fields.
+        let frames = collect_frame_htmls(&active.ws_url).await;
+        if !frames.is_empty() {
+            html.push_str(&format!("<div data-lb-frames=\"{}:\">", frames.len()));
+            for (i, fh) in frames.iter().enumerate() {
+                html.push_str(&format!("<div data-lb-frame=\"{i}\">{fh}</div>"));
+            }
+            html.push_str("</div>");
+        }
+        self.touch();
+        self.touch_tab(&sid).await;
         Ok((
-            parsed
-                .get("html")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
+            html,
             parsed
                 .get("title")
                 .and_then(|v| v.as_str())
@@ -1097,6 +1292,212 @@ async fn evaluate_js(ws_url: &str, expression: &str) -> Result<Value> {
         .ok_or_else(|| Error::Parse("evaluate: no value returned".into()))
 }
 
+/// Result of an across-frames evaluation: the value plus the id of the
+/// frame that produced it (`None` = main frame).
+struct FrameEval {
+    frame_id: Option<String>,
+    value: Value,
+}
+
+/// Execute `expression` in the main frame first, then in every child frame
+/// (iframe), returning the first non-null value and its frame. Lets
+/// selectors reach elements inside iframes — e.g. Microsoft's
+/// `fpt.live.com` login fields, invisible to the top-level document.
+async fn eval_across_frames(ws_url: &str, expression: &str) -> Result<FrameEval> {
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
+        .await
+        .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+
+    // Main frame first (no contextId = default context).
+    if let Ok(v) = rpc_expect(
+        &mut ws,
+        "Runtime.evaluate",
+        json!({"expression": expression, "returnByValue": true, "awaitPromise": true}),
+    )
+    .await
+    {
+        if let Some(val) = v.pointer("/result/value") {
+            if !val.is_null() && val.as_str() != Some("undefined") {
+                let _ = ws.close(None).await;
+                return Ok(FrameEval {
+                    frame_id: None,
+                    value: val.clone(),
+                });
+            }
+        }
+    }
+
+    // Child frames via isolated worlds.
+    // CDP returns { frameTree: { frame: {...}, childFrames: [...] } }.
+    let tree = rpc_expect(&mut ws, "Page.getFrameTree", json!({})).await?;
+    let main_id = tree
+        .pointer("/frameTree/frame/id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut frames: Vec<String> = Vec::new();
+    fn walk_frames(node: &Value, out: &mut Vec<String>, main: &str) {
+        if let Some(id) = node.pointer("/frame/id").and_then(|v| v.as_str()) {
+            if id != main {
+                out.push(id.to_string());
+            }
+        }
+        if let Some(children) = node.get("childFrames").and_then(|c| c.as_array()) {
+            for c in children {
+                walk_frames(c, out, main);
+            }
+        }
+    }
+    if let Some(ft) = tree.get("frameTree") {
+        walk_frames(ft, &mut frames, &main_id);
+    }
+
+    for fid in frames {
+        // NOTE: "grantUniveralAccess" is CDP's historical spelling.
+        let world = rpc_expect(
+            &mut ws,
+            "Page.createIsolatedWorld",
+            json!({"frameId": fid, "worldName": "lb-frame", "grantUniveralAccess": true}),
+        )
+        .await;
+        let Ok(world) = world else {
+            continue;
+        };
+        let Some(ctx) = world.get("executionContextId").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        if let Ok(v) = rpc_expect(
+            &mut ws,
+            "Runtime.evaluate",
+            json!({
+                "contextId": ctx,
+                "expression": expression,
+                "returnByValue": true,
+                "awaitPromise": true
+            }),
+        )
+        .await
+        {
+            if let Some(val) = v.pointer("/result/value") {
+                if !val.is_null() && val.as_str() != Some("undefined") {
+                    let _ = ws.close(None).await;
+                    return Ok(FrameEval {
+                        frame_id: Some(fid.clone()),
+                        value: val.clone(),
+                    });
+                }
+            }
+        }
+    }
+    let _ = ws.close(None).await;
+    Err(Error::Parse("no frame returned a value".into()))
+}
+
+/// Value-only wrapper (frame id discarded) — for callers that don't need
+/// frame-aware coordinates.
+async fn eval_across_frames_value(ws_url: &str, expression: &str) -> Result<Value> {
+    eval_across_frames(ws_url, expression)
+        .await
+        .map(|fe| fe.value)
+}
+
+/// Top-viewport offset (x, y) of an iframe element inside its parent
+/// document, via the CDP DOM domain. Used to convert frame-local element
+/// coordinates (getBoundingClientRect) into page-viewport coordinates that
+/// `Input.dispatchMouseEvent` understands.
+async fn iframe_viewport_offset(ws: &mut CdpWs, frame_id: &str) -> Option<(f64, f64)> {
+    let _ = rpc_expect(ws, "DOM.enable", json!({})).await;
+    let owner = rpc_expect(ws, "DOM.getFrameOwner", json!({ "frameId": frame_id }))
+        .await
+        .ok()?;
+    tracing::debug!("cdp: getFrameOwner -> {owner}");
+    // Modern Chrome returns backendNodeId; older returns nodeId. getBoxModel
+    // accepts either.
+    let params = if let Some(bid) = owner.get("backendNodeId").and_then(|v| v.as_u64()) {
+        json!({ "backendNodeId": bid })
+    } else {
+        let nid = owner.get("nodeId").and_then(|v| v.as_u64())?;
+        json!({ "nodeId": nid })
+    };
+    let boxed = rpc_expect(ws, "DOM.getBoxModel", params).await.ok()?;
+    tracing::debug!("cdp: getBoxModel -> {boxed}");
+    let border = boxed.pointer("/model/border").and_then(|b| b.as_array())?;
+    // Flat list: [x1, y1, x2, y2, x3, y3, x4, y4] (top-left first).
+    let x = border.first()?.as_f64()?;
+    let y = border.get(1)?.as_f64()?;
+    Some((x, y))
+}
+
+/// Collect the rendered HTML of every child frame (iframe) of the page, so
+/// snapshot extraction sees login forms and other frame-hosted content.
+async fn collect_frame_htmls(ws_url: &str) -> Vec<String> {
+    let Ok((mut ws, _)) = tokio_tungstenite::connect_async(ws_url).await else {
+        return Vec::new();
+    };
+    let Ok(tree) = rpc_expect(&mut ws, "Page.getFrameTree", json!({})).await else {
+        let _ = ws.close(None).await;
+        return Vec::new();
+    };
+    let main_id = tree
+        .pointer("/frameTree/frame/id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut frames: Vec<String> = Vec::new();
+    fn walk_frames(node: &Value, out: &mut Vec<String>, main: &str) {
+        if let Some(id) = node.pointer("/frame/id").and_then(|v| v.as_str()) {
+            if id != main {
+                out.push(id.to_string());
+            }
+        }
+        if let Some(children) = node.get("childFrames").and_then(|c| c.as_array()) {
+            for c in children {
+                walk_frames(c, out, main);
+            }
+        }
+    }
+    walk_frames(&tree, &mut frames, &main_id);
+
+    if let Some(ft) = tree.get("frameTree") {
+        walk_frames(ft, &mut frames, &main_id);
+    }
+
+    let mut htmls = Vec::new();
+    for fid in frames {
+        let Ok(world) = rpc_expect(
+            &mut ws,
+            "Page.createIsolatedWorld",
+            json!({"frameId": fid, "worldName": "lb-frame", "grantUniveralAccess": true}),
+        )
+        .await
+        else {
+            continue;
+        };
+        let Some(ctx) = world.get("executionContextId").and_then(|v| v.as_u64()) else {
+            continue;
+        };
+        if let Ok(v) = rpc_expect(
+            &mut ws,
+            "Runtime.evaluate",
+            json!({
+                "contextId": ctx,
+                "expression": "document.documentElement.outerHTML",
+                "returnByValue": true
+            }),
+        )
+        .await
+        {
+            if let Some(h) = v.pointer("/result/value").and_then(|x| x.as_str()) {
+                if !h.is_empty() {
+                    htmls.push(h.to_string());
+                }
+            }
+        }
+    }
+    let _ = ws.close(None).await;
+    htmls
+}
+
 /// Send a command and wait for its response (ignoring events in between).
 async fn rpc_expect(ws: &mut CdpWs, method: &str, params: Value) -> Result<Value> {
     let id = next_id();
@@ -1231,7 +1632,7 @@ pub async fn run_runbook(
                 let mut detail = String::new();
                 let mut done = false;
                 for sel in &candidates {
-                    match cdp.click(sel).await {
+                    match cdp.click(sel, None).await {
                         Ok(v) if v.get("ok").and_then(|x| x.as_bool()) == Some(true) => {
                             detail = format!("clicked {sel}");
                             done = true;
@@ -1259,7 +1660,7 @@ pub async fn run_runbook(
                 let mut detail = String::new();
                 let mut done = false;
                 for sel in &candidates {
-                    match cdp.type_text(sel, &text).await {
+                    match cdp.type_text(sel, &text, None).await {
                         Ok(v) if v.get("ok").and_then(|x| x.as_bool()) == Some(true) => {
                             detail = format!("typed into {sel}");
                             done = true;
@@ -1284,7 +1685,7 @@ pub async fn run_runbook(
             }
             "press" => {
                 let key = fill_vars(step.key.as_deref().unwrap_or("Enter"), vars);
-                match cdp.press_key(&key).await {
+                match cdp.press_key(&key, None).await {
                     Ok(v) if v.get("ok").and_then(|x| x.as_bool()) == Some(true) => StepOutcome {
                         step: i,
                         action: "press".into(),
@@ -1319,10 +1720,13 @@ pub async fn run_runbook(
                 let mut found = false;
                 for sel in &candidates {
                     if let Ok(v) = cdp
-                        .evaluate(&format!(
-                            "(() => !!document.querySelector({}))",
-                            serde_json::to_string(sel).unwrap_or_default()
-                        ))
+                        .evaluate(
+                            &format!(
+                                "(() => !!document.querySelector({}))",
+                                serde_json::to_string(sel).unwrap_or_default()
+                            ),
+                            None,
+                        )
                         .await
                     {
                         if v.as_bool() == Some(true) {
@@ -1356,7 +1760,7 @@ pub async fn run_runbook(
     }
 
     // Capture the final page state so callers can verify the goal.
-    let (html, title, _) = cdp.current_dom().await.unwrap_or_default();
+    let (html, title, _) = cdp.current_dom(None).await.unwrap_or_default();
     let text = lightbrowse_core::extract::extract_text(&html);
 
     Ok(RunbookOutcome {

@@ -19,6 +19,14 @@
 - [ ] **Resource manager** — per-tab budgets, eviction, global memory governor
 - [x] **Proxy / SOCKS** support — http/https/socks5/socks5h, both engines,
       runtime-switchable (`--proxy`, `LIGHTBROWSE_PROXY`, `PUT /v1/proxy`, MCP `proxy/set`)
+- [x] **Resource manager** — per-session tabs with LRU eviction at
+      `--max-tabs`, RAM governor evicts idle tabs over budget,
+      `tabs/list` + `tab/close` (HTTP + MCP)
+- [x] **Session isolation** — named `?session=<id>` contexts (own cookies +
+      own tab); actions target the right tab
+- [x] **Iframe support** — snapshot/click/type/submit see and drive fields
+      inside iframes (Microsoft fpt.live.com login, etc.) via CDP frame
+      contexts + viewport offset math
 - [ ] **Stealth options** — fingerprinting toggles for bot-detected sites
 
 ## Reading & extraction (what agents need most)
