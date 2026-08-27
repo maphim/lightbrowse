@@ -36,13 +36,26 @@ pub async fn navigate(
             None => fetch.navigate(session, url).await,
         },
         Engine::Auto => {
-            let page = fetch.navigate(session, url).await?;
-            if looks_js_rendered(&page) {
-                if let Some(c) = cdp {
-                    return c.navigate(session, url).await;
-                }
+            match fetch.navigate(session, url).await {
+                // Fetch worked and the page looks server-rendered — done.
+                Ok(page) if !looks_js_rendered(&page) => Ok(page),
+                // Fetch worked but the page is JS-heavy/challenged — the
+                // real browser can render it.
+                Ok(page) => match cdp {
+                    Some(c) => c.navigate(session, url).await,
+                    None => Ok(page),
+                },
+                // Transient fetch failure (DNS/TCP/TLS — e.g. a network blip
+                // or a site that rejects the fetch UA). Let the real browser
+                // try before giving up.
+                Err(e) => match cdp {
+                    Some(c) => match c.navigate(session, url).await {
+                        Ok(p) => Ok(p),
+                        Err(ce) => Err(ce),
+                    },
+                    None => Err(e),
+                },
             }
-            Ok(page)
         }
     }
 }
