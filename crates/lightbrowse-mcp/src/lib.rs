@@ -101,7 +101,11 @@ impl McpServer {
                 "result": {
                     "protocolVersion": PROTOCOL_VERSION,
                     "capabilities": { "tools": { "listChanged": false } },
-                    "serverInfo": { "name": "lightbrowse", "version": env!("CARGO_PKG_VERSION") }
+                    "serverInfo": {
+                        "name": "lightbrowse",
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "description": "Featherweight browser MCP. 24 tools in 6 groups: [Read] fetch/extract/snapshot/search/ask — [Act] click/type/submit/press/evaluate/screenshot/page/current on live CDP tabs — [Research] research/memory/search — [Runbook] trail/clear + runbook/* — [Session] tabs/list + tab/close — [Network] proxy/get + proxy/set. engine=auto picks fetch first, falls back to headless Chromium; engine=cdp keeps a live tab for actions. Call the 'help' tool for the grouped catalog with use-cases."
+                    }
                 }
             })),
             "notifications/initialized" | "notifications/cancelled" => None,
@@ -148,6 +152,48 @@ impl McpServer {
     async fn call_tool(&self, name: &str, args: &Map<String, Value>) -> Result<String, String> {
         let s = self.state.clone();
         match name {
+            "help" => Ok(pretty(&json!({
+                "about": "lightbrowse — featherweight browser MCP. 24 tools in 6 groups.",
+                "workflow": [
+                    "1. navigate (engine=auto for plain pages, engine=cdp for JS/login-heavy apps)",
+                    "2. snapshot / extract / ask to understand the page",
+                    "3. click / type / submit / press to interact (needs engine=cdp tab)",
+                    "4. page/current (or screenshot) to verify the result",
+                    "5. trail/clear + runbook/save to record a login flow, runbook/run to replay it"
+                ],
+                "groups": [
+                    {
+                        "tag": "[Read]",
+                        "when": "pull content from a URL without interacting",
+                        "tools": ["navigate", "extract", "snapshot", "search", "ask"]
+                    },
+                    {
+                        "tag": "[Act]",
+                        "when": "operate on a live engine=cdp tab (login forms, buttons, JS state)",
+                        "tools": ["click", "type", "submit", "press", "evaluate", "screenshot", "page/current"]
+                    },
+                    {
+                        "tag": "[Research]",
+                        "when": "multi-page research or recall what was already read",
+                        "tools": ["research", "memory/search"]
+                    },
+                    {
+                        "tag": "[Runbook]",
+                        "when": "record & replay action sequences (log in once, replay forever)",
+                        "tools": ["trail/clear", "runbook/save", "runbook/list", "runbook/get", "runbook/run"]
+                    },
+                    {
+                        "tag": "[Session]",
+                        "when": "manage open tabs / Chromium RAM",
+                        "tools": ["tabs/list", "tab/close"]
+                    },
+                    {
+                        "tag": "[Network]",
+                        "when": "route traffic through a proxy (geo-bypass, bot-detected sites)",
+                        "tools": ["proxy/get", "proxy/set"]
+                    }
+                ]
+            }))),
             "navigate" => {
                 let url = req_str(args, "url")?;
                 let engine = parse_engine_arg(args, s.engine)?;
@@ -668,7 +714,7 @@ fn error_response(id: Option<Value>, code: i64, message: &str) -> Value {
 }
 
 fn tools_schema() -> Vec<Value> {
-    vec![
+    let mut tools = vec![
         json!({
             "name": "navigate",
             "description": "Fetch a URL and return a summary: title, status, word count and a text preview of the main content. Cookies from the shared session are applied.",
@@ -925,7 +971,60 @@ fn tools_schema() -> Vec<Value> {
                 }
             }
         }),
-    ]
+        json!({
+            "name": "help",
+            "description": "[Help] Grouped tool catalog: every tool organized into 6 groups with 'use when' guidance plus a recommended workflow. Call this first when unsure which tool fits a task.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+    ];
+
+    // Tag each tool with its group (e.g. "[Read] ...") so agents can filter
+    // the flat tool list quickly. The catalog in `help` uses the same groups.
+    const TAGS: &[(&str, &str)] = &[
+        // [Read] — pull content from a URL without interacting.
+        ("navigate", "[Read]"),
+        ("extract", "[Read]"),
+        ("snapshot", "[Read]"),
+        ("search", "[Read]"),
+        ("ask", "[Read]"),
+        // [Act] — operate on a live engine=cdp tab.
+        ("click", "[Act]"),
+        ("type", "[Act]"),
+        ("submit", "[Act]"),
+        ("press", "[Act]"),
+        ("evaluate", "[Act]"),
+        ("screenshot", "[Act]"),
+        ("page/current", "[Act]"),
+        // [Research] — multi-page / memory recall.
+        ("research", "[Research]"),
+        ("memory/search", "[Research]"),
+        // [Runbook] — record & replay action sequences.
+        ("trail/clear", "[Runbook]"),
+        ("runbook/save", "[Runbook]"),
+        ("runbook/list", "[Runbook]"),
+        ("runbook/get", "[Runbook]"),
+        ("runbook/run", "[Runbook]"),
+        // [Session] — tab / RAM management.
+        ("tabs/list", "[Session]"),
+        ("tab/close", "[Session]"),
+        // [Network] — proxy routing.
+        ("proxy/get", "[Network]"),
+        ("proxy/set", "[Network]"),
+    ];
+    for t in &mut tools {
+        let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some((_, tag)) = TAGS.iter().find(|(n, _)| *n == name) {
+            if let Some(serde_json::Value::String(desc)) = t.get_mut("description") {
+                if !desc.starts_with(tag) {
+                    *desc = format!("{tag} {desc}");
+                }
+            }
+        }
+    }
+    tools
 }
 
 #[cfg(test)]
