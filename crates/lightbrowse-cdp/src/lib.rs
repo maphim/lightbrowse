@@ -104,7 +104,13 @@ impl CdpBackend {
         tokio::spawn(async move {
             loop {
                 tokio::select! {
-                    _ = token.cancelled() => break,
+                    // On shutdown (MCP process exit / Drop), kill Chromium so
+                    // no headless orphan is left behind (macOS issue).
+                    _ = token.cancelled() => {
+                        tracing::info!("cdp: shutdown — cleaning up Chromium");
+                        this.reset_browser().await;
+                        break;
+                    }
                     _ = tokio::time::sleep(Duration::from_secs(5)) => {}
                 }
                 let idle_elapsed = this
@@ -276,13 +282,9 @@ impl CdpBackend {
 
     /// Make sure Chromium is alive and a tab exists; returns the active page.
     async fn ensure_page(&self, url: &str) -> Result<ActivePage> {
-        // Reuse the open tab if we have one.
-        if let Some(p) = self.active.lock().await.clone() {
-            tracing::debug!("cdp: reusing active tab for {url}");
-            return Ok(p);
-        }
         // The browser struct may be alive while the process is actually dead
-        // (crashed/killed) — detect zombies and clean them before spawning.
+        // (crashed/killed) — detect zombies FIRST so we never reuse a dead
+        // tab's websocket (macOS: 'Connection refused' / 'closed connection').
         {
             let mut guard = self.inner.lock().await;
             if let Some(b) = guard.as_mut() {
@@ -292,6 +294,11 @@ impl CdpBackend {
                     self.reset_browser().await;
                 }
             }
+        }
+        // Reuse the open tab if we have one.
+        if let Some(p) = self.active.lock().await.clone() {
+            tracing::debug!("cdp: reusing active tab for {url}");
+            return Ok(p);
         }
         tracing::debug!("cdp: creating new tab for {url}");
         let port = {
@@ -1060,6 +1067,7 @@ fn is_connection_error(e: &Error) -> bool {
     let msg = e.to_string().to_ascii_lowercase();
     msg.contains("closed connection")
         || msg.contains("connection closed")
+        || msg.contains("connection refused")
         || msg.contains("connection reset")
         || msg.contains("unexpected eof")
         || msg.contains("broken pipe")
@@ -1300,4 +1308,59 @@ mod tests {
             "https%3A%2F%2Fa.com%2F%3Fx%3D1%26y%3D2"
         );
     }
+}
+
+/// Integration test: CDP must self-heal when the Chromium process is killed
+/// mid-session (macOS report: "Trying to work with closed connection").
+/// Requires a Chrome/Chromium binary + network; runs in CI via --include-ignored.
+#[tokio::test]
+#[ignore = "requires Chrome + network"]
+async fn recovers_after_chromium_killed() {
+    let config = lightbrowse_core::config::Config {
+        idle_timeout_secs: 300,
+        ..Default::default()
+    };
+    let backend = std::sync::Arc::new(CdpBackend::new(config));
+    let session = Session::new();
+
+    // 1) First navigation works.
+    let p1 = backend
+        .navigate(&session, "https://example.com/")
+        .await
+        .expect("first navigate");
+    assert!(!p1.html.is_empty());
+
+    // 2) Kill the Chromium process tree (simulate silent death).
+    let pid = backend
+        .inner
+        .lock()
+        .await
+        .as_ref()
+        .expect("browser running")
+        .child
+        .id();
+    let _ = std::process::Command::new("pkill")
+        .arg("-9")
+        .arg("-f")
+        .arg("--user-data-dir=.*lightbrowse-chrome")
+        .status();
+    let _ = std::process::Command::new("kill")
+        .arg("-9")
+        .arg(pid.to_string())
+        .status();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // 3) Next navigation must recover: kill old state, spawn fresh Chromium.
+    let p2 = backend
+        .navigate(&session, "https://example.com/")
+        .await
+        .expect("navigate after kill");
+    assert!(!p2.html.is_empty(), "recovered page must have content");
+    assert!(
+        backend.is_running().await,
+        "fresh Chromium should be running"
+    );
+    assert!(backend.navigate_count() >= 2, "both navigations counted");
+
+    backend.reset_browser().await;
 }

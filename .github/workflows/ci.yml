@@ -25,6 +25,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         run: cargo test --workspace
+      - name: Integration tests (CDP self-healing — needs Chrome + network)
+        run: cargo test -p lightbrowse-cdp -- --include-ignored
 
   release-build:
     name: Release build (static-ish, stripped)
