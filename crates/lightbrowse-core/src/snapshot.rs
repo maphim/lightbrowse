@@ -175,7 +175,7 @@ fn direct_text(elm: &ElementRef) -> String {
 
 /// Traverse and build the snapshot tree.
 pub fn snapshot(html: &str, url: &str, opts: &SnapshotOptions) -> SnapshotTree {
-    let doc = Html::parse_document(html);
+    let doc = Html::parse_document(&crate::extract::sanitize(html));
     let title = doc
         .select(&sel("title"))
         .next()

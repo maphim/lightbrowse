@@ -318,7 +318,9 @@ impl McpServer {
                     let page = nav_page(&s, url, engine).await?;
                     if let Some(m) = &s.memory {
                         m.store_page(&page).map_err(|e| e.to_string())?;
-                        let hits = m.search(&topic, 4, Some(&page.url)).map_err(|e| e.to_string())?;
+                        let hits = m
+                            .search(&topic, 4, Some(&page.url))
+                            .map_err(|e| e.to_string())?;
                         results.push(json!({
                             "url": page.url,
                             "title": extract::extract_meta(&page.html).title,
@@ -326,7 +328,9 @@ impl McpServer {
                         }));
                     }
                 }
-                Ok(pretty(&json!({ "topic": topic, "pages": results.len(), "results": results })))
+                Ok(pretty(
+                    &json!({ "topic": topic, "pages": results.len(), "results": results }),
+                ))
             }
             "runbook/run" => {
                 let name = req_str(args, "name")?;

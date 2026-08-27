@@ -313,10 +313,20 @@ async fn main() -> lightbrowse_core::Result<()> {
         } => {
             let mut results = Vec::new();
             for url in &urls {
-                let (page, _) =
-                    nav_cached(&memory, &*fetch, Some(&*cdp_trait), &session, url, engine, ttl).await?;
+                let (page, _) = nav_cached(
+                    &memory,
+                    &*fetch,
+                    Some(&*cdp_trait),
+                    &session,
+                    url,
+                    engine,
+                    ttl,
+                )
+                .await?;
                 memory.store_page(&page).ok();
-                let hits = memory.search(&topic, per_page, Some(&page.url)).unwrap_or_default();
+                let hits = memory
+                    .search(&topic, per_page, Some(&page.url))
+                    .unwrap_or_default();
                 let title = extract::extract_meta(&page.html).title;
                 results.push(json!({
                     "url": page.url,

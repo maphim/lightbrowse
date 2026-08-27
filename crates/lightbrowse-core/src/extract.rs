@@ -14,6 +14,17 @@ pub fn clean(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Remove `<script>`, `<style>`, `<template>` and `<noscript>` blocks before
+/// parsing. Their text is not page content (e.g. embedded JSON config on
+/// AEM sites) and would otherwise pollute extraction and main-content scoring.
+pub fn sanitize(html: &str) -> String {
+    let re = regex::Regex::new(
+        r"(?is)<(script|style|template|noscript)[^>]*>.*?</(script|style|template|noscript)>",
+    )
+    .expect("static sanitize regex");
+    re.replace_all(html, " ").into_owned()
+}
+
 /// Text belonging directly to this element (not its descendants).
 fn direct_text(elm: &ElementRef) -> String {
     let mut s = String::new();
@@ -50,7 +61,8 @@ pub fn is_visible(elm: &ElementRef) -> bool {
     }
     if let Some(style) = e.attr("style") {
         let s = style.to_ascii_lowercase();
-        if s.contains("display:none") || s.contains("visibility:hidden") {
+        if s.contains("display:none") || s.contains("visibility:hidden") || s.contains("opacity:0")
+        {
             return false;
         }
     }
@@ -102,7 +114,7 @@ pub struct Meta {
 }
 
 pub fn extract_meta(html: &str) -> Meta {
-    let doc = Html::parse_document(html);
+    let doc = Html::parse_document(&sanitize(html));
     let mut m = Meta::default();
 
     if let Some(t) = doc.select(&sel("title")).next() {
@@ -148,7 +160,7 @@ pub struct Heading {
 }
 
 pub fn extract_headings(html: &str) -> Vec<Heading> {
-    let doc = Html::parse_document(html);
+    let doc = Html::parse_document(&sanitize(html));
     let mut out = Vec::new();
     for level in 1..=6 {
         for h in doc.select(&sel(&format!("h{level}"))) {
@@ -183,7 +195,7 @@ pub struct Link {
 }
 
 pub fn extract_links(html: &str, base_url: &str) -> Vec<Link> {
-    let doc = Html::parse_document(html);
+    let doc = Html::parse_document(&sanitize(html));
     let base = Url::parse(base_url).ok();
     let mut out = Vec::new();
     for a in doc.select(&sel("a[href]")) {
@@ -232,7 +244,7 @@ pub struct Form {
 }
 
 pub fn extract_forms(html: &str, base_url: &str) -> Vec<Form> {
-    let doc = Html::parse_document(html);
+    let doc = Html::parse_document(&sanitize(html));
     let base = Url::parse(base_url).ok();
     let mut out = Vec::new();
     for f in doc.select(&sel("form")) {
@@ -382,7 +394,7 @@ fn block_text(elm: &ElementRef) -> String {
 }
 
 pub fn extract_text(html: &str) -> TextExtract {
-    let doc = Html::parse_document(html);
+    let doc = Html::parse_document(&sanitize(html));
     let title = doc
         .select(&sel("title"))
         .next()
@@ -546,7 +558,7 @@ pub struct SearchResult {
 }
 
 pub fn extract_search_results(html: &str) -> Vec<SearchResult> {
-    let doc = Html::parse_document(html);
+    let doc = Html::parse_document(&sanitize(html));
     let mut out = Vec::new();
 
     // DDG lite markup: .result > .result__a (title link), .result__snippet
