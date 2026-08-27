@@ -1116,6 +1116,7 @@ dependencies = [
  "axum",
  "lightbrowse-cdp",
  "lightbrowse-core",
+ "lightbrowse-fetch",
  "lightbrowse-memory",
  "serde",
  "serde_json",

@@ -74,6 +74,9 @@ pub struct CdpBackend {
     trail: Mutex<Vec<TrailStep>>,
     last_used: Mutex<Instant>,
     shutdown: CancellationToken,
+    /// Runtime proxy override (set via `set_proxy`). Applied at Chromium
+    /// launch; takes precedence over `config.proxy`.
+    proxy_override: Mutex<Option<String>>,
     /// Highest Chromium RAM ever observed (MB) — for monitoring.
     peak_ram: std::sync::atomic::AtomicU64,
     /// Navigations performed since start.
@@ -89,9 +92,45 @@ impl CdpBackend {
             trail: Mutex::new(Vec::new()),
             last_used: Mutex::new(Instant::now()),
             shutdown: CancellationToken::new(),
+            proxy_override: Mutex::new(None),
             peak_ram: std::sync::atomic::AtomicU64::new(0),
             navigations: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Change the proxy at runtime. The new proxy is applied the next time
+    /// Chromium launches; if a browser is already running it is restarted so
+    /// the change takes effect immediately. Pass `None` to go direct.
+    ///
+    /// The URL is validated up front (http/https/socks5/socks5h).
+    pub async fn set_proxy(&self, proxy: Option<String>) -> lightbrowse_core::Result<()> {
+        if let Some(p) = &proxy {
+            lightbrowse_core::proxy::parse_proxy(p)?;
+        }
+        {
+            let mut guard = self
+                .proxy_override
+                .lock()
+                .map_err(|_| lightbrowse_core::Error::Transport("proxy lock poisoned".into()))?;
+            if *guard == proxy {
+                return Ok(());
+            }
+            *guard = proxy;
+        }
+        if self.is_running().await {
+            tracing::info!("cdp: proxy changed — restarting Chromium");
+            self.reset_browser().await;
+        }
+        Ok(())
+    }
+
+    /// Currently effective proxy URL (`None` = direct).
+    pub fn proxy(&self) -> Option<String> {
+        self.proxy_override
+            .lock()
+            .ok()
+            .and_then(|g| g.clone())
+            .or_else(|| self.config.proxy.clone())
     }
 
     /// Start the idle watcher: after `idle_timeout_secs` without activity the
@@ -218,6 +257,17 @@ impl Drop for CdpBackend {
 }
 
 #[async_trait]
+impl lightbrowse_core::backend::ProxyControl for CdpBackend {
+    async fn set_proxy(&self, proxy: Option<String>) -> Result<()> {
+        CdpBackend::set_proxy(self, proxy).await
+    }
+
+    fn proxy(&self) -> Option<String> {
+        CdpBackend::proxy(self)
+    }
+}
+
+#[async_trait]
 impl BrowserBackend for CdpBackend {
     fn name(&self) -> &'static str {
         "cdp"
@@ -305,7 +355,14 @@ impl CdpBackend {
             let mut guard = self.inner.lock().await;
             if guard.is_none() {
                 tracing::info!("cdp: spawning headless Chromium (lazy)");
-                *guard = Some(CdpBrowser::spawn(&self.config).await?);
+                // Runtime proxy override (if any) wins over config.
+                let mut cfg = self.config.clone();
+                if let Ok(p) = self.proxy_override.lock() {
+                    if let Some(proxy) = p.clone() {
+                        cfg.proxy = Some(proxy);
+                    }
+                }
+                *guard = Some(CdpBrowser::spawn(&cfg).await?);
             }
             guard.as_ref().expect("just spawned").port
         };
@@ -684,6 +741,20 @@ impl CdpBrowser {
             &format!("--user-data-dir={}", user_data.display()),
             "about:blank",
         ]);
+        // Route all Chromium traffic through the configured proxy. The URL is
+        // normalized (e.g. socks5h → socks5, default ports applied) so Chrome
+        // always gets a well-formed `--proxy-server` value.
+        if let Some(proxy) = &config.proxy {
+            match lightbrowse_core::proxy::parse_proxy(proxy) {
+                Ok(spec) => {
+                    tracing::info!("cdp: routing via proxy {}", spec.describe());
+                    cmd.arg(format!("--proxy-server={}", spec.chrome_arg()));
+                }
+                Err(e) => {
+                    tracing::warn!("cdp: ignoring invalid proxy '{proxy}': {e}");
+                }
+            }
+        }
         if low_mem {
             tracing::info!(
                 "cdp: low-memory mode (budget {} MB) — single renderer, no cache",

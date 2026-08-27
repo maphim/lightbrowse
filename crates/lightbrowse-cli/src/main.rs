@@ -43,6 +43,12 @@ struct Cli {
     /// brokerage accounts. Default: temp profile (stateless).
     #[arg(long, global = true)]
     profile: Option<std::path::PathBuf>,
+    /// Route all traffic through a proxy — http://host:port,
+    /// https://host:port, socks5://host:port or socks5h://host:port
+    /// (SOCKS5 with DNS via proxy, recommended for geo-bypass).
+    /// Also settable via LIGHTBROWSE_PROXY.
+    #[arg(long, global = true)]
+    proxy: Option<String>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -160,6 +166,15 @@ async fn main() -> lightbrowse_core::Result<()> {
             .ok()
             .map(std::path::PathBuf::from)
     });
+    // Proxy: CLI flag wins over the environment; validate early so a typo
+    // fails before any request is made.
+    config.proxy = cli
+        .proxy
+        .clone()
+        .or_else(|| std::env::var("LIGHTBROWSE_PROXY").ok());
+    if let Some(p) = &config.proxy {
+        lightbrowse_core::parse_proxy(p)?;
+    }
     // Per-command overrides must land in config BEFORE backends are built.
     if let Cmd::Serve {
         idle_timeout: Some(t),
@@ -172,7 +187,8 @@ async fn main() -> lightbrowse_core::Result<()> {
         config.idle_timeout_secs = config.idle_timeout_secs.min(60);
     }
 
-    let fetch: Arc<dyn BrowserBackend> = Arc::new(FetchBackend::new()?);
+    let fetch: Arc<dyn BrowserBackend> =
+        Arc::new(FetchBackend::with_proxy(config.proxy.as_deref())?);
     let cdp = Arc::new(CdpBackend::new(config.clone()));
     cdp.spawn_idle_watcher();
     let cdp_trait: Arc<dyn BrowserBackend> = cdp.clone();

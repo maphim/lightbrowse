@@ -13,12 +13,15 @@ pub mod cookie;
 pub mod error;
 pub mod extract;
 pub mod page;
+pub mod proxy;
 pub mod service;
 pub mod session;
 pub mod snapshot;
 
 pub use backend::BrowserBackend;
+pub use backend::ProxyControl;
 pub use config::{Config, Engine};
 pub use error::{Error, Result};
 pub use page::Page;
+pub use proxy::{parse_proxy, ProxyKind, ProxySpec};
 pub use session::{Session, SessionOptions};

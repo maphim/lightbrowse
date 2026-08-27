@@ -56,6 +56,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/click", get(click_action))
         .route("/v1/type", get(type_action))
         .route("/v1/submit", get(submit_action))
+        .route("/v1/proxy", get(proxy_get).put(proxy_set))
         .with_state(state)
 }
 
@@ -123,6 +124,87 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
         "cdp_peak_ram_mb": cdp_peak_mb,
         "cdp_navigations": cdp_navs,
     }))
+}
+
+/// Current proxy in effect for each backend.
+///
+/// ```text
+/// GET /v1/proxy  →  { "fetch": "socks5h://...", "cdp": "socks5h://..." }
+/// ```
+async fn proxy_get(State(state): State<AppState>) -> impl IntoResponse {
+    let fetch_proxy = state
+        .backend
+        .as_any()
+        .and_then(|b| b.downcast_ref::<lightbrowse_fetch::FetchBackend>())
+        .and_then(|f| f.proxy());
+    let cdp_proxy = state
+        .cdp
+        .as_ref()
+        .and_then(|c| c.as_any())
+        .and_then(|b| b.downcast_ref::<lightbrowse_cdp::CdpBackend>())
+        .and_then(|c| c.proxy());
+    Json(json!({ "fetch": fetch_proxy, "cdp": cdp_proxy }))
+}
+
+#[derive(Deserialize)]
+struct ProxyBody {
+    /// Proxy URL (http/https/socks5/socks5h) or null/"" to go direct.
+    #[serde(default)]
+    proxy: Option<String>,
+}
+
+/// Set the proxy for both backends at runtime. Chromium (if running) is
+/// restarted so the change applies immediately.
+///
+/// ```text
+/// PUT /v1/proxy  body: { "proxy": "socks5h://host:1080" }
+/// PUT /v1/proxy  body: { "proxy": null }   # back to direct
+/// ```
+async fn proxy_set(State(state): State<AppState>, Json(body): Json<ProxyBody>) -> Response {
+    let proxy = match body.proxy {
+        Some(p) if p.trim().is_empty() => None,
+        Some(p) => {
+            // Validate before touching any backend so a typo leaves state intact.
+            if let Err(e) = lightbrowse_core::parse_proxy(&p) {
+                return ApiError::bad_request(format!("invalid proxy: {e}")).into_response();
+            }
+            Some(p)
+        }
+        None => None,
+    };
+
+    let mut applied = Vec::new();
+    if let Some(f) = state
+        .backend
+        .as_any()
+        .and_then(|b| b.downcast_ref::<lightbrowse_fetch::FetchBackend>())
+    {
+        match f.set_proxy(proxy.as_deref()) {
+            Ok(_) => applied.push("fetch"),
+            Err(e) => {
+                return ApiError::internal(format!("fetch backend: {e}")).into_response();
+            }
+        }
+    }
+    if let Some(c) = state
+        .cdp
+        .as_ref()
+        .and_then(|c| c.as_any())
+        .and_then(|b| b.downcast_ref::<lightbrowse_cdp::CdpBackend>())
+    {
+        match c.set_proxy(proxy.clone()).await {
+            Ok(_) => applied.push("cdp"),
+            Err(e) => {
+                return ApiError::internal(format!("cdp backend: {e}")).into_response();
+            }
+        }
+    }
+    tracing::info!(
+        "proxy: set to {:?} (applied to {})",
+        proxy,
+        applied.join(", ")
+    );
+    Json(json!({ "ok": true, "proxy": proxy, "applied": applied })).into_response()
 }
 
 #[derive(Deserialize)]

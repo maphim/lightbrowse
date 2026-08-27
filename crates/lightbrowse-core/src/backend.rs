@@ -26,3 +26,15 @@ pub trait BrowserBackend: Send + Sync {
         None
     }
 }
+
+/// Runtime proxy control — implemented by backends that can route traffic
+/// through a proxy and switch it without restarting the process.
+#[async_trait]
+pub trait ProxyControl: Send + Sync {
+    /// Change the proxy at runtime (`None` = direct connections).
+    /// Backends that can only apply a proxy at startup may return an error.
+    async fn set_proxy(&self, proxy: Option<String>) -> Result<()>;
+
+    /// Currently effective proxy URL, if any.
+    fn proxy(&self) -> Option<String>;
+}

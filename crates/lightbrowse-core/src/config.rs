@@ -46,6 +46,11 @@ pub struct Config {
     pub max_tabs: usize,
     /// Path to the Chrome/Chromium binary (auto-detected when `None`).
     pub chrome_path: Option<String>,
+    /// Proxy for all traffic — `http://host:port`, `https://host:port`,
+    /// `socks5://host:port` or `socks5h://host:port` (DNS via proxy).
+    /// Applied to both the fetch backend (reqwest) and Chromium
+    /// (`--proxy-server`) when set.
+    pub proxy: Option<String>,
     /// Persistent Chrome profile directory. When set, cookies/localStorage
     /// (i.e. logins) survive restarts. When `None`, a fresh temp profile is
     /// used per Chromium instance (stateless).
@@ -63,6 +68,7 @@ impl Default for Config {
             idle_timeout_secs: 60,
             max_tabs: 4,
             chrome_path: None,
+            proxy: None,
             profile_dir: None,
             js_wait_ms: 800,
         }

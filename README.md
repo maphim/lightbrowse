@@ -297,11 +297,44 @@ RAM" are opposing goals — so you only pay for what you need:
 | CLI flag / env | Default | Meaning |
 |---|---|---|
 | `--engine auto\|fetch\|cdp` | `auto` | engine selection (CLI/MCP/HTTP) |
+| `--proxy <url>` | unset | route all traffic via proxy (see below) |
 | `--idle-timeout <secs>` | `60` | suspend Chromium after idle (serve) |
 | `LIGHTBROWSE_MEMORY_MB` | `1024` | RAM budget |
 | `LIGHTBROWSE_IDLE_TIMEOUT` | `60` | idle timeout for one-shot modes |
 | `LIGHTBROWSE_UI` | unset | set to enable GUI (roadmap) |
+| `LIGHTBROWSE_PROXY` | unset | same as `--proxy` |
 | `CHROME_PATH` | auto-detect | Chrome/Chromium binary |
+
+## Proxy / SOCKS
+
+Route *all* traffic (both engines) through a proxy — useful for geo-bypass,
+bot-detected sites (Reddit, VOZ, ...) or privacy. Supported schemes:
+
+| Scheme | Meaning |
+|---|---|
+| `http://host:port` | HTTP (CONNECT) proxy |
+| `https://host:port` | TLS-encrypted HTTP proxy |
+| `socks5://host:port` | SOCKS5 (DNS resolved locally) |
+| `socks5h://host:port` | SOCKS5 with DNS **through** the proxy — no DNS leak, recommended |
+
+Missing port defaults: `1080` (SOCKS), `8080` (HTTP/HTTPS).
+
+```bash
+# one-shot via CLI
+lightbrowse fetch https://www.reddit.com --proxy socks5h://127.0.0.1:1080
+
+# server-wide (also: LIGHTBROWSE_PROXY env)
+lightbrowse serve --port 8787 --proxy socks5h://127.0.0.1:1080
+
+# switch at runtime (no restart) — applies to fetch AND Chromium
+curl -X PUT localhost:8787/v1/proxy -d '{"proxy":"socks5h://host:1080"}'
+curl localhost:8787/v1/proxy                 # → {"fetch": ..., "cdp": ...}
+curl -X PUT localhost:8787/v1/proxy -d '{"proxy":null}'   # back to direct
+```
+
+Via MCP: `proxy/set` (`{ "proxy": "socks5h://..." | null }`) and `proxy/get`.
+Changing the proxy restarts a running Chromium so it takes effect
+immediately; fetch connections are re-pooled on the fly.
 
 ## Build
 
@@ -319,8 +352,9 @@ Single source of truth: **[ROADMAP.md](ROADMAP.md)** (kept in sync with code).
 
 Highlights:
 - ✅ done — fetch/CDP engines, auto-fallback, actions, runbooks, stealth +
-  profiles, memory, research, screenshots, self-healing, RAM telemetry
-- 🔭 next — proxy/SOCKS support, resource manager, Servo tier (blocked on
+  profiles, memory, research, screenshots, self-healing, RAM telemetry,
+  **proxy/SOCKS** (http/https/socks5/socks5h, runtime-switchable)
+- 🔭 next — resource manager, Servo tier (blocked on
   upstream dependency chain — see [issue #7](https://github.com/maphim/lightbrowse/issues/7))
 
 ## License

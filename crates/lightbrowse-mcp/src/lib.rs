@@ -436,6 +436,63 @@ impl McpServer {
                 let res = cdp.press_key(&key).await.map_err(|e| e.to_string())?;
                 Ok(pretty(&json!({ "key": key, "result": res })))
             }
+            "proxy/get" => {
+                let fetch_proxy = s
+                    .backend
+                    .as_any()
+                    .and_then(|b| b.downcast_ref::<lightbrowse_fetch::FetchBackend>())
+                    .and_then(|f| f.proxy());
+                let cdp_proxy = s
+                    .cdp
+                    .as_ref()
+                    .and_then(|c| c.as_any())
+                    .and_then(|b| b.downcast_ref::<lightbrowse_cdp::CdpBackend>())
+                    .and_then(|c| c.proxy());
+                Ok(pretty(&json!({ "fetch": fetch_proxy, "cdp": cdp_proxy })))
+            }
+            "proxy/set" => {
+                let proxy = match args.get("proxy") {
+                    Some(Value::String(p)) if p.trim().is_empty() => None,
+                    Some(Value::String(p)) => Some(p.clone()),
+                    Some(Value::Null) | None => None,
+                    _ => return Err("proxy must be a string URL or null".into()),
+                };
+                if let Some(p) = &proxy {
+                    lightbrowse_core::parse_proxy(p).map_err(|e| e.to_string())?;
+                }
+                let mut applied = Vec::new();
+                if let Some(f) = s
+                    .backend
+                    .as_any()
+                    .and_then(|b| b.downcast_ref::<lightbrowse_fetch::FetchBackend>())
+                {
+                    f.set_proxy(proxy.as_deref())
+                        .map_err(|e| format!("fetch backend: {e}"))?;
+                    applied.push("fetch");
+                }
+                if let Some(c) = s
+                    .cdp
+                    .as_ref()
+                    .and_then(|c| c.as_any())
+                    .and_then(|b| b.downcast_ref::<lightbrowse_cdp::CdpBackend>())
+                {
+                    c.set_proxy(proxy.clone())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    applied.push("cdp");
+                }
+                tracing::info!(
+                    "mcp proxy/set: {:?} (applied to {})",
+                    proxy,
+                    applied.join(", ")
+                );
+                Ok(pretty(&json!({
+                    "ok": true,
+                    "proxy": proxy,
+                    "applied": applied,
+                    "hint": "next navigate/ask calls will use the proxy; engines are restarted automatically"
+                })))
+            }
             other => Err(format!("unknown tool: {other}")),
         }
     }
@@ -582,6 +639,21 @@ fn tools_schema() -> Vec<Value> {
                     "engine": { "type": "string", "enum": ["auto", "fetch", "cdp"], "description": "auto = fetch first, fall back to headless Chromium for JS-rendered pages" }
                 },
                 "required": ["url"]
+            }
+        }),
+        json!({
+            "name": "proxy/get",
+            "description": "Report the proxy currently in effect for each backend (fetch + cdp). null = direct connections.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "proxy/set",
+            "description": "Route all traffic through a proxy: http://host:port, https://host:port, socks5://host:port or socks5h://host:port (SOCKS5 with DNS via proxy — recommended for geo-bypass / bot-detected sites like Reddit or VOZ). Pass null (or empty string) to go back to direct. Applied to both engines; a running Chromium is restarted automatically.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "proxy": { "type": "string", "description": "Proxy URL, or null/\"\" for direct connections" }
+                }
             }
         }),
         json!({

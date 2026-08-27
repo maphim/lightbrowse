@@ -17,7 +17,8 @@
 - [x] **Orphan cleanup** — Chromium killed on shutdown (no headless orphans)
 - [x] **Token-optimized outputs** — compact snapshot, clipped ask hits (benchmarked)
 - [ ] **Resource manager** — per-tab budgets, eviction, global memory governor
-- [ ] **Proxy / SOCKS** support
+- [x] **Proxy / SOCKS** support — http/https/socks5/socks5h, both engines,
+      runtime-switchable (`--proxy`, `LIGHTBROWSE_PROXY`, `PUT /v1/proxy`, MCP `proxy/set`)
 - [ ] **Stealth options** — fingerprinting toggles for bot-detected sites
 
 ## Reading & extraction (what agents need most)
