@@ -12,7 +12,10 @@
 - [x] **Auto engine** — fetch first, headless Chromium fallback for JS pages
 - [x] **Idle suspension** — Chromium killed after idle timeout, RAM released
 - [x] **Low-memory mode** — budget < 350 MB sheds processes/cache
-- [x] **Real-RAM reporting** — `/health` exposes live `cdp_ram_mb`
+- [x] **Real-RAM reporting** — `/health` exposes live `self_ram_mb`, `cdp_ram_mb`, peak, navs
+- [x] **Self-healing** — dead-Chromium detection, kill + respawn + retry once
+- [x] **Orphan cleanup** — Chromium killed on shutdown (no headless orphans)
+- [x] **Token-optimized outputs** — compact snapshot, clipped ask hits (benchmarked)
 - [ ] **Resource manager** — per-tab budgets, eviction, global memory governor
 - [ ] **Proxy / SOCKS** support
 - [ ] **Stealth options** — fingerprinting toggles for bot-detected sites
@@ -23,6 +26,7 @@
 - [x] Accessibility snapshot with stable `uid`s
 - [x] CSS `selector` on snapshot nodes (for actions)
 - [x] **Intent-aware `ask`** — pass a question, get relevant blocks + score
+- [x] **Token & cost section** — benchmarked savings vs naive reads (see README)
 - [ ] **Page summarization** — optional LLM-less extractive summary
 - [ ] **Diff mode** — compare two versions of a page
 - [ ] **Multi-page research** — batch N URLs, aggregated answer
@@ -59,7 +63,7 @@
 ## Interfaces
 
 - [x] CLI (`fetch`, `extract`, `snapshot`, `search`, `ask`, `memory-*`, `serve`, `mcp`)
-- [x] MCP server — navigate/extract/snapshot/search/ask/memory/click/type/submit/runbook
+- [x] MCP server — navigate/extract/snapshot/search/ask/research/memory/click/type/submit/press/screenshot/evaluate/runbook
 - [x] HTTP API — `/v1/{page,extract,snapshot,search,ask,memory,click,type,submit,current}`
 - [ ] WebSocket streaming for long-running research tasks
 - [ ] Optional GUI (wry) — off by default, for humans who want to watch

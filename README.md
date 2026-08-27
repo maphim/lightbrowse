@@ -42,6 +42,50 @@ HTTP/REST API, and an **MCP server** (Model Context Protocol) so any AI host
 | Cookies/sessions lost between tool calls | shared session with persistent cookie jar |
 | Agents need structure, not pixels | `links`, `forms`, `meta`, `headings`, stable `uid` snapshot |
 | API-key-gated search | built-in DuckDuckGo search (no key) |
+| Token-hungry browsing | intent-aware `ask` + SQLite cache → read at a fraction of the cost |
+
+## Token & cost savings 💰
+
+The whole point: **read the web, not the HTML**. Measured on the same URL
+(Wikipedia Rust article, JSON payload sizes — tokens ≈ bytes/4):
+
+| Mode | Payload | ~Tokens | Best for |
+|---|---|---|---|
+| `fetch` (4k preview) | 4.4 KB | ~1.1 K | quick look |
+| `ask` (6 hits, 300ch) | 3.3 KB | **~0.8 K** | question-driven reading |
+| `snapshot` 100 nodes | 5.2 KB | ~1.3 K | interactive pages |
+| `snapshot` 400 nodes | 55.9 KB | ~14 K | full-page audit (rare) |
+| raw HTML of same page | ~90 KB | ~22 K | — (what a naive fetch gives you) |
+
+**Rules of thumb for agents:**
+1. Prefer `ask <url> "<question>"` over dumping pages — you get only the
+   relevant blocks (13x smaller than a naive read in our test).
+2. Prefer `extract --mode text|links|headings` over `snapshot` for reading.
+3. Use `snapshot` with `max_nodes` (default 400; 100 is plenty for most pages).
+4. Repeated URLs hit the SQLite cache — zero re-fetch tokens.
+
+**Hybrid strategy (recommended):** use lightbrowse for read-only work —
+`fetch`/`extract`/`ask`/`memory/search` — and keep a full DevTools-driven
+browser (e.g. Chrome DevTools MCP) for login-heavy or complex interactive
+flows. lightbrowse's own CDP tier covers the in-between (JS rendering,
+runbooks, actions) when you don't want a second stack.
+
+## RAM telemetry 📡
+
+`GET /health` reports live resource usage — the "light" in lightbrowse is
+measured, not promised:
+
+```json
+{ "self_ram_mb": 8, "cdp_ram_mb": 450, "cdp_peak_ram_mb": 472,
+  "cdp_navigations": 5, "memory_budget_mb": 1024 }
+```
+
+- Fetch engine: **8-12 MB**, flat across 60+ requests (no leak)
+- CDP (Chromium) only spawns when JS is needed; **idle suspension returns RAM
+  to 0**; low-memory mode under 350 MB budget
+- Chromium is **self-healing**: if the process dies (hang/OOM/kill), the next
+  call detects it, kills leftovers, spawns fresh and retries — no stale
+  connection errors (verified by integration test)
 
 ## Features
 
@@ -98,14 +142,15 @@ Available tools:
 |---|---|
 | `navigate(url, engine?)` | title/status/word-count + text preview |
 | `extract(url, mode, engine?)` | structured `text` \| `links` \| `forms` \| `meta` \| `headings` |
-| `snapshot(url, max_nodes?, engine?)` | accessibility tree with stable uids + CSS selectors |
-| `ask(url, question, engine?)` | intent-aware: fetch/cache + scored relevant blocks |
-| `click(selector)` | click an element on the active CDP tab (from snapshot) |
-| `type(selector, text)` | type into an input (React-compatible events) |
-| `submit(selector)` | submit the element's form |
+| `snapshot(url, max_nodes?, engine?)` | compact accessibility tree (nulls skipped) + CSS selectors |
+| `ask(url, question, engine?)` | intent-aware: fetch/cache + scored relevant blocks (clipped) |
+| `research(topic, urls[])` | multi-page: relevant blocks aggregated per page |
+| `click(selector)` / `type(selector, text)` / `submit(selector)` / `press(key)` | real input events on the active CDP tab |
+| `screenshot(path?, full_page?)` | capture the active tab as PNG |
+| `evaluate(expression)` | run JS on the active tab |
 | `page/current` | read the active CDP tab after actions |
-| `memory/search(query)` | BM25 search over everything read |
-| `memory/recent(limit?)` | recently read pages |
+| `runbook/save` \| `run` \| `get` \| `list` | record & replay action recipes (login flows) |
+| `memory/search(query)` / `memory/recent(limit?)` | BM25 search over everything read |
 | `search(query, max_results?)` | DuckDuckGo results (title/url/snippet) |
 
 **Agent interaction loop:** `navigate(url, engine="cdp")` → `snapshot()` → act
