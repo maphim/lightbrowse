@@ -86,13 +86,14 @@ impl CdpBackend {
         });
     }
 
-    /// Kill Chromium and release its RAM.
+    /// Close Chromium gracefully (cookies flushed to the profile) and
+    /// release its RAM. Called on idle timeout / shutdown.
     pub async fn suspend(&self) {
         let mut guard = self.inner.lock().await;
         if let Some(b) = guard.take() {
-            b.kill();
+            b.close_gracefully().await;
             *self.active.lock().await = None;
-            tracing::info!("cdp: Chromium suspended (RAM released)");
+            tracing::info!("cdp: Chromium suspended (RAM released, cookies flushed)");
         }
     }
 
@@ -134,9 +135,15 @@ impl BrowserBackend for CdpBackend {
         Some(self)
     }
 
-    async fn navigate(&self, _session: &Session, url: &str) -> Result<Page> {
+    async fn navigate(&self, session: &Session, url: &str) -> Result<Page> {
         let active = self.ensure_page(url).await?;
-        let result = navigate_and_render(&active.ws_url, url, self.config.js_wait_ms).await;
+        let result = navigate_and_render(
+            &active.ws_url,
+            url,
+            &session.user_agent,
+            self.config.js_wait_ms,
+        )
+        .await;
         if result.is_ok() {
             let ram = self.memory_usage_mb().await;
             if ram > self.config.memory_budget_mb {
@@ -227,26 +234,127 @@ impl CdpBackend {
         Ok(v)
     }
 
-    /// Click an element by CSS selector (from a snapshot's `selector` field).
+    /// Click an element by CSS selector using REAL mouse events (moved →
+    /// pressed → released at the element's center), which is far harder for
+    /// anti-bot systems to flag than `el.click()`.
     pub async fn click(&self, selector: &str) -> Result<Value> {
         let sel = serde_json::to_string(selector).map_err(|e| Error::Parse(e.to_string()))?;
-        self.evaluate(&format!(
-            "(() => {{ const el = document.querySelector({sel}); if (!el) return {{ok:false, reason:'element not found'}};              el.scrollIntoView({{block:'center'}}); el.focus(); el.click(); return {{ok:true, tag: el.tagName.toLowerCase()}}; }})()"
-        ))
-        .await
+        let point = self
+            .evaluate(&format!(
+                "(() => {{ const el = document.querySelector({sel}); if (!el) return null; \
+                 el.scrollIntoView({{block:'center'}}); const r = el.getBoundingClientRect(); \
+                 return {{x: r.x + r.width/2, y: r.y + r.height/2, tag: el.tagName.toLowerCase()}}; }})()"
+            ))
+            .await?;
+        let x = point.get("x").and_then(|v| v.as_f64());
+        let y = point.get("y").and_then(|v| v.as_f64());
+        let Some((x, y)) = x.zip(y) else {
+            return Ok(json!({"ok": false, "reason": "element not found"}));
+        };
+        let tag = point
+            .get("tag")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let active = self
+            .active
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| Error::NotInitialized("no active page — navigate first".into()))?;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
+            .await
+            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+        for (typ, buttons) in [("mouseMoved", 0), ("mousePressed", 1), ("mouseReleased", 0)] {
+            rpc_expect(
+                &mut ws,
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": typ,
+                    "x": x.round() as u64,
+                    "y": y.round() as u64,
+                    "button": "left",
+                    "buttons": buttons,
+                    "clickCount": 1
+                }),
+            )
+            .await?;
+        }
+        let _ = ws.close(None).await;
+        self.touch();
+        Ok(json!({ "ok": true, "tag": tag, "x": x.round() as u64, "y": y.round() as u64 }))
     }
 
-    /// Type text into an input/textarea (React-compatible value setter).
+    /// Type text like a real keyboard (CDP `Input.insertText` — fires genuine
+    /// input events; React and anti-bot both see a human typing).
     pub async fn type_text(&self, selector: &str, text: &str) -> Result<Value> {
+        // Focus the field first with a real click.
+        let clicked = self.click(selector).await?;
+        if clicked.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            return Ok(clicked);
+        }
+        let active = self
+            .active
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| Error::NotInitialized("no active page — navigate first".into()))?;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
+            .await
+            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+        rpc_expect(&mut ws, "Input.insertText", json!({ "text": text })).await?;
+        let _ = ws.close(None).await;
+        self.touch();
+        // Confirm what landed in the field.
         let sel = serde_json::to_string(selector).map_err(|e| Error::Parse(e.to_string()))?;
-        let txt = serde_json::to_string(text).map_err(|e| Error::Parse(e.to_string()))?;
-        self.evaluate(&format!(
-            "(() => {{ const el = document.querySelector({sel}); if (!el) return {{ok:false, reason:'element not found'}};              el.focus(); const proto = el instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;              const setter = Object.getOwnPropertyDescriptor(proto, 'value').set; setter.call(el, {txt});              el.dispatchEvent(new Event('input', {{bubbles:true}})); el.dispatchEvent(new Event('change', {{bubbles:true}}));              return {{ok:true, value: el.value}}; }})()"
-        ))
-        .await
+        let value = self
+            .evaluate(&format!(
+                "(() => {{ const el = document.querySelector({sel}); return el ? el.value : null; }})()"
+            ))
+            .await?;
+        Ok(json!({ "ok": true, "value": value }))
     }
 
-    /// Submit the form containing `selector` (or the form itself).
+    /// Press a physical key on the focused element (Enter, Tab, Backspace...).
+    pub async fn press_key(&self, key: &str) -> Result<Value> {
+        let (key_code, text) = match key {
+            "Enter" => (13, "\r"),
+            "Tab" => (9, "\t"),
+            "Backspace" => (8, "\u{8}"),
+            "Escape" => (27, "\u{1b}"),
+            "ArrowDown" => (40, ""),
+            "ArrowUp" => (38, ""),
+            other => return Err(Error::Unsupported(format!("unsupported key '{other}'"))),
+        };
+        let active = self
+            .active
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| Error::NotInitialized("no active page — navigate first".into()))?;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
+            .await
+            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+        for typ in ["keyDown", "keyUp"] {
+            rpc_expect(
+                &mut ws,
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": typ,
+                    "key": key,
+                    "code": key,
+                    "text": if typ == "keyDown" { text } else { "" },
+                    "windowsVirtualKeyCode": key_code,
+                    "nativeVirtualKeyCode": key_code
+                }),
+            )
+            .await?;
+        }
+        let _ = ws.close(None).await;
+        self.touch();
+        Ok(json!({ "ok": true, "key": key }))
+    }
+
     pub async fn submit(&self, selector: &str) -> Result<Value> {
         let sel = serde_json::to_string(selector).map_err(|e| Error::Parse(e.to_string()))?;
         self.evaluate(&format!(
@@ -294,6 +402,7 @@ impl CdpBackend {
 struct CdpBrowser {
     child: Child,
     port: u16,
+    browser_ws: String,
     _user_data_dir: std::path::PathBuf,
 }
 
@@ -310,14 +419,23 @@ impl CdpBrowser {
             })?;
 
         let port = pick_free_port().await?;
-        let user_data = std::env::temp_dir().join(format!(
-            "lightbrowse-chrome-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0)
-        ));
+        // Persistent profile keeps logins alive across restarts; without one
+        // we use a throwaway temp profile (stateless browsing).
+        let user_data = match &config.profile_dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir).ok();
+                tracing::info!("cdp: using persistent profile {}", dir.display());
+                dir.clone()
+            }
+            None => std::env::temp_dir().join(format!(
+                "lightbrowse-chrome-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            )),
+        };
         std::fs::create_dir_all(&user_data).ok();
 
         // JS heap cap from the memory budget: keep ~250 MB for the browser
@@ -370,13 +488,36 @@ impl CdpBrowser {
 
         // Wait for the DevTools endpoint to come up.
         let http = reqwest::Client::new();
-        wait_for_devtools(&http, port).await?;
+        let browser_ws = wait_for_devtools(&http, port).await?;
 
         Ok(Self {
             child,
             port,
+            browser_ws,
             _user_data_dir: user_data,
         })
+    }
+
+    /// Graceful CDP `Browser.close` first (flushes cookies to the profile),
+    /// then SIGKILL as a fallback. Without this, logins are lost.
+    async fn close_gracefully(mut self) {
+        if let Ok((mut ws, _)) = tokio_tungstenite::connect_async(&self.browser_ws).await {
+            let _ = ws
+                .send(WsMessage::Text(
+                    json!({"id": next_id(), "method": "Browser.close"}).to_string(),
+                ))
+                .await;
+            // Give Chrome a moment to flush and exit.
+            for _ in 0..20 {
+                if self.child.try_wait().ok().flatten().is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            let _ = ws.close(None).await;
+        }
+        tracing::warn!("cdp: Browser.close timed out — killing Chromium");
+        self.kill();
     }
 
     fn kill(mut self) {
@@ -474,6 +615,7 @@ type CdpWs =
 async fn navigate_and_render(
     ws_url: &str,
     url: &str,
+    user_agent: &str,
     js_wait_ms: u64,
 ) -> Result<(String, String, String)> {
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
@@ -481,6 +623,7 @@ async fn navigate_and_render(
         .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
 
     rpc_expect(&mut ws, "Page.enable", json!({})).await?;
+    stealth_setup(&mut ws, user_agent).await?;
 
     // Navigate and wait for the load event (or timeout).
     let nav_id = next_id();
@@ -562,6 +705,50 @@ async fn navigate_and_render(
 
     let _ = ws.close(None).await;
     Ok((html, title, final_url))
+}
+
+/// Hide automation fingerprints before the page runs any script:
+/// - override the User-Agent (removes the `HeadlessChrome` marker)
+/// - neuter `navigator.webdriver`
+/// - restore `window.chrome` / `navigator.plugins` shape (headless lacks them)
+async fn stealth_setup(ws: &mut CdpWs, user_agent: &str) -> Result<()> {
+    if let Err(e) = rpc_expect(
+        ws,
+        "Emulation.setUserAgentOverride",
+        json!({
+            "userAgent": user_agent,
+            "acceptLanguage": "en-US,en;q=0.9,vi;q=0.8",
+            "platform": "Linux x86_64"
+        }),
+    )
+    .await
+    {
+        tracing::warn!("cdp: UA override failed: {e}");
+    }
+    let stealth_js = format!(
+        r#"(() => {{
+    Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
+    Object.defineProperty(navigator, 'userAgent', {{ get: () => {ua_json} }});
+    if (!window.chrome) {{
+        window.chrome = {{ runtime: {{}} }};
+    }}
+    Object.defineProperty(navigator, 'plugins', {{
+        get: () => [1, 2, 3, 4, 5],
+    }});
+    Object.defineProperty(navigator, 'languages', {{
+        get: () => ['en-US', 'en', 'vi'],
+    }});
+}})();
+"#,
+        ua_json = serde_json::to_string(user_agent).map_err(|e| Error::Parse(e.to_string()))?
+    );
+    let _ = rpc_expect(
+        ws,
+        "Page.addScriptToEvaluateOnNewDocument",
+        json!({ "source": stealth_js }),
+    )
+    .await;
+    Ok(())
 }
 
 /// One-shot JS evaluation on a page websocket (opens + closes its own ws).

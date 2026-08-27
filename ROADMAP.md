@@ -44,9 +44,12 @@
 
 ## Actions (make the browser *do* things)
 
-- [x] **click(selector)** via CDP — `document.querySelector().click()`
-- [x] **type(selector, text)** — native value setter + input/change events
+- [x] **click(selector)** via CDP — real mouse events at element coordinates
+- [x] **type(selector, text)** — CDP `Input.insertText` (real keyboard events)
+- [x] **press(key)** — `Input.dispatchKeyEvent` (Enter/Tab/Backspace/...)
 - [x] **submit(selector)** — `form.requestSubmit()`
+- [x] **persistent profile** — logins survive restarts (graceful Browser.close)
+- [x] **stealth** — clean UA, webdriver/plugins/chrome spoof (bot.sannysoft ✓)
 - [ ] **screenshot** — `Page.captureScreenshot` (CDP)
 - [ ] **session cookies across actions** — persist logged-in state
 - [ ] **waits** — wait-for-selector / network-idle helpers

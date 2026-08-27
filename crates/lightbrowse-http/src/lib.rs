@@ -48,6 +48,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/memory/search", get(memory_search))
         .route("/v1/memory/recent", get(memory_recent))
         .route("/v1/current", get(current_page))
+        .route("/v1/evaluate", get(evaluate))
         .route("/v1/click", get(click_action))
         .route("/v1/type", get(type_action))
         .route("/v1/submit", get(submit_action))
@@ -309,6 +310,22 @@ fn require_cdp(state: &AppState) -> Result<&lightbrowse_cdp::CdpBackend, ApiErro
     cdp.as_any()
         .and_then(|b| b.downcast_ref::<lightbrowse_cdp::CdpBackend>())
         .ok_or_else(|| ApiError::internal("cdp backend type mismatch"))
+}
+
+#[derive(Deserialize)]
+struct EvaluateQuery {
+    expression: String,
+}
+
+async fn evaluate(
+    State(state): State<AppState>,
+    Query(q): Query<EvaluateQuery>,
+) -> Result<Response, ApiError> {
+    let res = require_cdp(&state)?
+        .evaluate(&q.expression)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "result": res })).into_response())
 }
 
 async fn current_page(State(state): State<AppState>) -> Result<Response, ApiError> {

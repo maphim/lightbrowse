@@ -85,8 +85,7 @@ impl Default for Session {
 }
 
 /// A modern Chrome UA so that most sites treat us like a real browser.
-pub const DEFAULT_UA: &str = concat!(
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) ",
-    "Chrome/131.0.0.0 Safari/537.36 lightbrowse/",
-    env!("CARGO_PKG_VERSION"),
-);
+/// Deliberately identical to stock Chrome: any `lightbrowse/` suffix would
+/// leak that the client is automated and get logins flagged.
+pub const DEFAULT_UA: &str =
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";

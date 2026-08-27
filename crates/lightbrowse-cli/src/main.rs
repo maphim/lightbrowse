@@ -38,6 +38,11 @@ struct Cli {
     /// Cache TTL in seconds for repeated fetches (default 300).
     #[arg(long, global = true, default_value_t = 300)]
     cache_ttl: i64,
+    /// Persistent Chrome profile directory. Set this to keep logins
+    /// (cookies, localStorage) alive across runs — e.g. for Gmail or
+    /// brokerage accounts. Default: temp profile (stateless).
+    #[arg(long, global = true)]
+    profile: Option<std::path::PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -131,6 +136,11 @@ async fn main() -> lightbrowse_core::Result<()> {
     if let Ok(v) = std::env::var("LIGHTBROWSE_IDLE_TIMEOUT") {
         config.idle_timeout_secs = v.parse().unwrap_or(60);
     }
+    config.profile_dir = cli.profile.clone().or_else(|| {
+        std::env::var("LIGHTBROWSE_PROFILE")
+            .ok()
+            .map(std::path::PathBuf::from)
+    });
     // Per-command overrides must land in config BEFORE backends are built.
     if let Cmd::Serve {
         idle_timeout: Some(t),

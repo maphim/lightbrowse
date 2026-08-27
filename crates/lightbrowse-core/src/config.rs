@@ -46,6 +46,10 @@ pub struct Config {
     pub max_tabs: usize,
     /// Path to the Chrome/Chromium binary (auto-detected when `None`).
     pub chrome_path: Option<String>,
+    /// Persistent Chrome profile directory. When set, cookies/localStorage
+    /// (i.e. logins) survive restarts. When `None`, a fresh temp profile is
+    /// used per Chromium instance (stateless).
+    pub profile_dir: Option<std::path::PathBuf>,
     /// Extra wait after the load event, for lazy-JS pages (milliseconds).
     pub js_wait_ms: u64,
 }
@@ -59,6 +63,7 @@ impl Default for Config {
             idle_timeout_secs: 60,
             max_tabs: 4,
             chrome_path: None,
+            profile_dir: None,
             js_wait_ms: 800,
         }
     }

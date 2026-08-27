@@ -253,6 +253,12 @@ impl McpServer {
                 let pages = m.recent(limit).map_err(|e| e.to_string())?;
                 Ok(pretty(&json!({ "pages": pages })))
             }
+            "evaluate" => {
+                let expression = req_str(args, "expression")?;
+                let cdp = require_cdp(&s)?;
+                let res = cdp.evaluate(&expression).await.map_err(|e| e.to_string())?;
+                Ok(pretty(&json!({ "result": res })))
+            }
             "page/current" => {
                 let cdp = require_cdp(&s)?;
                 let (html, title, url) = cdp.current_dom().await.map_err(|e| e.to_string())?;
@@ -285,6 +291,12 @@ impl McpServer {
                 let cdp = require_cdp(&s)?;
                 let res = cdp.submit(&selector).await.map_err(|e| e.to_string())?;
                 Ok(pretty(&json!({ "selector": selector, "result": res })))
+            }
+            "press" => {
+                let key = req_str(args, "key")?;
+                let cdp = require_cdp(&s)?;
+                let res = cdp.press_key(&key).await.map_err(|e| e.to_string())?;
+                Ok(pretty(&json!({ "key": key, "result": res })))
             }
             other => Err(format!("unknown tool: {other}")),
         }
@@ -498,6 +510,17 @@ fn tools_schema() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "evaluate",
+            "description": "Run arbitrary JavaScript on the ACTIVE CDP tab and return the value. For advanced inspection.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "expression": { "type": "string" }
+                },
+                "required": ["expression"]
+            }
+        }),
+        json!({
             "name": "page/current",
             "description": "Read the ACTIVE CDP tab: url, title, rendered text preview. Use after click/type/submit to see the result.",
             "inputSchema": { "type": "object", "properties": {} }
@@ -534,6 +557,17 @@ fn tools_schema() -> Vec<Value> {
                     "selector": { "type": "string" }
                 },
                 "required": ["selector"]
+            }
+        }),
+        json!({
+            "name": "press",
+            "description": "Press a physical key on the focused element of the ACTIVE CDP tab: Enter, Tab, Backspace, Escape, ArrowDown, ArrowUp.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "enum": ["Enter", "Tab", "Backspace", "Escape", "ArrowDown", "ArrowUp"] }
+                },
+                "required": ["key"]
             }
         }),
         json!({

@@ -149,6 +149,32 @@ crates/
 └── lightbrowse-cli/    the `lightbrowse` binary
 ```
 
+## Logging in (Gmail, brokerage accounts, ...)
+
+lightbrowse is built to get *past* login walls, not to fight CAPTCHAs:
+
+1. **Persistent profile** — `--profile <dir>` (or `LIGHTBROWSE_PROFILE`) keeps
+   cookies + localStorage across restarts. Log in once, the session survives:
+   ```bash
+   lightbrowse serve --profile ~/.config/lightbrowse/gmail
+   # AI logs in via CDP actions → idle → Chromium closes gracefully
+   # (cookies flushed) → next run is still logged in
+   ```
+   Chromium is closed with CDP `Browser.close` (not SIGKILL) so cookies are
+   flushed to the profile.
+2. **Stealth by default** — clean Chrome UA (no `HeadlessChrome`, no
+   `lightbrowse/` marker), `navigator.webdriver` neutered, `window.chrome` /
+   `plugins` / `languages` spoofed. Verified against bot.sannysoft.com.
+3. **Real input events** — clicks are dispatched as mouse events at the
+   element's coordinates (moved → pressed → released); typing uses CDP
+   `Input.insertText` (real keyboard events, React-compatible); keys via
+   `Input.dispatchKeyEvent`. Anti-bot heuristics see a human, not `el.click()`.
+
+**Honest limits:** Google/Cloudflare may still challenge headless Chromium
+with CAPTCHA — that's an arms race. For 2FA (TOTP/SMS) the agent should stop
+and ask the human; lightbrowse won't (and shouldn't) bypass that. Brokerages
+in VN are generally much lighter than Google.
+
 ## Browsing memory (SQLite + FTS5)
 
 Everything the browser reads is cached and indexed at
