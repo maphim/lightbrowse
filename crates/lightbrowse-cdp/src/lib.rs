@@ -580,7 +580,20 @@ impl CdpBackend {
                         cfg.proxy = Some(proxy);
                     }
                 }
-                *guard = Some(CdpBrowser::spawn(&cfg, self.shutdown.clone()).await?);
+                // Spawn with one internal retry: right after a hard-killed
+                // server, the profile can briefly contend with the dying
+                // Chromium (stale socket / port race) and the endpoint may
+                // not come up in time. The failed child is already killed by
+                // spawn(), so a retry is safe and virtually always succeeds.
+                let mut spawned = CdpBrowser::spawn(&cfg, self.shutdown.clone()).await;
+                if spawned.is_err() {
+                    tracing::warn!(
+                        "cdp: Chromium spawn failed — retrying once after a short pause"
+                    );
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    spawned = CdpBrowser::spawn(&cfg, self.shutdown.clone()).await;
+                }
+                *guard = Some(spawned?);
             }
             guard.as_ref().expect("just spawned").port
         };
@@ -1010,6 +1023,11 @@ impl CdpBrowser {
                     .unwrap_or(0)
             )),
         };
+        // A hard-killed previous server (SIGKILL) leaves its Chromium orphaned
+        // and holding the profile's SingletonLock — the next spawn then hangs
+        // ("Chrome DevTools endpoint did not come up in 20s"). Reap orphans
+        // and clear stale locks before launching.
+        clean_stale_profile_locks(&user_data);
         std::fs::create_dir_all(&user_data).ok();
 
         // JS heap cap from the memory budget: keep ~250 MB for the browser
@@ -1070,13 +1088,25 @@ impl CdpBrowser {
         cmd.stdout(Stdio::null())
             .stderr(Stdio::null())
             .stdin(Stdio::null());
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| Error::Transport(format!("failed to launch Chrome ({chrome}): {e}")))?;
 
         // Wait for the DevTools endpoint to come up.
         let http = reqwest::Client::new();
-        let browser_ws = wait_for_devtools(&http, port).await?;
+        let browser_ws = match wait_for_devtools(&http, port).await {
+            Ok(ws) => ws,
+            // Do NOT leak the freshly launched Chrome: a spawn failure (e.g.
+            // endpoint timeout after a profile-lock conflict) must kill the
+            // child, otherwise every retry accumulates another Chromium that
+            // keeps poisoning the profile and times out forever.
+            Err(e) => {
+                tracing::error!("cdp: spawn failed ({e}) — killing freshly launched Chrome");
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
+        };
 
         // Log renderer crashes (Target.targetCrashed) so "Connection reset
         // without closing handshake" failures can be attributed to a real
@@ -1292,9 +1322,9 @@ async fn wait_for_devtools(http: &reqwest::Client, port: u16) -> Result<String> 
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    Err(Error::Transport(
-        "Chrome DevTools endpoint did not come up in 20s".into(),
-    ))
+    Err(Error::Transport(format!(
+        "Chrome DevTools endpoint did not come up in 20s (port {port})"
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -1837,6 +1867,85 @@ async fn rpc_expect(ws: &mut CdpWs, method: &str, params: Value) -> Result<Value
                 let _ = ws.send(WsMessage::Pong(p)).await;
             }
             Ok(Some(Ok(_))) => {}
+        }
+    }
+}
+
+/// Reap orphaned Chromium processes that hold OUR profile dir and clear
+/// their stale profile locks, so a fresh spawn never hangs on a
+/// SingletonLock left by a hard-killed previous server.
+///
+/// Unix-only via /proc. A Chrome whose parent is NOT a live lightbrowse
+/// server (parent died → reparented to init or a subreaper, PPID may be
+/// anything) is safe to SIGKILL; a live owner is left untouched, and locks
+/// are only removed when no live owner remains.
+fn clean_stale_profile_locks(user_data: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        let needle = user_data.display().to_string();
+        let mut live_owner = false;
+        let mut found = 0usize;
+        let mut killed = 0usize;
+        if let Ok(rd) = std::fs::read_dir("/proc") {
+            for e in rd.flatten() {
+                let pid = e.file_name().to_string_lossy().to_string();
+                if !pid.chars().all(|c| c.is_ascii_digit()) {
+                    continue;
+                }
+                let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+                let args: Vec<&str> = std::str::from_utf8(&cmdline)
+                    .unwrap_or("")
+                    .split('\0')
+                    .collect();
+                if !args
+                    .iter()
+                    .any(|a| a.starts_with("--user-data-dir=") && a.contains(&needle))
+                {
+                    continue;
+                }
+                // Decide ownership: the browser MAIN process is directly
+                // parented to the lightbrowse server; its children (renderers,
+                // zygotes — same cmdline profile) are parented to chrome.
+                let ppid: i32 = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .nth(3)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(-1);
+                let parent_cmd = std::fs::read(format!("/proc/{ppid}/cmdline"))
+                    .map(|c| String::from_utf8_lossy(&c).to_string())
+                    .unwrap_or_default();
+                let parent_is_lightbrowse = parent_cmd.contains("lightbrowse");
+                let parent_is_chrome = parent_cmd.contains("chrome");
+                if parent_is_lightbrowse {
+                    live_owner = true;
+                } else if !parent_is_chrome {
+                    // Parent is init, a subreaper, or dead — an orphaned
+                    // browser main. Kill it; children die with it.
+                    killed += 1;
+                    tracing::warn!(
+                        "cdp: killing orphaned Chromium (pid {pid}) holding profile {needle}"
+                    );
+                    let _ = std::process::Command::new("kill")
+                        .arg("-9")
+                        .arg(&pid)
+                        .status();
+                } else {
+                    found += 1;
+                }
+            }
+        }
+        tracing::debug!(
+            "cdp: profile-lock scan for {needle}: {found} chrome procs, {killed} orphaned killed, live_owner={live_owner}"
+        );
+        if !live_owner {
+            for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+                let p = user_data.join(name);
+                if p.exists() {
+                    tracing::info!("cdp: removing stale profile lock {}", p.display());
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
         }
     }
 }
