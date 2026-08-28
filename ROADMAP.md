@@ -27,6 +27,15 @@
 - [x] **Iframe support** — snapshot/click/type/submit see and drive fields
       inside iframes (Microsoft fpt.live.com login, etc.) via CDP frame
       contexts + viewport offset math
+- [x] **OOPIF support** — cross-origin iframes reached via `Target.getTargets`
+      (Chrome doesn't list them in `Page.getFrameTree`)
+- [x] **Tab-level recovery** — read-only tools self-heal after a renderer
+      crash (`Connection reset without closing handshake` / 20s hangs)
+- [x] **Renderer crash logging** — `Target.targetCrashed` listener attributes
+      resets to real crashes instead of guessed network issues
+- [x] **SSO auth sharing** — all CDP sessions share the persistent Chromium
+      profile: log into Microsoft SSO once, Outlook/Teams/SharePoint are
+      auto-authenticated everywhere
 - [ ] **Stealth options** — fingerprinting toggles for bot-detected sites
 
 ## Reading & extraction (what agents need most)
@@ -65,8 +74,12 @@
 - [x] **stealth** — clean UA, webdriver/plugins/chrome spoof (bot.sannysoft ✓)
 - [x] **runbooks** — auto-record action trail → save/run/list/get recipes;
       selector fallbacks + {{VAR}} substitution; final-state verification
-- [ ] **screenshot** — `Page.captureScreenshot` (CDP)
-- [ ] **session cookies across actions** — persist logged-in state
+- [x] **credential vault** — encrypted (AES-256-GCM) password storage;
+      `vault/set|list|get|delete` (CLI + MCP + HTTP); runbook replay can
+      resolve `vault:<name>.<field>` server-side so secrets never enter
+      the LLM context
+- [x] **screenshot** — `Page.captureScreenshot` (CDP)
+- [x] **session cookies across actions** — persist logged-in state
 - [ ] **waits** — wait-for-selector / network-idle helpers
 
 ## Interfaces

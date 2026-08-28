@@ -58,6 +58,23 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum VaultCmd {
+    /// Store (or update) credentials for a website.
+    Set {
+        name: String,
+        url: String,
+        username: String,
+        password: String,
+    },
+    /// List entry names + urls (never secrets).
+    List,
+    /// Print a full entry (username + password).
+    Get { name: String },
+    /// Delete an entry.
+    Delete { name: String },
+}
+
+#[derive(Subcommand)]
 enum Cmd {
     /// Fetch a URL and print a page summary (title, status, text preview).
     Fetch {
@@ -101,6 +118,11 @@ enum Cmd {
         engine: Engine,
         #[arg(long)]
         idle_timeout: Option<u64>,
+    },
+    /// Manage the encrypted credential vault.
+    Vault {
+        #[command(subcommand)]
+        cmd: VaultCmd,
     },
     /// Serve the MCP (Model Context Protocol) server over stdio.
     Mcp {
@@ -398,14 +420,83 @@ async fn main() -> lightbrowse_core::Result<()> {
             };
             lightbrowse_http::serve(&format!("{host}:{port}"), state).await?;
         }
+        Cmd::Vault { cmd } => {
+            use lightbrowse_core::vault::{Vault as VaultStore, VaultEntry};
+            let vault =
+                VaultStore::open(Default::default()).map_err(lightbrowse_core::Error::Parse)?;
+            match cmd {
+                VaultCmd::Set {
+                    name,
+                    url,
+                    username,
+                    password,
+                } => {
+                    vault
+                        .set(
+                            &name,
+                            VaultEntry {
+                                url,
+                                username,
+                                password,
+                                extra: Default::default(),
+                                updated_at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                            },
+                        )
+                        .map_err(lightbrowse_core::Error::Parse)?;
+                    print_json(&json!({"ok": true, "name": name}));
+                }
+                VaultCmd::List => {
+                    let items: Vec<Value> = vault
+                        .list()
+                        .into_iter()
+                        .map(|(n, url, updated)| json!({"name": n, "url": url, "updated_at": updated}))
+                        .collect();
+                    print_json(&json!({"count": items.len(), "entries": items}));
+                }
+                VaultCmd::Get { name } => {
+                    let e = vault.get(&name).ok_or_else(|| {
+                        lightbrowse_core::Error::Parse(format!("vault entry '{name}' not found"))
+                    })?;
+                    print_json(
+                        &json!({"name": name, "url": e.url, "username": e.username, "password": e.password}),
+                    );
+                }
+                VaultCmd::Delete { name } => {
+                    if !vault
+                        .delete(&name)
+                        .map_err(lightbrowse_core::Error::Parse)?
+                    {
+                        return Err(lightbrowse_core::Error::NotInitialized(format!(
+                            "vault entry '{name}' not found"
+                        )));
+                    }
+                    print_json(&json!({"ok": true, "name": name}));
+                }
+            }
+        }
         Cmd::Mcp { engine } => {
             let session = Arc::new(Mutex::new(FetchBackend::new_session(Default::default())));
+            // Encrypted credential vault (auto-creates key + vault file).
+            let vault = match lightbrowse_core::vault::Vault::open(Default::default()) {
+                Ok(v) => {
+                    tracing::info!("vault: unlocked ({} entries)", v.list().len());
+                    Some(Arc::new(v))
+                }
+                Err(e) => {
+                    tracing::warn!("vault: unavailable — {e}");
+                    None
+                }
+            };
             let server = lightbrowse_mcp::McpServer::new(
                 fetch,
                 Some(cdp_trait),
                 session,
                 engine,
                 Some(Arc::new(memory)),
+                vault,
             );
             server.run().await?;
         }

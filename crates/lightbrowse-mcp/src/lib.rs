@@ -28,6 +28,8 @@ pub struct McpState {
     pub session: Arc<Mutex<Session>>,
     pub engine: Engine,
     pub memory: Option<Arc<MemoryStore>>,
+    /// Encrypted credential vault (None when unavailable).
+    pub vault: Option<Arc<lightbrowse_core::vault::Vault>>,
 }
 
 pub struct McpServer {
@@ -41,6 +43,7 @@ impl McpServer {
         session: Arc<Mutex<Session>>,
         engine: Engine,
         memory: Option<Arc<MemoryStore>>,
+        vault: Option<Arc<lightbrowse_core::vault::Vault>>,
     ) -> Self {
         Self {
             state: McpState {
@@ -49,6 +52,7 @@ impl McpServer {
                 session,
                 engine,
                 memory,
+                vault,
             },
         }
     }
@@ -104,7 +108,7 @@ impl McpServer {
                     "serverInfo": {
                         "name": "lightbrowse",
                         "version": env!("CARGO_PKG_VERSION"),
-                        "description": "Featherweight browser MCP. 24 tools in 6 groups: [Read] fetch/extract/snapshot/search/ask — [Act] click/type/submit/press/evaluate/screenshot/page/current on live CDP tabs — [Research] research/memory/search — [Runbook] trail/clear + runbook/* — [Session] tabs/list + tab/close — [Network] proxy/get + proxy/set. engine=auto picks fetch first, falls back to headless Chromium; engine=cdp keeps a live tab for actions. Call the 'help' tool for the grouped catalog with use-cases."
+                        "description": "Featherweight browser MCP. 29 tools in 7 groups: [Read] fetch/extract/snapshot/search/ask — [Act] click/type/submit/press/evaluate/screenshot/page/current on live CDP tabs — [Research] research/memory/search — [Runbook] trail/clear + runbook/* — [Session] tabs/list + tab/close — [Network] proxy/get + proxy/set — [Vault] vault/set + vault/list + vault/get + vault/delete (encrypted credentials). engine=auto picks fetch first, falls back to headless Chromium; engine=cdp keeps a live tab for actions. Call the 'help' tool for the grouped catalog with use-cases."
                     }
                 }
             })),
@@ -152,8 +156,64 @@ impl McpServer {
     async fn call_tool(&self, name: &str, args: &Map<String, Value>) -> Result<String, String> {
         let s = self.state.clone();
         match name {
+            "vault/set" => {
+                let vault = s.vault.as_ref().ok_or("vault unavailable")?;
+                let name = req_str(args, "name")?;
+                let entry = lightbrowse_core::vault::VaultEntry {
+                    url: req_str(args, "url")?,
+                    username: req_str(args, "username")?,
+                    password: req_str(args, "password")?,
+                    extra: args
+                        .get("extra")
+                        .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        .unwrap_or_default(),
+                    updated_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                };
+                vault.set(&name, entry).map_err(|e| e.to_string())?;
+                Ok(pretty(
+                    &json!({"ok": true, "name": name, "note": "stored encrypted (AES-256-GCM)"}),
+                ))
+            }
+            "vault/list" => {
+                let vault = s.vault.as_ref().ok_or("vault unavailable")?;
+                let items: Vec<Value> = vault
+                    .list()
+                    .into_iter()
+                    .map(|(n, url, updated)| json!({"name": n, "url": url, "updated_at": updated}))
+                    .collect();
+                Ok(pretty(&json!({"count": items.len(), "entries": items})))
+            }
+            "vault/get" => {
+                let vault = s.vault.as_ref().ok_or("vault unavailable")?;
+                let name = req_str(args, "name")?;
+                let e = vault
+                    .get(&name)
+                    .ok_or_else(|| format!("vault entry '{name}' not found"))?;
+                // Secrets leave the vault only here (login flows). Redact from
+                // any log path — this JSON is the tool result only.
+                Ok(pretty(&json!({
+                    "name": name,
+                    "url": e.url,
+                    "username": e.username,
+                    "password": e.password,
+                    "extra": e.extra,
+                    "updated_at": e.updated_at
+                })))
+            }
+            "vault/delete" => {
+                let vault = s.vault.as_ref().ok_or("vault unavailable")?;
+                let name = req_str(args, "name")?;
+                let removed = vault.delete(&name).map_err(|e| e.to_string())?;
+                if !removed {
+                    return Err(format!("vault entry '{name}' not found"));
+                }
+                Ok(pretty(&json!({"ok": true, "name": name})))
+            }
             "help" => Ok(pretty(&json!({
-                "about": "lightbrowse — featherweight browser MCP. 24 tools in 6 groups.",
+                "about": "lightbrowse — featherweight browser MCP. 29 tools in 7 groups.",
                 "workflow": [
                     "1. navigate (engine=auto for plain pages, engine=cdp for JS/login-heavy apps)",
                     "2. snapshot / extract / ask to understand the page",
@@ -191,6 +251,11 @@ impl McpServer {
                         "tag": "[Network]",
                         "when": "route traffic through a proxy (geo-bypass, bot-detected sites)",
                         "tools": ["proxy/get", "proxy/set"]
+                    },
+                    {
+                        "tag": "[Vault]",
+                        "when": "store/fetch encrypted credentials for logins — or reference them in runbook/run as vault:<name>.field (resolved server-side, never shown to the LLM)",
+                        "tools": ["vault/set", "vault/list", "vault/get", "vault/delete"]
                     }
                 ]
             }))),
@@ -403,10 +468,25 @@ impl McpServer {
                     .ok_or_else(|| format!("runbook '{name}' not found"))?;
                 let steps: Vec<lightbrowse_cdp::RunbookStep> =
                     serde_json::from_str(&steps_json).map_err(|e| e.to_string())?;
-                let vars: std::collections::HashMap<String, String> = args
+                let mut vars: std::collections::HashMap<String, String> = args
                     .get("variables")
                     .and_then(|v| serde_json::from_value(v.clone()).ok())
                     .unwrap_or_default();
+                // Resolve vault refs ("vault:<name>.<field>") server-side so
+                // secrets never enter the LLM context on replay.
+                if let Some(vault) = &s.vault {
+                    for (k, v) in vars.iter_mut() {
+                        if v.starts_with("vault:") {
+                            match vault.resolve_ref(v) {
+                                Some(Ok(secret)) => *v = secret,
+                                Some(Err(e)) => return Err(e),
+                                None => {
+                                    return Err(format!("unknown vault ref in variable {k}: {v}"))
+                                }
+                            }
+                        }
+                    }
+                }
                 let cdp = require_cdp(&s)?;
                 let outcome = lightbrowse_cdp::run_runbook(cdp, &url, &steps, &vars)
                     .await
@@ -979,6 +1059,52 @@ fn tools_schema() -> Vec<Value> {
                 "properties": {}
             }
         }),
+        // [Vault] — encrypted credential storage (AES-256-GCM at rest).
+        json!({
+            "name": "vault/set",
+            "description": "[Vault] Store (or update) credentials for a website in the encrypted vault. The agent can later fetch them with vault/get, or reference them in runbook/run via vault:<name>.password (resolved server-side, never shown to the LLM).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "entry name, e.g. outlook" },
+                    "url": { "type": "string", "description": "login URL" },
+                    "username": { "type": "string" },
+                    "password": { "type": "string" },
+                    "extra": { "type": "object", "description": "optional extra fields (e.g. pin, security answer)" }
+                },
+                "required": ["name", "url", "username", "password"]
+            }
+        }),
+        json!({
+            "name": "vault/list",
+            "description": "[Vault] List vault entries: name + url only — never secrets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "vault/get",
+            "description": "[Vault] Get a full vault entry (username, password, extra) to fill a login form. Use only when you need to type credentials. Prefer vault refs in runbook/run so the secret stays server-side.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "entry name" }
+                },
+                "required": ["name"]
+            }
+        }),
+        json!({
+            "name": "vault/delete",
+            "description": "[Vault] Delete a vault entry.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" }
+                },
+                "required": ["name"]
+            }
+        }),
     ];
 
     // Tag each tool with its group (e.g. "[Read] ...") so agents can filter
@@ -1013,6 +1139,11 @@ fn tools_schema() -> Vec<Value> {
         // [Network] — proxy routing.
         ("proxy/get", "[Network]"),
         ("proxy/set", "[Network]"),
+        // [Vault] — encrypted credential storage.
+        ("vault/set", "[Vault]"),
+        ("vault/list", "[Vault]"),
+        ("vault/get", "[Vault]"),
+        ("vault/delete", "[Vault]"),
     ];
     for t in &mut tools {
         let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");

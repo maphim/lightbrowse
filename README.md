@@ -254,6 +254,38 @@ Steps carry **selector fallbacks** (`#id`, `[name=...]`, `[placeholder=...]`,
 `[aria-label=...]`) so replays survive small DOM changes. Runbooks live in
 the same SQLite store as browsing memory.
 
+## Credential vault 🔐
+
+Store website credentials **encrypted at rest** (AES-256-GCM) and let the
+agent use them for logins:
+
+```bash
+# CLI
+lightbrowse vault set outlook https://outlook.live.com me@corp.com 'P@ssw0rd'
+lightbrowse vault list          # names + urls only — never secrets
+lightbrowse vault get outlook   # full entry (for the agent to fill forms)
+lightbrowse vault delete outlook
+```
+
+MCP tools: `vault/set`, `vault/list`, `vault/get`, `vault/delete` — the
+agent stores credentials you give it, then fetches them when a login form
+appears. **Two safety levels:**
+
+1. `vault/get` returns the entry so the agent can type it (secret passes
+   through the LLM context — inherent to typed logins).
+2. **Recommended:** reference the vault from a runbook **server-side** —
+   `runbook/run {"variables": {"PASSWORD": "vault:outlook.password"}}`
+   resolves the secret inside lightbrowse, so the LLM never sees it.
+
+Security model:
+
+- Key: `~/.config/lightbrowse/vault.key` (auto-generated, `0600`) or
+  `LIGHTBROWSE_VAULT_KEY` (64 hex chars). Vault file: `vault.enc`, `0600`.
+- `vault/list` and the `help` catalog never expose secrets; secrets are
+  redacted from logs.
+- Key + secrets are `zeroize`d (wiped from RAM) on drop; tampered vault
+  files fail to open (GCM auth tag).
+
 ## Browsing memory (SQLite + FTS5)
 
 Everything the browser reads is cached and indexed at
@@ -307,6 +339,8 @@ RAM" are opposing goals — so you only pay for what you need:
 | `LIGHTBROWSE_MAX_TABS` | unset | same as `--max-tabs` |
 | `LIGHTBROWSE_UA` | auto | User-Agent override. CDP engine derives a version-matched UA from the Chrome binary by default; set this to force a custom UA for both engines |
 | `CHROME_PATH` | auto-detect | Chrome/Chromium binary |
+| `LIGHTBROWSE_VAULT_DIR` | `~/.config/lightbrowse` | vault directory (`vault.enc` + `vault.key`) |
+| `LIGHTBROWSE_VAULT_KEY` | auto | 64-hex master key (overrides key file; else auto-generated `vault.key`, 0600) |
 
 ## Sessions & isolation
 
