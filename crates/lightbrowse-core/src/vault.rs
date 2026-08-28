@@ -27,9 +27,11 @@ pub struct VaultEntry {
     pub url: String,
     pub username: String,
     pub password: String,
-    /// Optional extra fields (e.g. PINs, security answers) — never shown by `list`.
+    /// Optional extra fields — arbitrary JSON (nested objects, arrays, e.g.
+    /// {pin, answers: [...]}). Never shown by `list`. Old string-map entries
+    /// still deserialize (serde_json::Value is a superset).
     #[serde(default)]
-    pub extra: BTreeMap<String, String>,
+    pub extra: serde_json::Value,
     #[serde(default)]
     pub updated_at: u64,
 }
@@ -134,7 +136,46 @@ impl Vault {
             "password" => entry.password,
             "username" => entry.username,
             "url" => entry.url,
-            other => entry.extra.get(other).cloned().unwrap_or_default(),
+            other => {
+                // Nested path into `extra` JSON: answers.0, server.host, ...
+                let mut cur = &entry.extra;
+                let mut ok = true;
+                for part in other.split('.') {
+                    cur = match cur {
+                        serde_json::Value::Object(m) => match m.get(part) {
+                            Some(v) => v,
+                            None => {
+                                ok = false;
+                                break;
+                            }
+                        },
+                        serde_json::Value::Array(a) => {
+                            match part.parse::<usize>().ok().and_then(|i| a.get(i)) {
+                                Some(v) => v,
+                                None => {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    };
+                }
+                if !ok {
+                    return Some(Err(format!(
+                        "vault ref {reference}: field '{field}' not found for entry '{name}'"
+                    )));
+                }
+                match cur {
+                    serde_json::Value::String(s) => s.clone(),
+                    serde_json::Value::Number(n) => n.to_string(),
+                    serde_json::Value::Bool(b) => b.to_string(),
+                    _ => String::new(), // object/array/null — not directly usable
+                }
+            }
         };
         if value.is_empty() {
             Some(Err(format!(
@@ -426,7 +467,7 @@ mod tests {
                 url: "https://outlook.live.com".into(),
                 username: "me@corp.com".into(),
                 password: "pw!".into(),
-                extra: BTreeMap::from([("pin".into(), "1234".into())]),
+                extra: serde_json::json!({ "pin": "1234", "answers": ["a", "b"] }),
                 updated_at: 0,
             },
         )
@@ -440,6 +481,11 @@ mod tests {
             "me@corp.com"
         );
         assert_eq!(v.resolve_ref("vault:outlook.pin").unwrap().unwrap(), "1234");
+        // nested JSON refs work too
+        assert_eq!(
+            v.resolve_ref("vault:outlook.answers.0").unwrap().unwrap(),
+            "a"
+        );
         assert!(v.resolve_ref("vault:missing.password").is_none());
         assert!(v.resolve_ref("not-a-ref").is_none());
         // empty field → error result

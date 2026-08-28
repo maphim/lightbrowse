@@ -1119,7 +1119,7 @@ fn tools_schema() -> Vec<Value> {
                     "url": { "type": "string", "description": "login URL" },
                     "username": { "type": "string" },
                     "password": { "type": "string" },
-                    "extra": { "type": "object", "description": "optional extra fields (e.g. pin, security answer)" }
+                    "extra": { "type": "object", "description": "optional extra fields — arbitrary nested JSON (e.g. {\"pin\": 1234, \"answers\": [\"a\"]}), referenced in runbook/run as vault:<name>.pin or vault:<name>.answers.0" }
                 },
                 "required": ["name", "url", "username", "password"]
             }
