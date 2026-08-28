@@ -15,3 +15,7 @@ async-trait = { workspace = true }
 url = { workspace = true }
 scraper = { workspace = true }
 regex = "1"
+aes-gcm = { workspace = true }
+rand = { workspace = true }
+zeroize = { workspace = true }
+hex = { workspace = true }

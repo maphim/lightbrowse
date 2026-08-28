@@ -17,6 +17,7 @@ pub mod proxy;
 pub mod service;
 pub mod session;
 pub mod snapshot;
+pub mod vault;
 
 pub use backend::BrowserBackend;
 pub use backend::ProxyControl;
