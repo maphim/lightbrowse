@@ -899,6 +899,7 @@ async fn login_action(
         .await
         .map_err(ApiError::from)?;
     let mut saved = serde_json::Value::Null;
+    let mut runbook_saved = serde_json::Value::Null;
     let mut probe = serde_json::Value::Null;
     if res.get("ok").and_then(|v| v.as_bool()) == Some(true) && q.save_vault {
         tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
@@ -927,10 +928,20 @@ async fn login_action(
                 };
                 vault.set(&name, entry).map_err(ApiError::internal)?;
                 saved = json!(name);
+                // Auto-save a replayable runbook of the login steps.
+                let trail = cdp.trail();
+                if !trail.is_empty() {
+                    let steps_json = serde_json::to_string(&trail)
+                        .map_err(|e| ApiError::internal(format!("runbook serialize: {e}")))?;
+                    let rb_name = format!("login-{name}");
+                    if state.memory.save_runbook(&rb_name, url, &steps_json).is_ok() {
+                        runbook_saved = json!(rb_name);
+                    }
+                }
             }
         }
     }
-    Ok(Json(json!({ "login": res, "probe": probe, "vault_saved": saved })).into_response())
+    Ok(Json(json!({ "login": res, "probe": probe, "vault_saved": saved, "runbook_saved": runbook_saved })).into_response())
 }
 
 #[derive(Deserialize)]

@@ -817,6 +817,7 @@ impl McpServer {
 
                 // Auto-save on detected success.
                 let mut saved = json!(null);
+                let mut runbook_saved = json!(null);
                 let mut probe = json!(null);
                 if save_vault {
                     tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
@@ -854,6 +855,21 @@ impl McpServer {
                         } else {
                             return Err("vault unavailable — start with a vault path".into());
                         }
+                        // Auto-save a replayable runbook of the login steps.
+                        let trail = cdp.trail();
+                        if !trail.is_empty() {
+                            if let Some(m) = &s.memory {
+                                let steps_json = serde_json::to_string(&trail)
+                                    .map_err(|e| e.to_string())?;
+                                let rb_name = format!("login-{name}");
+                                if m
+                                    .save_runbook(&rb_name, url, &steps_json)
+                                    .is_ok()
+                                {
+                                    runbook_saved = json!(rb_name);
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -861,6 +877,7 @@ impl McpServer {
                     "login": res,
                     "probe": probe,
                     "vault_saved": saved,
+                    "runbook_saved": runbook_saved,
                 })))
             }
             "fill_form" => {

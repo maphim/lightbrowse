@@ -547,10 +547,22 @@ async fn main() -> lightbrowse_core::Result<()> {
                             },
                         )
                         .map_err(lightbrowse_core::Error::Parse)?;
+                    // Auto-save a replayable runbook of the login steps.
+                    let mut runbook_saved = serde_json::Value::Null;
+                    let trail = cdp.trail();
+                    if !trail.is_empty() {
+                        let steps_json = serde_json::to_string(&trail)
+                            .map_err(|e| lightbrowse_core::Error::Parse(format!("runbook serialize: {e}")))?;
+                        let rb_name = format!("login-{name}");
+                        if memory.save_runbook(&rb_name, cur_url, &steps_json).is_ok() {
+                            runbook_saved = json!(rb_name);
+                        }
+                    }
                     print_json(&json!({
                         "login": res,
                         "probe": probe,
                         "vault_saved": name,
+                        "runbook_saved": runbook_saved,
                     }));
                     return Ok(());
                 }
