@@ -146,7 +146,7 @@ enum Cmd {
         session: Option<String>,
     },
     /// One-call login: navigate to URL, auto-detect username+password
-    /// fields, fill both, submit.
+    /// fields, fill both, submit. Auto-saves to the vault on detected success.
     Login {
         url: String,
         username: String,
@@ -154,6 +154,12 @@ enum Cmd {
         /// Settle wait (ms) after navigate (bot challenges / heavy JS).
         #[arg(long, default_value_t = 3000)]
         settle_ms: u64,
+        /// Disable auto-save to the encrypted vault.
+        #[arg(long)]
+        no_save: bool,
+        /// Vault entry name (default: hostname).
+        #[arg(long)]
+        vault_name: Option<String>,
     },
     /// One-call form/survey fill: navigate, fill fields like a human
     /// (values by label/name + auto test data), optionally submit.
@@ -494,6 +500,8 @@ async fn main() -> lightbrowse_core::Result<()> {
             username,
             password,
             settle_ms,
+            no_save,
+            vault_name,
         } => {
             lightbrowse_core::service::navigate(
                 &*fetch,
@@ -507,7 +515,47 @@ async fn main() -> lightbrowse_core::Result<()> {
                 tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
             }
             let res = cdp.fill_login(&username, &password, None).await?;
-            print_json(&res);
+            if res.get("ok").and_then(|v| v.as_bool()) == Some(true) && !no_save {
+                tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+                let probe = cdp.login_success_probe(None).await?;
+                if probe
+                    .get("detected")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    let cur_url = probe.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                    let name = vault_name.clone().unwrap_or_else(|| {
+                        url::Url::parse(cur_url)
+                            .ok()
+                            .and_then(|u| u.host_str().map(|h| h.to_string()))
+                            .unwrap_or_else(|| "saved-login".into())
+                    });
+                    let vault = lightbrowse_core::vault::Vault::open(Default::default())
+                        .map_err(lightbrowse_core::Error::Parse)?;
+                    vault
+                        .set(
+                            &name,
+                            lightbrowse_core::vault::VaultEntry {
+                                url: cur_url.to_string(),
+                                username: username.clone(),
+                                password: password.clone(),
+                                extra: json!({"source": "login-auto-save"}),
+                                updated_at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                            },
+                        )
+                        .map_err(lightbrowse_core::Error::Parse)?;
+                    print_json(&json!({
+                        "login": res,
+                        "probe": probe,
+                        "vault_saved": name,
+                    }));
+                    return Ok(());
+                }
+            }
+            print_json(&json!({ "login": res }));
         }
         Cmd::FillForm {
             url,
@@ -725,6 +773,9 @@ async fn main() -> lightbrowse_core::Result<()> {
                 engine,
                 config: Arc::new(config),
                 memory: Arc::new(memory),
+                vault: lightbrowse_core::vault::Vault::open(Default::default())
+                    .ok()
+                    .map(Arc::new),
             };
             lightbrowse_http::serve(&format!("{host}:{port}"), state).await?;
         }

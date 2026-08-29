@@ -1491,6 +1491,44 @@ impl CdpBackend {
         }))
     }
 
+    /// Probe whether a login attempt actually succeeded: page left the login
+    /// URL and/or a logged-in indicator (logout link, user menu, avatar)
+    /// appeared. Heuristic — used to decide auto-save to the vault.
+    pub async fn login_success_probe(&self, session: Option<&str>) -> Result<Value> {
+        let expr = r#"(() => {
+  const url = location.href;
+  const onLoginPage = /login|log\s*in|signin|sign\s*in|dang\s*nhap|\u0111\u0103ng\s*nh\u1eadp/i.test(url);
+  const loginLink = document.querySelector('a[href*="login" i], a[href*="log-in" i], a[href*="signin" i], a[href*="sign-in" i]');
+  const logout = document.querySelector('a[href*="logout" i], a[href*="log-out" i], [data-xf-click="logout"]');
+  const userMenu = document.querySelector('.p-navgroup-link--account, .p-navEl--user, [data-user="1"], .navbar-user, .header-account, [class*="account"]');
+  const avatar = document.querySelector('.avatar, img[alt*="avatar" i], .user-avatar');
+  return JSON.stringify({
+    url,
+    on_login_page: !!onLoginPage,
+    has_login_link: !!loginLink,
+    has_logout: !!logout,
+    has_user_menu: !!userMenu,
+    has_avatar: !!avatar
+  });
+})()"#;
+        let v = self.evaluate(expr, session).await?;
+        let raw = v.as_str().unwrap_or("{}");
+        let parsed: Value = serde_json::from_str(raw)
+            .map_err(|e| Error::Parse(format!("login probe parse: {e}")))?;
+        let on_login = parsed.get("on_login_page").and_then(|b| b.as_bool()).unwrap_or(true);
+        let logged_in = parsed.get("has_logout").and_then(|b| b.as_bool()).unwrap_or(false)
+            || parsed.get("has_user_menu").and_then(|b| b.as_bool()).unwrap_or(false);
+        let url = parsed.get("url").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let detected = !on_login || logged_in;
+        Ok(json!({
+            "detected": detected,
+            "on_login_page": on_login,
+            "has_logout": parsed.get("has_logout"),
+            "has_user_menu": parsed.get("has_user_menu"),
+            "url": url,
+        }))
+    }
+
     pub async fn submit(&self, selector: &str, session: Option<&str>) -> Result<Value> {
         let sel = serde_json::to_string(selector).map_err(|e| Error::Parse(e.to_string()))?;
         let (_, active) = self.active_page(session).await?;

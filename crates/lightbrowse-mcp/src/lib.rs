@@ -778,15 +778,90 @@ impl McpServer {
                 Ok(pretty(&json!({ "selector": selector, "result": res })))
             }
             "login" => {
-                let username = req_str(args, "username")?;
-                let password = req_str(args, "password")?;
+                let mut username = req_str(args, "username")?;
+                let mut password = req_str(args, "password")?;
+                let save_vault = args
+                    .get("save_vault")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let vault_name = opt_str(args, "vault_name");
                 let cdp = require_cdp(&s)?;
                 let session = opt_str(args, "session");
+
+                // Resolve vault:<name>.<field> refs server-side so the real
+                // secret is typed AND re-savable, never shown to the LLM.
+                if let Some(vault) = &s.vault {
+                    if password.starts_with("vault:") {
+                        password = match vault.resolve_ref(&password) {
+                            Some(Ok(v)) => v,
+                            Some(Err(e)) => return Err(e),
+                            None => return Err(format!("unknown vault ref: {password}")),
+                        };
+                    }
+                    if username.starts_with("vault:") {
+                        username = match vault.resolve_ref(&username) {
+                            Some(Ok(v)) => v,
+                            Some(Err(e)) => return Err(e),
+                            None => return Err(format!("unknown vault ref: {username}")),
+                        };
+                    }
+                }
+
                 let res = cdp
                     .fill_login(&username, &password, session.as_deref())
                     .await
                     .map_err(|e| e.to_string())?;
-                Ok(pretty(&res))
+                if res.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+                    return Ok(pretty(&res));
+                }
+
+                // Auto-save on detected success.
+                let mut saved = json!(null);
+                let mut probe = json!(null);
+                if save_vault {
+                    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+                    probe = cdp
+                        .login_success_probe(session.as_deref())
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let detected = probe
+                        .get("detected")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if detected {
+                        let url = probe.get("url").and_then(|v| v.as_str()).unwrap_or("");
+                        let name = vault_name.unwrap_or_else(|| {
+                            url::Url::parse(url)
+                                .ok()
+                                .and_then(|u| u.host_str().map(|h| h.to_string()))
+                                .unwrap_or_else(|| "saved-login".into())
+                        });
+                        if let Some(vault) = &s.vault {
+                            let entry = lightbrowse_core::vault::VaultEntry {
+                                url: url.to_string(),
+                                username: username.clone(),
+                                password: password.clone(),
+                                extra: serde_json::json!({"source": "login-auto-save"}),
+                                updated_at: std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0),
+                            };
+                            match vault.set(&name, entry) {
+                                Ok(()) => saved = json!(name),
+                                Err(e) => return Err(e),
+                            }
+                        } else {
+                            return Err("vault unavailable — start with a vault path".into());
+                        }
+                    }
+                }
+
+                Ok(pretty(&json!({
+                    "login": res,
+                    "probe": probe,
+                    "vault_saved": saved,
+                })))
             }
             "fill_form" => {
                 let values = args
@@ -1292,12 +1367,14 @@ fn tools_schema() -> Vec<Value> {
         }),
         json!({
             "name": "login",
-            "description": "ONE-CALL login: detect username+password fields on the current page, fill both, submit. Returns which fields were filled. Password may reference the vault as vault:<name>.field (resolved server-side, never in context).",
+            "description": "ONE-CALL login: detect username+password fields on the current page, fill both, submit. With save_vault=true (default), waits ~2.5s after submit and AUTO-SAVES credentials to the encrypted vault when login success is detected (page left the login URL / logged-in indicator appeared). Password/username may reference the vault as vault:<name>.field (resolved server-side, never in context).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "username": { "type": "string", "description": "username / email / phone" },
+                    "username": { "type": "string", "description": "username / email / phone, or vault:<name>.field" },
                     "password": { "type": "string", "description": "password or vault:<name>.field" },
+                    "save_vault": { "type": "boolean", "default": true, "description": "auto-save to vault on detected login success" },
+                    "vault_name": { "type": "string", "description": "vault entry name (default: hostname, e.g. voz.vn)" },
                     "session": { "type": "string", "description": "optional session id" }
                 },
                 "required": ["username", "password"]
