@@ -147,7 +147,7 @@ impl McpServer {
                     "serverInfo": {
                         "name": "lightbrowse",
                         "version": env!("CARGO_PKG_VERSION"),
-                        "description": "Featherweight browser MCP. 34 tools in 7 groups: [Read] fetch/extract/snapshot/search/ask — [Act] click/click_at/visual_snapshot/type/login/submit/press/evaluate/screenshot/page/current on live CDP tabs — [Download] download/downloads — [Research] research/memory/search — [Runbook] trail/clear + runbook/* — [Session] tabs/list + tab/close — [Network] proxy/get + proxy/set + network/capture + cookies — [Vault] vault/set + vault/list + vault/get + vault/delete (encrypted credentials). engine=auto picks fetch first, falls back to headless Chromium; engine=cdp keeps a live tab for actions. visual_snapshot = SoM numbered overlay for human-like vision agents; click_at = coordinate click; login = one-call username+password fill. Call the 'help' tool for the grouped catalog with use-cases."
+                        "description": "Featherweight browser MCP. 35 tools in 7 groups: [Read] fetch/extract/snapshot/search/ask — [Act] click/click_at/visual_snapshot/type/login/submit/press/evaluate/screenshot/page/current on live CDP tabs — [Download] download/downloads — [Research] research/memory/search — [Runbook] trail/clear + runbook/* — [Session] tabs/list + tab/close — [Network] proxy/get + proxy/set + network/capture + cookies — [Vault] vault/set + vault/list + vault/get + vault/delete (encrypted credentials). engine=auto picks fetch first, falls back to headless Chromium; engine=cdp keeps a live tab for actions. visual_snapshot = SoM numbered overlay for human-like vision agents; click_at = coordinate click; login = one-call username+password fill; fill_form = one-call any-form/survey fill (auto test data). Call the 'help' tool for the grouped catalog with use-cases."
                     }
                 }
             })),
@@ -326,7 +326,7 @@ impl McpServer {
                 }
             }
             "help" => Ok(pretty(&json!({
-                "about": "lightbrowse — featherweight browser MCP. 34 tools in 7 groups.",
+                "about": "lightbrowse — featherweight browser MCP. 35 tools in 7 groups.",
                 "workflow": [
                     "1. navigate (engine=auto for plain pages, engine=cdp for JS/login-heavy apps)",
                     "2. snapshot / extract / ask to understand the page",
@@ -344,7 +344,7 @@ impl McpServer {
                     {
                         "tag": "[Act]",
                         "when": "operate on a live engine=cdp tab (login forms, buttons, JS state)",
-                        "tools": ["click", "click_at", "visual_snapshot", "type", "login", "submit", "press", "evaluate", "screenshot", "page/current"]
+                        "tools": ["click", "click_at", "visual_snapshot", "type", "login", "fill_form", "submit", "press", "evaluate", "screenshot", "page/current"]
                     },
                     {
                         "tag": "[Research]",
@@ -784,6 +784,28 @@ impl McpServer {
                 let session = opt_str(args, "session");
                 let res = cdp
                     .fill_login(&username, &password, session.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(pretty(&res))
+            }
+            "fill_form" => {
+                let values = args
+                    .get("values")
+                    .and_then(|v| v.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                let auto = args
+                    .get("auto")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                let submit = args
+                    .get("submit")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let cdp = require_cdp(&s)?;
+                let session = opt_str(args, "session");
+                let res = cdp
+                    .fill_form(&values, auto, submit, session.as_deref())
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok(pretty(&res))
@@ -1255,6 +1277,20 @@ fn tools_schema() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "fill_form",
+            "description": "Fill ANY form/survey like a human, in one call: enumerates all editable fields (inputs/selects/textareas/checkboxes/radios with labels), matches your values by label/name/id/placeholder, auto-generates sensible test data for the rest (auto=true), optionally submits. values is a JSON object of field label-or-name to value.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "values": { "type": "object", "description": "field label/name/id/placeholder -> value", "additionalProperties": { "type": "string" } },
+                    "auto": { "type": "boolean", "default": true, "description": "fill unmatched fields with generated test data" },
+                    "submit": { "type": "boolean", "default": false, "description": "click the submit/register button after filling" },
+                    "session": { "type": "string", "description": "optional session id" }
+                },
+                "required": ["values"]
+            }
+        }),
+        json!({
             "name": "login",
             "description": "ONE-CALL login: detect username+password fields on the current page, fill both, submit. Returns which fields were filled. Password may reference the vault as vault:<name>.field (resolved server-side, never in context).",
             "inputSchema": {
@@ -1420,6 +1456,7 @@ fn tools_schema() -> Vec<Value> {
         ("visual_snapshot", "[Act]"),
         ("type", "[Act]"),
         ("login", "[Act]"),
+        ("fill_form", "[Act]"),
         ("submit", "[Act]"),
         ("press", "[Act]"),
         ("evaluate", "[Act]"),

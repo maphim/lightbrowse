@@ -112,6 +112,14 @@
       username+password fields (depth-independent), fill both, Enter to submit
       (MCP `login` / HTTP `/v1/login` / CLI `login <url> <user> <pass>`;
       secrets can reference the vault as `vault:<name>.field`)
+- [x] **fill_form(values, auto, submit)** — ONE-CALL form/survey filler like a
+      human: enumerates every editable field (inputs/selects/textareas/
+      checkboxes/radios with labels), matches caller values by label/name/id/
+      placeholder, auto-generates test data for the rest (VN-aware: tên, sđt,
+      tuổi, quốc gia…), fills via real input events, optional submit button
+      detection (MCP `fill_form` / HTTP `POST /v1/form/fill` / CLI
+      `fill-form <url> --values '{...}'`). Live-verified on a 11-field
+      registration form — all filled in one call
 - [x] **type(selector, text)** — CDP `Input.insertText` (real keyboard events)
 - [x] **press(key)** — `Input.dispatchKeyEvent` (Enter/Tab/Backspace/...)
 - [x] **submit(selector)** — `form.requestSubmit()`
