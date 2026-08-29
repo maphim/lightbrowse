@@ -1295,6 +1295,202 @@ impl CdpBackend {
         }))
     }
 
+    /// Generic form/survey filler — the "human fills a form" action.
+    ///
+    /// Enumerates every editable field on the page (inputs, selects,
+    /// textareas, checkboxes, radios) with labels, then:
+    /// 1. matches caller-provided `values` (key = label / name / id / placeholder),
+    /// 2. auto-generates sensible test data for the rest (`auto: true`),
+    /// 3. fills everything and optionally submits.
+    ///
+    /// `values` is a JSON object, e.g. `{"email": "a@b.com", "Họ tên": "A B"}`.
+    pub async fn fill_form(
+        &self,
+        values: &serde_json::Map<String, Value>,
+        auto: bool,
+        submit: bool,
+        session: Option<&str>,
+    ) -> Result<Value> {
+        // ── 1. Enumerate editable fields (depth-independent JS pass).
+        let enum_js = r#"(() => {
+  const out = [];
+  document.querySelectorAll('input, select, textarea').forEach((el) => {
+    const tag = el.tagName.toLowerCase();
+    const t = tag === 'select' ? 'select' : tag === 'textarea' ? 'textarea' : (el.type || 'text').toLowerCase();
+    if (['hidden','submit','button','image','reset','file'].includes(t)) return;
+    if (el.disabled || el.readOnly) return;
+    const label = (el.labels && el.labels.length ? el.labels[0].textContent : (el.closest('label') || {}).textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80);
+    let css = null;
+    if (el.id) css = '#' + CSS.escape(el.id);
+    else if (el.name) css = tag + '[name="' + CSS.escape(el.name) + '"]';
+    else if (el.type === 'checkbox' || el.type === 'radio') return;
+    if (!css) return;
+    out.push({
+      tag, type: t, name: el.name || '', id: el.id || '', placeholder: el.placeholder || '',
+      label, required: !!el.required, checked: !!(el.checked),
+      options: t === 'select' ? Array.from(el.options).filter(o => o.value !== '').map(o => o.textContent.trim().replace(/\s+/g,' ').slice(0, 40)) : [],
+      css
+    });
+  });
+  return JSON.stringify(out);
+})()"#;
+        let v = self.evaluate(enum_js, session).await?;
+        let raw = v.as_str().unwrap_or("[]");
+        let fields: Vec<Value> = serde_json::from_str(raw)
+            .map_err(|e| Error::Parse(format!("fill_form enumerate parse: {e}")))?;
+
+        // ── 2. Build match keys (normalized) for caller values.
+        let norm = |s: &str| -> String {
+            s.to_lowercase().trim().trim_end_matches(':').to_string()
+        };
+        let mut used = std::collections::HashSet::new();
+        let mut filled = Vec::new();
+        let mut unmatched_user_keys = Vec::new();
+
+        for f in &fields {
+            let ftype = f.get("type").and_then(|x| x.as_str()).unwrap_or("text");
+            let name = f.get("name").and_then(|x| x.as_str()).unwrap_or("");
+            let id = f.get("id").and_then(|x| x.as_str()).unwrap_or("");
+            let placeholder = f.get("placeholder").and_then(|x| x.as_str()).unwrap_or("");
+            let label = f.get("label").and_then(|x| x.as_str()).unwrap_or("");
+            let css = f.get("css").and_then(|x| x.as_str()).unwrap_or("").to_string();
+
+            let keys: Vec<String> = [label, name, id, placeholder]
+                .iter()
+                .filter(|s| !s.is_empty())
+                .map(|s| norm(s))
+                .collect();
+
+            // a) explicit value match (exact then substring)
+            let mut value: Option<(&str, &str)> = None; // (user_key, value)
+            'outer: for (uk, uv) in values {
+                let un = norm(uk);
+                for k in &keys {
+                    if *k == un {
+                        value = Some((uk, uv.as_str().unwrap_or("")));
+                        break 'outer;
+                    }
+                }
+            }
+            if value.is_none() {
+                'outer2: for (uk, uv) in values {
+                    let un = norm(uk);
+                    for k in &keys {
+                        if k.contains(&un) || un.contains(k) {
+                            value = Some((uk, uv.as_str().unwrap_or("")));
+                            break 'outer2;
+                        }
+                    }
+                }
+            }
+
+            // b) auto-generate for unmatched fields
+            let options: Vec<Value> = f
+                .get("options")
+                .and_then(|o| o.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let generated = if value.is_none() && auto {
+                Some(auto_value(ftype, &norm(&format!("{name} {label} {placeholder}")), &rand_suffix(), &options))
+            } else {
+                None
+            };
+
+            let val = match (value, generated) {
+                (Some((uk, uv)), _) => {
+                    used.insert(uk.to_string());
+                    uv.to_string()
+                }
+                (None, Some(g)) => g,
+                (None, None) => {
+                    if value.is_none() {
+                        // user key never matched anything
+                    }
+                    continue;
+                }
+            };
+
+            // ── 3. Fill by type.
+            let ok = match ftype {
+                "checkbox" => {
+                    let target = val.eq_ignore_ascii_case("true") || val.eq_ignore_ascii_case("yes") || val == "1" || val.is_empty();
+                    if target != f.get("checked").and_then(|c| c.as_bool()).unwrap_or(false) {
+                        self.click(&css, session).await.map(|r| r.get("ok").and_then(|o| o.as_bool()).unwrap_or(false)).unwrap_or(false)
+                    } else { true }
+                }
+                "radio" => {
+                    self.click(&css, session).await.map(|r| r.get("ok").and_then(|o| o.as_bool()).unwrap_or(false)).unwrap_or(false)
+                }
+                "select" => {
+                    let set_js = format!(
+                        "(() => {{ const el = document.querySelector({sel}); if (!el) return false;                          const want = {want}; const opt = Array.from(el.options).find(o => o.value === want || o.textContent.trim() === want);                          if (!opt) return false; el.value = opt.value;                          el.dispatchEvent(new Event('change', {{bubbles: true}})); return true; }})()",
+                        sel = serde_json::to_string(&css).unwrap_or_default(),
+                        want = serde_json::to_string(&val).unwrap_or_default()
+                    );
+                    self.evaluate(&set_js, session).await
+                        .map(|r| r.as_bool().unwrap_or(false)).unwrap_or(false)
+                }
+                "date" | "time" | "month" => {
+                    let set_js = format!(
+                        "(() => {{ const el = document.querySelector({sel}); if (!el) return false;                          el.value = {want}; el.dispatchEvent(new Event('input', {{bubbles: true}}));                          el.dispatchEvent(new Event('change', {{bubbles: true}})); return el.value === {want}; }})()",
+                        sel = serde_json::to_string(&css).unwrap_or_default(),
+                        want = serde_json::to_string(&val).unwrap_or_default()
+                    );
+                    self.evaluate(&set_js, session).await
+                        .map(|r| r.as_bool().unwrap_or(false)).unwrap_or(false)
+                }
+                _ => {
+                    let typed = self.type_text(&css, &val, session).await?;
+                    typed.get("ok").and_then(|o| o.as_bool()).unwrap_or(false)
+                }
+            };
+
+            filled.push(json!({
+                "field": if !label.is_empty() { label } else if !name.is_empty() { name } else { id },
+                "key": value.map(|(k, _)| k).unwrap_or("(auto)"),
+                "type": ftype,
+                "value": val,
+                "ok": ok,
+            }));
+        }
+
+        for (uk, _) in values {
+            if !used.contains(uk) {
+                unmatched_user_keys.push(uk.clone());
+            }
+        }
+
+        // ── 4. Optional submit.
+        let submitted = if submit {
+            let sub_js = r#"(() => {
+  const btn = Array.from(document.querySelectorAll('button[type=submit], input[type=submit], button'))
+    .find(b => /submit|login|register|sign\s*up|create|save|đăng ký|đăng nhập|đồng ý|tiếp tục|gửi/i.test((b.textContent || b.value || '')));
+  if (btn) { btn.click(); return 'click:' + (btn.textContent || btn.value || '').trim().slice(0, 30); }
+  return null;
+})()"#;
+            let r = self.evaluate(sub_js, session).await;
+            match r {
+                Ok(rr) => match rr.as_str() {
+                    Some(s) if !s.is_empty() && !s.starts_with("null") => json!(s),
+                    _ => {
+                        let k = self.press_key("Enter", session).await?;
+                        json!(k.get("ok"))
+                    }
+                },
+                Err(_) => json!("none"),
+            }
+        } else {
+            json!(false)
+        };
+
+        Ok(json!({
+            "ok": true,
+            "filled": filled,
+            "unmatched_values": unmatched_user_keys,
+            "submitted": submitted,
+        }))
+    }
+
     pub async fn submit(&self, selector: &str, session: Option<&str>) -> Result<Value> {
         let sel = serde_json::to_string(selector).map_err(|e| Error::Parse(e.to_string()))?;
         let (_, active) = self.active_page(session).await?;
@@ -2176,6 +2372,70 @@ async fn stealth_setup(
 }
 
 /// One-shot JS evaluation on a page websocket (opens + closes its own ws).
+/// Generate a plausible test value for an unmatched form field, based on its
+/// type and normalized name/label/placeholder hints. Vietnamese-aware.
+fn auto_value(ftype: &str, hints: &str, rnd: &str, options: &[Value]) -> String {
+    match ftype {
+        "email" => format!("lb.{rnd}@test.dev"),
+        "password" => format!("Passw0rd!{rnd}"),
+        "tel" | "phone" => {
+            // digits-only suffix (rnd is alphanumeric — filter to digits)
+            let digits: String = rnd.chars().filter(|c| c.is_ascii_digit()).take(8).collect();
+            format!("09{digits}")
+        }
+        "number" => {
+            if hints.contains("tuoi") || hints.contains("age") { "25".into() }
+            else if hints.contains("so luong") || hints.contains("quantity") { "2".into() }
+            else { "42".into() }
+        }
+        "date" => "2026-08-30".into(),
+        "select" => options
+            .first()
+            .and_then(|o| o.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "1".into()),
+        "checkbox" | "radio" => "true".into(),
+        _ => {
+            if hints.contains("email") { format!("lb.{rnd}@test.dev") }
+            else if hints.contains("user") || hints.contains("tai khoan") || hints.contains("ten dang nhap") {
+                format!("lbuser{rnd}")
+            } else if hints.contains("pass") || hints.contains("mat khau") {
+                format!("Passw0rd!{rnd}")
+            } else if hints.contains("ho") || hints.contains("ten") || hints.contains("name") {
+                format!("Nguyen Van {rnd}")
+            } else if hints.contains("sdt") || hints.contains("phone") || hints.contains("dien thoai") {
+                let digits: String = rnd.chars().filter(|c| c.is_ascii_digit()).take(8).collect();
+                format!("09{digits}")
+            } else if hints.contains("dia chi") || hints.contains("address") || hints.contains("city") || hints.contains("thanh pho") {
+                "Ha Noi".into()
+            } else if hints.contains("birth") || hints.contains("ngay sinh") || hints.contains("namsinh") {
+                "1991-04-05".into()
+            } else if hints.contains("gioi tinh") || hints.contains("gender") {
+                "Nam".into()
+            } else if ftype == "textarea" {
+                "Test content generated by lightbrowse form filler.".into()
+            } else {
+                format!("test{rnd}")
+            }
+        }
+    }
+}
+
+/// Short pseudo-random alphanumeric suffix for generated values
+/// (time + thread-id hash — no extra crate needed).
+fn rand_suffix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let mut seed = t as u64 ^ std::process::id() as u64;
+    let mut out = String::with_capacity(10);
+    for _ in 0..10 {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let c = ((seed >> 33) % 36) as u8;
+        out.push(if c < 10 { (b'0' + c) as char } else { (b'a' + c - 10) as char });
+    }
+    out
+}
+
 async fn evaluate_js(ws_url: &str, expression: &str) -> Result<Value> {
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
         .await

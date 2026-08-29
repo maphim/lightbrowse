@@ -155,6 +155,23 @@ enum Cmd {
         #[arg(long, default_value_t = 3000)]
         settle_ms: u64,
     },
+    /// One-call form/survey fill: navigate, fill fields like a human
+    /// (values by label/name + auto test data), optionally submit.
+    FillForm {
+        url: String,
+        /// JSON map of field label/name -> value, e.g. '{"email":"a@b.com"}'
+        #[arg(long)]
+        values: Option<String>,
+        /// Fill unmatched fields with generated test data (default true).
+        #[arg(long)]
+        no_auto: bool,
+        /// Click the submit/register button after filling.
+        #[arg(long)]
+        submit: bool,
+        /// Settle wait (ms) after navigate.
+        #[arg(long, default_value_t = 3000)]
+        settle_ms: u64,
+    },
     /// LLM-less extractive summary of a page (top sentences, no API key).
     Summarize {
         url: String,
@@ -490,6 +507,34 @@ async fn main() -> lightbrowse_core::Result<()> {
                 tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
             }
             let res = cdp.fill_login(&username, &password, None).await?;
+            print_json(&res);
+        }
+        Cmd::FillForm {
+            url,
+            values,
+            no_auto,
+            submit,
+            settle_ms,
+        } => {
+            lightbrowse_core::service::navigate(
+                &*fetch,
+                Some(&*cdp_trait),
+                &session,
+                &url,
+                Engine::Cdp,
+            )
+            .await?;
+            if settle_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+            }
+            let values: serde_json::Map<String, Value> = match &values {
+                Some(raw) => serde_json::from_str(raw)
+                    .map_err(|e| lightbrowse_core::Error::Unsupported(format!("values JSON: {e}")))?,
+                None => serde_json::Map::new(),
+            };
+            let res = cdp
+                .fill_form(&values, !no_auto, submit, None)
+                .await?;
             print_json(&res);
         }
         Cmd::Summarize {
