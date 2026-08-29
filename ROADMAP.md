@@ -107,6 +107,11 @@
 ## Actions (make the browser *do* things)
 
 - [x] **click(selector)** via CDP — real mouse events at element coordinates
+- [x] **click_at(x,y)** — coordinate click (SoM/vision “human pointing”)
+- [x] **login(username, password)** — ONE-CALL login: direct JS detection of
+      username+password fields (depth-independent), fill both, Enter to submit
+      (MCP `login` / HTTP `/v1/login` / CLI `login <url> <user> <pass>`;
+      secrets can reference the vault as `vault:<name>.field`)
 - [x] **type(selector, text)** — CDP `Input.insertText` (real keyboard events)
 - [x] **press(key)** — `Input.dispatchKeyEvent` (Enter/Tab/Backspace/...)
 - [x] **submit(selector)** — `form.requestSubmit()`

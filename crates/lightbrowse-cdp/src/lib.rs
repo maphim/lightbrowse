@@ -1065,8 +1065,7 @@ impl CdpBackend {
     /// Click at raw viewport coordinates (CSS px, top-left origin) — the
     /// "human pointing" action for SoM/vision agents. Dispatches a real
     /// mouseMoved → pressed → released sequence at the given point.
-    pub async fn click_at(&self, x: f64, y: f64, session: Option<&str>) -> Result<Value> {
-        let (sid, active) = self.active_page(session).await?;
+    pub async fn click_at(&self, x: f64, y: f64, session: Option<&str>) -> Result<Value> {        let (sid, active) = self.active_page(session).await?;
         if x < 0.0 || y < 0.0 {
             return Ok(json!({ "ok": false, "reason": "coordinates must be >= 0" }));
         }
@@ -1221,6 +1220,79 @@ impl CdpBackend {
             ms: None,
         });
         Ok(json!({ "ok": true, "key": key }))
+    }
+
+    /// One-call login: detect username + password fields on the CURRENT page
+    /// (direct JS pass — depth-independent, unlike the snapshot tree), fill
+    /// both, and submit (Enter on the password field). Returns what was
+    /// filled and where.
+    pub async fn fill_login(
+        &self,
+        username: &str,
+        password: &str,
+        session: Option<&str>,
+    ) -> Result<Value> {
+        let expr = r#"(() => {
+  const inputs = Array.from(document.querySelectorAll('input'));
+  const editable = (i) => {
+    const t = (i.type || 'text').toLowerCase();
+    return !['hidden','checkbox','radio','submit','button','image','reset','file'].includes(t);
+  };
+  const pass = inputs.find(i => (i.type || '').toLowerCase() === 'password');
+  const hint = (i) => (i.name || '') + ' ' + (i.placeholder || '') + ' ' + (i.id || '');
+  const user = inputs.find(i => editable(i) && i !== pass
+      && /(user|login|email|mail|account|username|t\u00ean|t\u00e0i kho\u1ea3n|\u0111\u0103ng nh\u1eadp)/i.test(hint(i)))
+    || inputs.find(i => editable(i) && i !== pass);
+  const css = (el) => {
+    if (!el) return null;
+    if (el.id) return '#' + CSS.escape(el.id);
+    if (el.name) return el.tagName.toLowerCase() + '[name="' + CSS.escape(el.name) + '"]';
+    // nth-of-type path from body
+    const parts = []; let e = el;
+    while (e && e !== document.documentElement) {
+      const sib = Array.from(e.parentElement ? e.parentElement.children : []).filter(c => c.tagName === e.tagName);
+      const idx = sib.indexOf(e) + 1;
+      parts.unshift(e.tagName.toLowerCase() + ':nth-of-type(' + idx + ')');
+      e = e.parentElement;
+    }
+    return parts.join(' > ');
+  };
+  return JSON.stringify({pass: css(pass), user: css(user)});
+})()"#;
+        let v = self.evaluate(expr, session).await?;
+        let raw = v.as_str().unwrap_or("{}");
+        let parsed: Value = serde_json::from_str(raw)
+            .map_err(|e| Error::Parse(format!("fill_login detect parse: {e}")))?;
+        let pass_sel = parsed.get("pass").and_then(|s| s.as_str()).map(|s| s.to_string());
+        let user_sel = parsed.get("user").and_then(|s| s.as_str()).map(|s| s.to_string());
+
+        let Some(pass_sel) = pass_sel else {
+            return Ok(json!({ "ok": false, "reason": "no password field found (input[type=password])" }));
+        };
+        let Some(user_sel) = user_sel else {
+            return Ok(json!({ "ok": false, "reason": "no username field found" }));
+        };
+
+        let mut filled = Vec::new();
+        let u = self.type_text(&user_sel, username, session).await?;
+        filled.push(json!({ "field": "username", "selector": user_sel, "ok": u.get("ok") }));
+        if u.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            return Ok(json!({ "ok": false, "reason": "username fill failed", "filled": filled }));
+        }
+        let p = self.type_text(&pass_sel, password, session).await?;
+        filled.push(json!({ "field": "password", "selector": pass_sel, "ok": p.get("ok") }));
+        if p.get("ok").and_then(|v| v.as_bool()) != Some(true) {
+            return Ok(json!({ "ok": false, "reason": "password fill failed", "filled": filled }));
+        }
+
+        // Submit: Enter on the (focused) password field.
+        let submitted = self.press_key("Enter", session).await?;
+        Ok(json!({
+            "ok": true,
+            "filled": filled,
+            "submitted": submitted,
+            "note": "credentials are handled by the caller; consider vault:<name>.field to keep secrets out of context",
+        }))
     }
 
     pub async fn submit(&self, selector: &str, session: Option<&str>) -> Result<Value> {

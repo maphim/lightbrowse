@@ -147,7 +147,7 @@ impl McpServer {
                     "serverInfo": {
                         "name": "lightbrowse",
                         "version": env!("CARGO_PKG_VERSION"),
-                        "description": "Featherweight browser MCP. 33 tools in 7 groups: [Read] fetch/extract/snapshot/search/ask — [Act] click/click_at/visual_snapshot/type/submit/press/evaluate/screenshot/page/current on live CDP tabs — [Download] download/downloads — [Research] research/memory/search — [Runbook] trail/clear + runbook/* — [Session] tabs/list + tab/close — [Network] proxy/get + proxy/set + network/capture + cookies — [Vault] vault/set + vault/list + vault/get + vault/delete (encrypted credentials). engine=auto picks fetch first, falls back to headless Chromium; engine=cdp keeps a live tab for actions. visual_snapshot = SoM numbered overlay for human-like vision agents; click_at = coordinate click. Call the 'help' tool for the grouped catalog with use-cases."
+                        "description": "Featherweight browser MCP. 34 tools in 7 groups: [Read] fetch/extract/snapshot/search/ask — [Act] click/click_at/visual_snapshot/type/login/submit/press/evaluate/screenshot/page/current on live CDP tabs — [Download] download/downloads — [Research] research/memory/search — [Runbook] trail/clear + runbook/* — [Session] tabs/list + tab/close — [Network] proxy/get + proxy/set + network/capture + cookies — [Vault] vault/set + vault/list + vault/get + vault/delete (encrypted credentials). engine=auto picks fetch first, falls back to headless Chromium; engine=cdp keeps a live tab for actions. visual_snapshot = SoM numbered overlay for human-like vision agents; click_at = coordinate click; login = one-call username+password fill. Call the 'help' tool for the grouped catalog with use-cases."
                     }
                 }
             })),
@@ -326,7 +326,7 @@ impl McpServer {
                 }
             }
             "help" => Ok(pretty(&json!({
-                "about": "lightbrowse — featherweight browser MCP. 33 tools in 7 groups.",
+                "about": "lightbrowse — featherweight browser MCP. 34 tools in 7 groups.",
                 "workflow": [
                     "1. navigate (engine=auto for plain pages, engine=cdp for JS/login-heavy apps)",
                     "2. snapshot / extract / ask to understand the page",
@@ -344,7 +344,7 @@ impl McpServer {
                     {
                         "tag": "[Act]",
                         "when": "operate on a live engine=cdp tab (login forms, buttons, JS state)",
-                        "tools": ["click", "click_at", "visual_snapshot", "type", "submit", "press", "evaluate", "screenshot", "page/current"]
+                        "tools": ["click", "click_at", "visual_snapshot", "type", "login", "submit", "press", "evaluate", "screenshot", "page/current"]
                     },
                     {
                         "tag": "[Research]",
@@ -776,6 +776,17 @@ impl McpServer {
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok(pretty(&json!({ "selector": selector, "result": res })))
+            }
+            "login" => {
+                let username = req_str(args, "username")?;
+                let password = req_str(args, "password")?;
+                let cdp = require_cdp(&s)?;
+                let session = opt_str(args, "session");
+                let res = cdp
+                    .fill_login(&username, &password, session.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(pretty(&res))
             }
             "submit" => {
                 let selector = req_str(args, "selector")?;
@@ -1244,6 +1255,19 @@ fn tools_schema() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "login",
+            "description": "ONE-CALL login: detect username+password fields on the current page, fill both, submit. Returns which fields were filled. Password may reference the vault as vault:<name>.field (resolved server-side, never in context).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "username": { "type": "string", "description": "username / email / phone" },
+                    "password": { "type": "string", "description": "password or vault:<name>.field" },
+                    "session": { "type": "string", "description": "optional session id" }
+                },
+                "required": ["username", "password"]
+            }
+        }),
+        json!({
             "name": "type",
             "description": "Type text into an input/textarea on the ACTIVE CDP tab (React-compatible events).",
             "inputSchema": {
@@ -1395,6 +1419,7 @@ fn tools_schema() -> Vec<Value> {
         ("click_at", "[Act]"),
         ("visual_snapshot", "[Act]"),
         ("type", "[Act]"),
+        ("login", "[Act]"),
         ("submit", "[Act]"),
         ("press", "[Act]"),
         ("evaluate", "[Act]"),

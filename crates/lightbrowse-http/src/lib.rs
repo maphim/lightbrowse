@@ -59,6 +59,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runbook/run", axum::routing::post(runbook_run))
         .route("/v1/click", get(click_action))
         .route("/v1/click_at", get(click_at_action))
+        .route("/v1/login", get(login_action))
         .route("/v1/visual_snapshot", get(visual_snapshot))
         .route("/v1/type", get(type_action))
         .route("/v1/submit", get(submit_action))
@@ -692,6 +693,7 @@ fn openapi_spec() -> Value {
             "/v1/screenshot": { "get": { "summary": "Screenshot the active CDP tab", "responses": { "200": {"description": "PNG"} } } },
             "/v1/click": { "get": { "summary": "Click a CSS selector on the active tab", "parameters": [{"name": "selector", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "click result"} } } },
             "/v1/click_at": { "get": { "summary": "Click at viewport coordinates (CSS px) — the human-pointing action for SoM/vision", "parameters": [{"name": "x", "in": "query", "required": true, "schema": {"type": "number"}}, {"name": "y", "in": "query", "required": true, "schema": {"type": "number"}}], "responses": { "200": {"description": "click result"} } } },
+            "/v1/login": { "get": { "summary": "One-call login: auto-detect username+password fields on the active tab, fill both, submit", "parameters": [{"name": "username", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "password", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "fill result"} } } },
             "/v1/visual_snapshot": { "get": { "summary": "Vision-grounded look: screenshot + Set-of-Mark numbered overlay + uid map (base64 image)", "parameters": [{"name": "max_marks", "in": "query", "schema": {"type": "integer"}}, {"name": "max_nodes", "in": "query", "schema": {"type": "integer"}}], "responses": { "200": {"description": "JSON with image_base64 + map"} } } },
             "/v1/type": { "get": { "summary": "Type text into an input on the active tab", "parameters": [{"name": "selector", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "text", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "type result"} } } },
             "/v1/tabs": { "get": { "summary": "List open CDP tabs", "responses": { "200": {"description": "tabs"} } } },
@@ -847,6 +849,27 @@ async fn click_action(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "selector": q.selector, "result": res })).into_response())
+}
+
+#[derive(Deserialize)]
+struct LoginQuery {
+    username: String,
+    password: String,
+    /// Optional session id.
+    session: Option<String>,
+}
+
+/// One-call login: auto-detect username+password fields, fill both, submit.
+async fn login_action(
+    State(state): State<AppState>,
+    Query(q): Query<LoginQuery>,
+) -> Result<Response, ApiError> {
+    let cdp_session = resolve_cdp_session(&state, q.session.as_deref())?;
+    let res = require_cdp(&state)?
+        .fill_login(&q.username, &q.password, cdp_session.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(res).into_response())
 }
 
 #[derive(Deserialize)]
