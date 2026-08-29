@@ -57,6 +57,18 @@ pub struct Config {
     pub profile_dir: Option<std::path::PathBuf>,
     /// Extra wait after the load event, for lazy-JS pages (milliseconds).
     pub js_wait_ms: u64,
+    /// Attach to an EXISTING Chrome/Chromium DevTools endpoint instead of
+    /// spawning a fresh headless instance — e.g. the user's real browser
+    /// started with `--remote-debugging-port`, already logged in. Accepts
+    /// `http://host:port` or `ws://.../devtools/browser/...`.
+    pub cdp_url: Option<String>,
+    /// Directory for browser downloads (programmatic `download` tool and
+    /// `Browser.setDownloadBehavior`). Default: the system Downloads dir.
+    pub download_dir: Option<std::path::PathBuf>,
+    /// Path to a JS file injected into EVERY page before app scripts run
+    /// (via `Page.addScriptToEvaluateOnNewDocument`) — for fetch/XHR hooks,
+    /// globals, network spies. Env: LIGHTBROWSE_PRELOAD.
+    pub preload_script: Option<std::path::PathBuf>,
 }
 
 impl Default for Config {
@@ -71,6 +83,9 @@ impl Default for Config {
             proxy: None,
             profile_dir: None,
             js_wait_ms: 800,
+            cdp_url: None,
+            download_dir: None,
+            preload_script: None,
         }
     }
 }

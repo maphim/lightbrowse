@@ -53,6 +53,20 @@ struct Cli {
     /// recently used tab is evicted. Also settable via LIGHTBROWSE_MAX_TABS.
     #[arg(long, global = true)]
     max_tabs: Option<usize>,
+    /// Attach to an EXISTING Chrome/Chromium DevTools endpoint instead of
+    /// spawning a fresh headless instance — reuse the user's logged-in
+    /// browser. Accepts http://host:port or ws://.../devtools/browser/...
+    /// Also settable via LIGHTBROWSE_CDP_URL.
+    #[arg(long, global = true)]
+    cdp_url: Option<String>,
+    /// Directory for browser downloads (programmatic `download` tool).
+    /// Also settable via LIGHTBROWSE_DOWNLOAD_DIR. Default: ~/Downloads.
+    #[arg(long, global = true)]
+    download_dir: Option<std::path::PathBuf>,
+    /// Path to a JS file injected into EVERY page before app scripts run
+    /// (fetch/XHR hooks, network spies). Also settable via LIGHTBROWSE_PRELOAD.
+    #[arg(long, global = true)]
+    preload: Option<std::path::PathBuf>,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -190,6 +204,27 @@ async fn main() -> lightbrowse_core::Result<()> {
     config.profile_dir = cli.profile.clone().or_else(|| {
         std::env::var("LIGHTBROWSE_PROFILE")
             .ok()
+            .map(std::path::PathBuf::from)
+    });
+    // Attach to an external Chrome (--cdp-url / LIGHTBROWSE_CDP_URL) instead
+    // of spawning our own headless instance.
+    config.cdp_url = cli.cdp_url.clone().or_else(|| {
+        std::env::var("LIGHTBROWSE_CDP_URL")
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
+    // Download directory (programmatic `download` tool + setDownloadBehavior).
+    config.download_dir = cli.download_dir.clone().or_else(|| {
+        std::env::var("LIGHTBROWSE_DOWNLOAD_DIR")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+    });
+    // Per-page preload hook script.
+    config.preload_script = cli.preload.clone().or_else(|| {
+        std::env::var("LIGHTBROWSE_PRELOAD")
+            .ok()
+            .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from)
     });
     // Proxy: CLI flag wins over the environment; validate early so a typo

@@ -146,7 +146,7 @@ impl McpServer {
                     "serverInfo": {
                         "name": "lightbrowse",
                         "version": env!("CARGO_PKG_VERSION"),
-                        "description": "Featherweight browser MCP. 29 tools in 7 groups: [Read] fetch/extract/snapshot/search/ask — [Act] click/type/submit/press/evaluate/screenshot/page/current on live CDP tabs — [Research] research/memory/search — [Runbook] trail/clear + runbook/* — [Session] tabs/list + tab/close — [Network] proxy/get + proxy/set — [Vault] vault/set + vault/list + vault/get + vault/delete (encrypted credentials). engine=auto picks fetch first, falls back to headless Chromium; engine=cdp keeps a live tab for actions. Call the 'help' tool for the grouped catalog with use-cases."
+                        "description": "Featherweight browser MCP. 31 tools in 7 groups: [Read] fetch/extract/snapshot/search/ask — [Act] click/type/submit/press/evaluate/screenshot/page/current on live CDP tabs — [Download] download/downloads — [Research] research/memory/search — [Runbook] trail/clear + runbook/* — [Session] tabs/list + tab/close — [Network] proxy/get + proxy/set + network/capture + cookies — [Vault] vault/set + vault/list + vault/get + vault/delete (encrypted credentials). engine=auto picks fetch first, falls back to headless Chromium; engine=cdp keeps a live tab for actions. Call the 'help' tool for the grouped catalog with use-cases."
                     }
                 }
             })),
@@ -260,8 +260,72 @@ impl McpServer {
                 }
                 Ok(pretty(&json!({"ok": true, "name": name})))
             }
+            "cookies" => {
+                let cdp = require_cdp(&s)?;
+                let v = cdp.cookies(None).await.map_err(|e| e.to_string())?;
+                let arr = v.as_array().cloned().unwrap_or_default();
+                Ok(pretty(&json!({
+                    "count": arr.len(),
+                    "cookies": arr.iter().map(|c| json!({
+                        "name": c.get("name"),
+                        "value": c.get("value"),
+                        "domain": c.get("domain"),
+                        "path": c.get("path"),
+                        "httpOnly": c.get("httpOnly"),
+                        "secure": c.get("secure"),
+                        "sameSite": c.get("sameSite"),
+                        "expires": c.get("expires")
+                    })).collect::<Vec<_>>()
+                })))
+            }
+            "download" => {
+                let cdp = require_cdp(&s)?;
+                let url = req_str(args, "url")?;
+                let filename = opt_str(args, "filename");
+                let v = cdp
+                    .download(&url, filename.as_deref(), None)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(pretty(&v))
+            }
+            "downloads" => {
+                let cdp = require_cdp(&s)?;
+                Ok(pretty(&json!({
+                    "count": cdp.downloads().len(),
+                    "downloads": cdp.downloads()
+                })))
+            }
+            "network/capture" => {
+                let cdp = require_cdp(&s)?;
+                let action = args.get("action").and_then(|a| a.as_str()).unwrap_or("log");
+                match action {
+                    "start" => Ok(pretty(
+                        &cdp.network_capture(true, None)
+                            .await
+                            .map_err(|e| e.to_string())?,
+                    )),
+                    "stop" => Ok(pretty(
+                        &cdp.network_capture(false, None)
+                            .await
+                            .map_err(|e| e.to_string())?,
+                    )),
+                    "flush" => {
+                        cdp.network_log_clear();
+                        Ok(pretty(&json!({ "cleared": true })))
+                    }
+                    "log" => {
+                        let events = cdp.network_log();
+                        Ok(pretty(
+                            &json!({ "capturing": cdp.network_capturing(), "count": events.len(), "events": events }),
+                        ))
+                    }
+                    other => Err(format!(
+                        "network/capture action must be start|stop|flush|log, got {other}"
+                    )),
+                }
+            }
             "help" => Ok(pretty(&json!({
-                "about": "lightbrowse — featherweight browser MCP. 29 tools in 7 groups.",
+                "about": "lightbrowse — featherweight browser MCP. 31 tools in 7 groups.",
                 "workflow": [
                     "1. navigate (engine=auto for plain pages, engine=cdp for JS/login-heavy apps)",
                     "2. snapshot / extract / ask to understand the page",
@@ -298,8 +362,13 @@ impl McpServer {
                     },
                     {
                         "tag": "[Network]",
-                        "when": "route traffic through a proxy (geo-bypass, bot-detected sites)",
-                        "tools": ["proxy/get", "proxy/set"]
+                        "when": "route traffic through a proxy (geo-bypass, bot-detected sites), inspect session cookies, or capture the requests a SPA makes (API discovery)",
+                        "tools": ["proxy/get", "proxy/set", "cookies", "network/capture"]
+                    },
+                    {
+                        "tag": "[Download]",
+                        "when": "download files programmatically (auth-gated downloads curl can't do) or check recent downloads",
+                        "tools": ["download", "downloads"]
                     },
                     {
                         "tag": "[Vault]",
@@ -1097,6 +1166,41 @@ fn tools_schema() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "limit": { "type": "integer", "minimum": 1, "maximum": 50, "default": 10 }
+                }
+            }
+        }),
+        json!({
+            "name": "cookies",
+            "description": "All cookies visible to the browser session (including httpOnly and SameSite) via CDP Network.getAllCookies on the active tab. Export a session to replay it with curl or another tool. Requires a live engine=cdp tab.",
+            "inputSchema": { "type": "object", "properties": {} }
+        }),
+        json!({
+            "name": "download",
+            "description": "Trigger a programmatic download of a URL on the active tab and wait for the file to land in the configured download directory (LIGHTBROWSE_DOWNLOAD_DIR, default ~/Downloads). Downloads are saved with the server-provided filename unless 'filename' is given. Requires a live engine=cdp tab.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": { "type": "string", "description": "Absolute http(s) URL of the file to download" },
+                    "filename": { "type": "string", "description": "Optional output filename" }
+                },
+                "required": ["url"]
+            }
+        }),
+        json!({
+            "name": "downloads",
+            "description": "Recent programmatic downloads (last 200, newest first): url, saved filename after Chromium dedupe, bytes, timestamp. Lets you confirm a download finished and see where the file landed without polling the filesystem. Requires a live engine=cdp tab for the session.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {}
+            }
+        }),
+        json!({
+            "name": "network/capture",
+            "description": "Network request log for SPA API discovery / auth-flow analysis. Actions: start (begin capturing requests/responses/failures on the active tab), stop (end capture, keep log), flush (clear log), log (read captured events, newest first). Each event: kind (request/response/failed), url, method, status, mime, request_id, ts. Requires a live engine=cdp tab.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["start", "stop", "flush", "log"], "description": "start | stop | flush | log (default log)" }
                 }
             }
         }),

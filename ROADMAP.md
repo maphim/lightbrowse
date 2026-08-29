@@ -80,13 +80,22 @@
       the LLM context
 - [x] **screenshot** — `Page.captureScreenshot` (CDP)
 - [x] **session cookies across actions** — persist logged-in state
+- [x] **downloads** — `Browser.setDownloadBehavior` + `download`/`downloads`
+      tools (MCP + HTTP), configurable dir (`--download-dir`), multiple
+      downloads per session, post-download rename to requested filename
+- [x] **network capture** — `network/capture start|stop|flush|log` records
+      requests/responses/failures for SPA API discovery + auth analysis
+- [x] **attach to running Chrome** — `--cdp-url` reuses a logged-in browser
+      (never closes/kills it); `--preload` injects JS before app scripts
+- [x] **navigate hardening** — errors only surface when the final retry
+      fails; `Page.getFrameTree` retried with backoff; SPA settle wait
 - [ ] **waits** — wait-for-selector / network-idle helpers
 
 ## Interfaces
 
 - [x] CLI (`fetch`, `extract`, `snapshot`, `search`, `ask`, `memory-*`, `serve`, `mcp`)
 - [x] MCP server — navigate/extract/snapshot/search/ask/research/memory/click/type/submit/press/screenshot/evaluate/runbook
-- [x] HTTP API — `/v1/{page,extract,snapshot,search,ask,memory,click,type,submit,current}`
+- [x] HTTP API — `/v1/{page,extract,snapshot,search,ask,memory,click,type,submit,current,cookies,download,downloads,network/log,network/capture}` + `/docs` + `/openapi.json`
 - [ ] WebSocket streaming for long-running research tasks
 - [ ] Optional GUI (wry) — off by default, for humans who want to watch
 

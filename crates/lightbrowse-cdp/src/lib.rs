@@ -10,7 +10,7 @@
 //! 3. **Zero magic deps** — the CDP client is ~250 lines over a websocket;
 //!    no chromiumoxide, no browser driver.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -97,6 +97,16 @@ pub struct CdpBackend {
     peak_ram: std::sync::atomic::AtomicU64,
     /// Navigations performed since start.
     navigations: std::sync::atomic::AtomicU64,
+    /// Recent programmatic downloads (last 200): url, saved path, bytes, ts.
+    /// Lets agents confirm a download finished and see the final filename
+    /// (after Chromium dedupe) instead of polling ~/Downloads (#25).
+    recent_downloads: Arc<Mutex<VecDeque<Value>>>,
+    /// Bounded capture buffer for the network request log (#29/#31).
+    network_log: Arc<Mutex<VecDeque<Value>>>,
+    /// Cancellation handle for the active network-capture background task.
+    network_capture_token: Mutex<Option<CancellationToken>>,
+    /// True while the capture task is running (toggled off on task exit).
+    network_capturing: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CdpBackend {
@@ -111,6 +121,10 @@ impl CdpBackend {
             proxy_override: Mutex::new(None),
             peak_ram: std::sync::atomic::AtomicU64::new(0),
             navigations: std::sync::atomic::AtomicU64::new(0),
+            recent_downloads: Arc::new(Mutex::new(VecDeque::new())),
+            network_log: Arc::new(Mutex::new(VecDeque::new())),
+            network_capture_token: Mutex::new(None),
+            network_capturing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -466,12 +480,25 @@ impl BrowserBackend for CdpBackend {
     async fn navigate(&self, session: &Session, url: &str) -> Result<Page> {
         let attempt = self.try_navigate(session, url).await;
         if let Err(e) = &attempt {
-            if is_connection_error(e) {
-                tracing::warn!(
-                    "cdp: connection lost ({e}) — killing Chromium and retrying once with a fresh instance"
-                );
+            // Only surface an error when the FINAL retry fails: on redirect
+            // chains (1drv.ms → onedrive.live.com) the DevTools connection
+            // routinely closes mid-load while the navigation itself succeeds
+            // (#26). Reset Chromium and retry once; verify the page rendered.
+            if is_recoverable(e) {
+                tracing::warn!("cdp: navigate failed ({e}) — resetting Chromium and retrying once");
                 self.reset_browser().await;
-                return self.try_navigate(session, url).await;
+                let retried = self.try_navigate(session, url).await;
+                if let Ok(p) = &retried {
+                    let rendered = !p.html.trim().is_empty() || !p.title.trim().is_empty();
+                    if !rendered {
+                        tracing::warn!(
+                            "cdp: navigate retry succeeded but page looks empty ({} bytes, title {:?})",
+                            p.html.len(),
+                            p.title
+                        );
+                    }
+                }
+                return retried;
             }
         }
         attempt
@@ -492,7 +519,15 @@ impl CdpBackend {
             .as_ref()
             .map(|b| b.user_agent.clone())
             .unwrap_or_else(|| session.user_agent.clone());
-        let result = navigate_and_render(&active.ws_url, url, &ua, self.config.js_wait_ms).await;
+        let result = navigate_and_render(
+            &active.ws_url,
+            url,
+            &ua,
+            self.config.js_wait_ms,
+            self.config.preload_script.as_deref(),
+            self.config.download_dir.as_deref(),
+        )
+        .await;
         if result.is_ok() {
             let ram = self.memory_usage_mb().await;
             if ram > self.config.memory_budget_mb {
@@ -585,8 +620,14 @@ impl CdpBackend {
                 // Chromium (stale socket / port race) and the endpoint may
                 // not come up in time. The failed child is already killed by
                 // spawn(), so a retry is safe and virtually always succeeds.
-                let mut spawned = CdpBrowser::spawn(&cfg, self.shutdown.clone()).await;
-                if spawned.is_err() {
+                let mut spawned = match &self.config.cdp_url {
+                    Some(endpoint) => {
+                        tracing::info!("cdp: attaching to existing Chrome at {endpoint}");
+                        CdpBrowser::attach(endpoint).await
+                    }
+                    None => CdpBrowser::spawn(&cfg, self.shutdown.clone()).await,
+                };
+                if spawned.is_err() && self.config.cdp_url.is_none() {
                     tracing::warn!(
                         "cdp: Chromium spawn failed — retrying once after a short pause"
                     );
@@ -667,7 +708,274 @@ impl CdpBackend {
         Ok(v)
     }
 
-    /// Click an element by CSS selector using REAL mouse events (moved →
+    /// All cookies visible to the browser session (including httpOnly and
+    /// SameSite), via CDP `Network.getAllCookies` on the active tab. Lets
+    /// agents export a session to replay it with curl or another tool —
+    /// `document.cookie` only exposes non-httpOnly cookies.
+    pub async fn cookies(&self, session: Option<&str>) -> Result<Value> {
+        let (sid, active) = self.active_page(session).await?;
+        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
+            .await
+            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+        let result = rpc_expect(&mut ws, "Network.getAllCookies", json!({})).await;
+        let _ = ws.close(None).await;
+        let v = result?;
+        self.touch();
+        self.touch_tab(&sid).await;
+        Ok(v.get("cookies").cloned().unwrap_or(Value::Null))
+    }
+
+    /// Trigger a programmatic download of `url` on the active tab and wait
+    /// for the file to land in the configured download directory.
+    /// Returns the saved path and size, or a descriptive error.
+    pub async fn download(
+        &self,
+        url: &str,
+        filename: Option<&str>,
+        session: Option<&str>,
+    ) -> Result<Value> {
+        let (sid, active) = self.active_page(session).await?;
+        let dir = self
+            .config
+            .download_dir
+            .clone()
+            .unwrap_or_else(|| std::env::temp_dir().join("lightbrowse-downloads"));
+        std::fs::create_dir_all(&dir).ok();
+        // Files present before the click — the new download is any file that
+        // appears after this snapshot.
+        let before: std::collections::HashSet<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
+            .await
+            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+        // Set the download behavior on THIS connection, right before the
+        // click — and KEEP the connection open until the file lands. Chrome
+        // decides the save path asynchronously after the click; if the
+        // connection that called setDownloadBehavior closes first, the
+        // behavior reverts and the file silently lands in ~/Downloads
+        // instead (verified live on Chrome 149).
+        match rpc_expect(
+            &mut ws,
+            "Browser.setDownloadBehavior",
+            json!({ "behavior": "allow", "downloadPath": dir.display().to_string() }),
+        )
+        .await
+        {
+            Ok(v) => tracing::debug!("cdp: download(): setDownloadBehavior ok ({v})"),
+            Err(e) => tracing::warn!("cdp: download: setDownloadBehavior failed: {e}"),
+        }
+        let eval_res = rpc_expect(
+            &mut ws,
+            "Runtime.evaluate",
+            json!({
+                "expression": format!(
+                    "(() => {{ let a = document.getElementById('__lb_download_anchor'); \
+                     if (!a) {{ a = document.createElement('a'); a.id = '__lb_download_anchor'; \
+                     a.style.cssText = 'position:fixed;left:0;top:0;width:1px;height:1px;opacity:0;'; \
+                     document.body.appendChild(a); }} \
+                     a.href = {url_json}; a.download = {file_json}; \
+                     a.dispatchEvent(new MouseEvent('click', {{bubbles: true, cancelable: true, view: window}})); \
+                     return 'triggered'; }})()",
+                    url_json = serde_json::to_string(url).unwrap_or_default(),
+                    file_json = serde_json::to_string(filename.unwrap_or("")).unwrap_or_default()
+                ),
+                "returnByValue": true,
+                "awaitPromise": true
+            }),
+        )
+        .await;
+        match &eval_res {
+            Ok(v) => tracing::debug!("cdp: download click triggered on {}: {v}", active.ws_url),
+            Err(e) => tracing::warn!("cdp: download click evaluate failed: {e}"),
+        }
+        let _ = eval_res?;
+        self.touch();
+        self.touch_tab(&sid).await;
+        // Poll the download dir for a new file (up to 60s) while keeping the
+        // ws open so the download behavior stays in effect.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut last = Err(Error::Transport(format!(
+            "download: no file appeared in {} within 60s",
+            dir.display()
+        )));
+        while Instant::now() < deadline {
+            let now: std::collections::HashSet<std::path::PathBuf> = std::fs::read_dir(&dir)
+                .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+                .unwrap_or_default();
+            let fresh: Vec<_> = now
+                .difference(&before)
+                .filter(|p| !p.extension().map(|e| e == "crdownload").unwrap_or(false))
+                .collect();
+            if !fresh.is_empty() {
+                let path = fresh[0].clone();
+                // Wait for the file to finish (size stable across 2 reads —
+                // Chrome writes in chunks; a partial read would report a
+                // truncated size).
+                let mut stable = 0usize;
+                let mut prev_size = 0u64;
+                for _ in 0..8 {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                    if size == prev_size && size > 0 {
+                        stable += 1;
+                        if stable >= 2 {
+                            break;
+                        }
+                    } else {
+                        stable = 0;
+                        prev_size = size;
+                    }
+                }
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                // Honor the requested filename by renaming after the download
+                // completes — the `download` attribute is only a hint and is
+                // ignored on cross-origin URLs, so renaming is deterministic.
+                let final_path = match filename {
+                    Some(name)
+                        if !name.is_empty()
+                            && name
+                                != path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default() =>
+                    {
+                        let target = dir.join(name);
+                        let target = if target.exists() {
+                            // avoid overwriting an existing file with a (N) suffix
+                            let stem = name.rsplit('.').next().unwrap_or(name);
+                            let ext = name
+                                .rsplit('.')
+                                .nth(1)
+                                .map(|e| format!(".{e}"))
+                                .unwrap_or_default();
+                            let mut n = 1usize;
+                            loop {
+                                let cand = dir.join(format!("{stem} ({n}){ext}"));
+                                if !cand.exists() {
+                                    break cand;
+                                }
+                                n += 1;
+                            }
+                        } else {
+                            target
+                        };
+                        let _ = std::fs::rename(&path, &target);
+                        target
+                    }
+                    _ => path,
+                };
+                let size = std::fs::metadata(&final_path)
+                    .map(|m| m.len())
+                    .unwrap_or(size);
+                last = Ok(json!({
+                    "ts": now_ms(),
+                    "url": url,
+                    "saved": final_path.display().to_string(),
+                    "bytes": size,
+                    "dir": dir.display().to_string()
+                }));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let _ = ws.close(None).await;
+        if let Ok(event) = &last {
+            let mut log = self
+                .recent_downloads
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if log.len() >= 200 {
+                log.pop_front();
+            }
+            log.push_back(event.clone());
+        }
+        last
+    }
+
+    /// Recent programmatic downloads (last 200), newest first. Each entry:
+    /// ts, url, saved (final filename after Chromium dedupe), bytes, dir.
+    pub fn downloads(&self) -> Vec<Value> {
+        let log = self
+            .recent_downloads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        log.iter().rev().cloned().collect()
+    }
+
+    /// Start (`enable=true`) or stop (`enable=false`) a network capture on
+    /// the active tab. While capturing, a background task holds a DevTools
+    /// connection open and records requests/responses/failures (url, method,
+    /// status, mime) into a bounded ring buffer — for SPA API discovery
+    /// (#31) and auth-flow analysis (#29). Returns capture status + count.
+    pub async fn network_capture(&self, enable: bool, session: Option<&str>) -> Result<Value> {
+        let (sid, active) = self.active_page(session).await?;
+        if !enable {
+            let mut token_guard = self
+                .network_capture_token
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(t) = token_guard.take() {
+                t.cancel();
+            }
+            drop(token_guard);
+            self.network_capturing.store(false, Ordering::Relaxed);
+            let n = self
+                .network_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len();
+            return Ok(json!({ "capturing": false, "events": n }));
+        }
+        if self.network_capturing.load(Ordering::Relaxed) {
+            let n = self
+                .network_log
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .len();
+            return Ok(json!({ "capturing": true, "events": n }));
+        }
+        let token = CancellationToken::new();
+        {
+            let mut token_guard = self
+                .network_capture_token
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *token_guard = Some(token.clone());
+        }
+        self.network_capturing.store(true, Ordering::Relaxed);
+        let ws_url = active.ws_url.clone();
+        let log: Arc<Mutex<VecDeque<Value>>> = self.network_log.clone();
+        let capturing = self.network_capturing.clone();
+        self.touch_tab(&sid).await;
+        tokio::spawn(async move {
+            let res = network_capture_loop(&ws_url, &log, &token).await;
+            if let Err(e) = res {
+                tracing::warn!("cdp: network capture ended: {e}");
+            }
+            capturing.store(false, Ordering::Relaxed);
+        });
+        Ok(json!({ "capturing": true, "events": 0 }))
+    }
+
+    /// Current network capture buffer (newest first) + capture status.
+    pub fn network_log(&self) -> Vec<Value> {
+        let log = self.network_log.lock().unwrap_or_else(|e| e.into_inner());
+        log.iter().rev().cloned().collect()
+    }
+
+    /// Whether a network capture is currently running.
+    pub fn network_capturing(&self) -> bool {
+        self.network_capturing.load(Ordering::Relaxed)
+    }
+
+    /// Clear the network capture buffer.
+    pub fn network_log_clear(&self) {
+        self.network_log
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
     /// pressed → released at the element's center), which is far harder for
     /// anti-bot systems to flag than `el.click()`. Works across iframes
     /// (selectors are resolved in every frame; coordinates are viewport
@@ -983,9 +1291,13 @@ impl CdpBackend {
 // ---------------------------------------------------------------------------
 
 struct CdpBrowser {
-    child: Child,
+    /// The spawned Chrome process. `None` in attach mode (external Chrome
+    /// via `--cdp-url`) — we must never kill the user's browser.
+    child: Option<Child>,
     port: u16,
     browser_ws: String,
+    /// True when attached to an external Chrome instead of spawning one.
+    attached: bool,
     /// Effective User-Agent: matches the actual Chrome binary version so
     /// sites (Slack, Google) don't reject us as an "old browser" — see
     /// `chrome_version_ua`. Overridable via LIGHTBROWSE_UA.
@@ -1115,9 +1427,10 @@ impl CdpBrowser {
         spawn_crash_listener(browser_ws.clone(), shutdown);
 
         Ok(Self {
-            child,
+            child: Some(child),
             port,
             browser_ws,
+            attached: false,
             // Prefer an explicit override, else match the real binary version.
             user_agent: std::env::var("LIGHTBROWSE_UA")
                 .ok()
@@ -1128,9 +1441,98 @@ impl CdpBrowser {
         })
     }
 
+    /// Attach to an EXISTING Chrome/Chromium DevTools endpoint instead of
+    /// spawning our own headless instance. The user's browser may already
+    /// have logins (cookies/localStorage) — reusing it skips every SSO flow.
+    /// We never kill or close the external browser.
+    ///
+    /// Accepts `http://host:port` (probed via `/json/version`) or a direct
+    /// `ws://.../devtools/browser/...` URL.
+    async fn attach(endpoint: &str) -> Result<Self> {
+        let endpoint = endpoint.trim();
+        let (http_base, browser_ws) =
+            if endpoint.starts_with("ws://") || endpoint.starts_with("wss://") {
+                // Derive an http base from the ws URL for /json/new calls.
+                let http_base = endpoint
+                    .replace("ws://", "http://")
+                    .replace("wss://", "https://")
+                    .trim_end_matches("/devtools/browser")
+                    .trim_end_matches("/devtools/page")
+                    .to_string();
+                (http_base, endpoint.to_string())
+            } else {
+                let base = endpoint
+                    .trim_end_matches('/')
+                    .strip_prefix("http://")
+                    .or_else(|| endpoint.strip_prefix("https://"))
+                    .map(|s| format!("http://{}", s))
+                    .unwrap_or_else(|| format!("http://{}", endpoint));
+                let http = reqwest::Client::new();
+                let version: Value = http
+                    .get(format!("{base}/json/version"))
+                    .send()
+                    .await
+                    .map_err(|e| Error::Transport(format!("cdp attach: cannot reach {base}: {e}")))?
+                    .json()
+                    .await
+                    .map_err(|e| {
+                        Error::Transport(format!("cdp attach: {base} not a DevTools endpoint: {e}"))
+                    })?;
+                let ws = version
+                    .get("webSocketDebuggerUrl")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        Error::Transport(format!(
+                            "cdp attach: no webSocketDebuggerUrl in {base}/json/version"
+                        ))
+                    })?
+                    .to_string();
+                (base, ws)
+            };
+
+        // Verify the endpoint is actually reachable before adopting it.
+        let (mut ws, _) = tokio_tungstenite::connect_async(&browser_ws)
+            .await
+            .map_err(|e| Error::Transport(format!("cdp attach: connect {browser_ws}: {e}")))?;
+        let ver = rpc_expect(&mut ws, "Browser.getVersion", json!({})).await;
+        let _ = ws.close(None).await;
+        let version = match ver {
+            Ok(v) => v
+                .get("product")
+                .and_then(|p| p.as_str())
+                .unwrap_or("external")
+                .to_string(),
+            Err(_) => "external".to_string(),
+        };
+        tracing::info!("cdp: attached to external Chrome ({version})");
+
+        let port = http_base
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(0);
+        Ok(Self {
+            child: None,
+            port,
+            browser_ws,
+            attached: true,
+            user_agent: std::env::var("LIGHTBROWSE_UA")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| lightbrowse_core::session::DEFAULT_UA.to_string()),
+            _user_data_dir: std::path::PathBuf::new(),
+        })
+    }
+
     /// Graceful CDP `Browser.close` first (flushes cookies to the profile),
     /// then SIGKILL as a fallback. Without this, logins are lost.
+    /// In attach mode the external browser is NEVER closed or killed — we
+    /// simply drop our connection.
     async fn close_gracefully(mut self) {
+        if self.attached {
+            tracing::debug!("cdp: attached mode — not closing external Chrome");
+            return;
+        }
         if let Ok((mut ws, _)) = tokio_tungstenite::connect_async(&self.browser_ws).await {
             let _ = ws
                 .send(WsMessage::Text(
@@ -1139,8 +1541,10 @@ impl CdpBrowser {
                 .await;
             // Give Chrome a moment to flush and exit.
             for _ in 0..20 {
-                if self.child.try_wait().ok().flatten().is_some() {
-                    return;
+                if let Some(child) = self.child.as_mut() {
+                    if child.try_wait().ok().flatten().is_some() {
+                        return;
+                    }
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
@@ -1151,17 +1555,25 @@ impl CdpBrowser {
     }
 
     /// Is the Chromium process still running? (try_wait needs &mut Child)
+    /// In attach mode we can't see the external process — assume alive.
     fn is_alive(&mut self) -> bool {
-        self.child.try_wait().ok().flatten().is_none()
+        match self.child.as_mut() {
+            Some(child) => child.try_wait().ok().flatten().is_none(),
+            None => true, // attached: external browser state is not ours to check
+        }
     }
 
     fn kill(mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     fn memory_usage_mb(&self) -> usize {
-        let pid = self.child.id();
+        let Some(pid) = self.child.as_ref().map(|c| c.id()) else {
+            return 0; // attached: external process RAM is not ours to measure
+        };
         let children = std::process::Command::new("ps")
             .args(["--ppid", &pid.to_string(), "-o", "rss="])
             .output()
@@ -1341,13 +1753,38 @@ async fn navigate_and_render(
     url: &str,
     user_agent: &str,
     js_wait_ms: u64,
+    preload_script: Option<&std::path::Path>,
+    download_dir: Option<&std::path::Path>,
 ) -> Result<(String, String, String)> {
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
         .await
         .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
 
     rpc_expect(&mut ws, "Page.enable", json!({})).await?;
-    stealth_setup(&mut ws, user_agent).await?;
+    stealth_setup(&mut ws, user_agent, preload_script).await?;
+
+    // Allow programmatic downloads (anchor clicks / the `download` tool)
+    // without Chromium's "multiple automatic downloads" gate, and route
+    // them to a deterministic directory. Env: LIGHTBROWSE_DOWNLOAD_DIR.
+    // NOTE: use behavior "allow", NOT "allowAndName" — on Chrome 149
+    // allowAndName silently renames every file to a GUID (verified live).
+    if let Some(dir) = download_dir {
+        match rpc_expect(
+            &mut ws,
+            "Browser.setDownloadBehavior",
+            json!({ "behavior": "allow", "downloadPath": dir.display().to_string() }),
+        )
+        .await
+        {
+            Ok(v) => tracing::debug!(
+                "cdp: setDownloadBehavior allow -> {} (result {v})",
+                dir.display()
+            ),
+            Err(e) => tracing::warn!("cdp: setDownloadBehavior failed: {e}"),
+        }
+    } else {
+        tracing::debug!("cdp: no download dir configured — downloads go to Chrome default");
+    }
 
     // Navigate and wait for the load event (or timeout).
     let nav_id = next_id();
@@ -1389,6 +1826,52 @@ async fn navigate_and_render(
     // Extra grace for lazy JS frameworks.
     if js_wait_ms > 0 {
         tokio::time::sleep(Duration::from_millis(js_wait_ms)).await;
+    }
+
+    // SPA settle: client-rendered frameworks (React/Vue/Next) mount their
+    // DOM AFTER Page.loadEventFired, so serializing right away yields an
+    // empty shell (see #27). Poll body-text length: if it grew between two
+    // samples the page is still rendering — keep waiting until stable (2
+    // equal reads) or the cap expires. Static pages are stable on the first
+    // two samples (~0.8s extra) and skip the wait.
+    let settle_cap = Duration::from_secs(12);
+    let settle_start = Instant::now();
+    let mut prev_len: Option<usize> = None;
+    let mut stable_rounds = 0u32;
+    loop {
+        if settle_start.elapsed() >= settle_cap {
+            break;
+        }
+        let len = rpc_expect(
+            &mut ws,
+            "Runtime.evaluate",
+            json!({
+                "expression": "document.body ? document.body.innerText.length : 0",
+                "returnByValue": true
+            }),
+        )
+        .await
+        .ok()
+        .and_then(|r| {
+            r.get("result")
+                .and_then(|v| v.get("value"))
+                .and_then(|v| v.as_u64())
+        })
+        .map(|n| n as usize)
+        .unwrap_or(0);
+        match prev_len {
+            Some(p) if p == len => {
+                stable_rounds += 1;
+                if stable_rounds >= 2 {
+                    break;
+                }
+            }
+            _ => {
+                stable_rounds = 0;
+                prev_len = Some(len);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(400)).await;
     }
 
     if !loaded {
@@ -1473,7 +1956,11 @@ async fn navigate_and_render(
 /// - override the User-Agent (removes the `HeadlessChrome` marker)
 /// - neuter `navigator.webdriver`
 /// - restore `window.chrome` / `navigator.plugins` shape (headless lacks them)
-async fn stealth_setup(ws: &mut CdpWs, user_agent: &str) -> Result<()> {
+async fn stealth_setup(
+    ws: &mut CdpWs,
+    user_agent: &str,
+    preload_script: Option<&std::path::Path>,
+) -> Result<()> {
     if let Err(e) = rpc_expect(
         ws,
         "Emulation.setUserAgentOverride",
@@ -1510,6 +1997,24 @@ async fn stealth_setup(ws: &mut CdpWs, user_agent: &str) -> Result<()> {
         json!({ "source": stealth_js }),
     )
     .await;
+    // Optional user preload hook (--preload / LIGHTBROWSE_PRELOAD): runs
+    // before the page's own scripts, e.g. fetch/XHR wrappers for API
+    // discovery (see #31).
+    if let Some(path) = preload_script {
+        match std::fs::read_to_string(path) {
+            Ok(source) => {
+                let _ = rpc_expect(
+                    ws,
+                    "Page.addScriptToEvaluateOnNewDocument",
+                    json!({ "source": source }),
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::warn!("cdp: preload script {} unreadable: {e}", path.display());
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1571,7 +2076,7 @@ async fn eval_across_frames(port: u16, ws_url: &str, expression: &str) -> Result
 
     // Child frames via isolated worlds.
     // CDP returns { frameTree: { frame: {...}, childFrames: [...] } }.
-    let tree = rpc_expect(&mut ws, "Page.getFrameTree", json!({})).await?;
+    let tree = rpc_frame_tree(&mut ws).await?;
     let main_id = tree
         .pointer("/frameTree/frame/id")
         .and_then(|v| v.as_str())
@@ -1759,7 +2264,7 @@ async fn collect_frame_htmls(port: u16, ws_url: &str) -> Vec<String> {
     let Ok((mut ws, _)) = tokio_tungstenite::connect_async(ws_url).await else {
         return Vec::new();
     };
-    let Ok(tree) = rpc_expect(&mut ws, "Page.getFrameTree", json!({})).await else {
+    let Ok(tree) = rpc_frame_tree(&mut ws).await else {
         let _ = ws.close(None).await;
         return Vec::new();
     };
@@ -1961,6 +2466,110 @@ fn is_connection_error(e: &Error) -> bool {
         || msg.contains("unexpected eof")
         || msg.contains("broken pipe")
         || msg.contains("i/o error: connection")
+}
+
+/// A CDP error worth retrying at a higher level: transport failures and
+/// internal RPC timeouts (a busy renderer can stall a single call past its
+/// deadline). The caller decides how many retries are worth it.
+fn is_recoverable(e: &Error) -> bool {
+    is_connection_error(e) || e.to_string().to_ascii_lowercase().contains("timed out")
+}
+
+/// Epoch milliseconds — timestamps for download events / network capture.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// `Page.getFrameTree` with internal retry + backoff: a single stalled RPC
+/// (busy renderer, page mid-navigation) used to fail the whole call with a
+/// "Page.getFrameTree timed out" noise error even though the connection is
+/// healthy (see #26). Retries twice with short backoff, then gives up.
+async fn rpc_frame_tree(ws: &mut CdpWs) -> Result<Value> {
+    let mut last = None;
+    for attempt in 0..3 {
+        match rpc_expect(ws, "Page.getFrameTree", json!({})).await {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                last = Some(e);
+                if !is_recoverable(last.as_ref().unwrap()) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(300 * (attempt + 1))).await;
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| Error::Transport("cdp: Page.getFrameTree failed".into())))
+}
+
+/// Background loop for network capture (#29/#31): holds a DevTools
+/// connection to the active tab open, listens for Network events and stores
+/// compact request/response/failure records into a bounded ring buffer.
+/// Exits when the tab's websocket closes (tab recreated / browser reset) or
+/// the caller cancels the token; always clears `capturing` on exit.
+async fn network_capture_loop(
+    ws_url: &str,
+    log: &Arc<Mutex<VecDeque<Value>>>,
+    token: &CancellationToken,
+) -> Result<()> {
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
+        .await
+        .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+    rpc_expect(&mut ws, "Network.enable", json!({})).await?;
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => {
+                let _ = ws.close(None).await;
+                return Ok(());
+            }
+            msg = ws.next() => {
+                match msg {
+                    None => return Ok(()), // ws closed → tab gone; capture ends
+                    Some(Err(e)) => return Err(Error::Transport(format!("cdp recv: {e}"))),
+                    Some(Ok(WsMessage::Text(t))) => {
+                        let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                        if let Some(m) = v.get("method").and_then(|m| m.as_str()) {
+                            let entry = match m {
+                                "Network.requestWillBeSent" => Some(json!({
+                                    "ts": now_ms(),
+                                    "kind": "request",
+                                    "request_id": v.pointer("/params/requestId"),
+                                    "url": v.pointer("/params/request/url").and_then(|u| u.as_str()).unwrap_or(""),
+                                    "method": v.pointer("/params/request/method").and_then(|u| u.as_str()).unwrap_or(""),
+                                    "type": v.pointer("/params/type"),
+                                })),
+                                "Network.responseReceived" => Some(json!({
+                                    "ts": now_ms(),
+                                    "kind": "response",
+                                    "request_id": v.pointer("/params/requestId"),
+                                    "url": v.pointer("/params/response/url").and_then(|u| u.as_str()).unwrap_or(""),
+                                    "status": v.pointer("/params/response/status"),
+                                    "mime": v.pointer("/params/response/mimeType").and_then(|u| u.as_str()).unwrap_or(""),
+                                })),
+                                "Network.loadingFailed" => Some(json!({
+                                    "ts": now_ms(),
+                                    "kind": "failed",
+                                    "request_id": v.pointer("/params/requestId"),
+                                    "error": v.pointer("/params/errorText"),
+                                })),
+                                _ => None,
+                            };
+                            if let Some(entry) = entry {
+                                let mut guard = log.lock().unwrap_or_else(|e| e.into_inner());
+                                if guard.len() >= 500 {
+                                    guard.pop_front();
+                                }
+                                guard.push_back(entry);
+                            }
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                }
+            }
+        }
+    }
 }
 
 /// Errors a read-only op should self-heal from: a dead/restarted renderer
@@ -2320,6 +2929,8 @@ async fn recovers_after_chromium_killed() {
         .as_ref()
         .expect("browser running")
         .child
+        .as_ref()
+        .expect("spawned browser")
         .id();
     let _ = std::process::Command::new("pkill")
         .arg("-9")

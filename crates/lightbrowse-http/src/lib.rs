@@ -61,7 +61,14 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/submit", get(submit_action))
         .route("/v1/tabs", get(tabs_list))
         .route("/v1/tab/close", get(tab_close))
+        .route("/v1/cookies", get(cookies))
+        .route("/v1/download", get(download))
+        .route("/v1/downloads", get(downloads))
+        .route("/v1/network/log", get(network_log))
+        .route("/v1/network/capture", get(network_capture_action))
         .route("/v1/proxy", get(proxy_get).put(proxy_set))
+        .route("/openapi.json", get(openapi_json))
+        .route("/docs", get(docs_page))
         .with_state(state)
 }
 
@@ -499,6 +506,209 @@ fn require_cdp(state: &AppState) -> Result<&lightbrowse_cdp::CdpBackend, ApiErro
     cdp.as_any()
         .and_then(|b| b.downcast_ref::<lightbrowse_cdp::CdpBackend>())
         .ok_or_else(|| ApiError::internal("cdp backend type mismatch"))
+}
+
+/// GET /v1/cookies — all cookies (incl. httpOnly) for the active CDP session.
+async fn cookies(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let cdp = require_cdp(&state)?;
+    let v = cdp
+        .cookies(None)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let arr = v.as_array().cloned().unwrap_or_default();
+    Ok(Json(json!({
+        "count": arr.len(),
+        "cookies": arr.iter().map(|c| json!({
+            "name": c.get("name"),
+            "value": c.get("value"),
+            "domain": c.get("domain"),
+            "path": c.get("path"),
+            "httpOnly": c.get("httpOnly"),
+            "secure": c.get("secure"),
+            "sameSite": c.get("sameSite")
+        })).collect::<Vec<_>>()
+    })))
+}
+
+/// GET /v1/download?url=...&filename=... — trigger a programmatic download
+/// on the active CDP tab and wait for the file to land.
+#[derive(Deserialize)]
+struct DownloadQuery {
+    url: String,
+    filename: Option<String>,
+}
+
+async fn download(
+    State(state): State<AppState>,
+    Query(q): Query<DownloadQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let cdp = require_cdp(&state)?;
+    let v = cdp
+        .download(&q.url, q.filename.as_deref(), None)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(Json(v))
+}
+
+/// GET /v1/downloads — recent programmatic downloads (newest first).
+async fn downloads(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let cdp = require_cdp(&state)?;
+    let list = cdp.downloads();
+    Ok(Json(json!({
+        "count": list.len(),
+        "downloads": list
+    })))
+}
+
+/// GET /v1/network/log — captured network events + capture status.
+async fn network_log(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let cdp = require_cdp(&state)?;
+    let events = cdp.network_log();
+    Ok(Json(json!({
+        "capturing": cdp.network_capturing(),
+        "count": events.len(),
+        "events": events
+    })))
+}
+
+/// GET /v1/network/capture?action=start|stop|flush — control the capture.
+async fn network_capture_action(
+    State(state): State<AppState>,
+    Query(q): Query<NetworkCaptureQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let cdp = require_cdp(&state)?;
+    let v = match q.action.as_deref().unwrap_or("log") {
+        "start" => cdp
+            .network_capture(true, None)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?,
+        "stop" => cdp
+            .network_capture(false, None)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?,
+        "flush" => {
+            cdp.network_log_clear();
+            json!({ "cleared": true })
+        }
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "action must be start|stop|flush|log, got {other}"
+            )))
+        }
+    };
+    Ok(Json(v))
+}
+
+#[derive(Deserialize)]
+struct NetworkCaptureQuery {
+    action: Option<String>,
+}
+
+/// GET /docs — human-readable route reference rendered from the OpenAPI
+/// spec (#28). Lets users discover the REST API without reading the source.
+async fn docs_page() -> axum::response::Html<String> {
+    let spec = openapi_spec();
+    let mut rows = String::new();
+    let mut paths: Vec<(&str, &Value)> = spec["paths"]
+        .as_object()
+        .map(|m| m.iter().map(|(k, v)| (k.as_str(), v)).collect())
+        .unwrap_or_default();
+    paths.sort_by_key(|(p, _)| *p);
+    for (path, methods) in paths {
+        if let Some(methods) = methods.as_object() {
+            for (method, detail) in methods {
+                let summary = detail["summary"].as_str().unwrap_or("");
+                let params = detail["parameters"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|p| p["name"].as_str())
+                            .map(|n| format!("<code>{}</code>", n))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    })
+                    .unwrap_or_default();
+                let verb = method.to_uppercase();
+                rows.push_str(&format!(
+                    "<tr><td class=\"verb {}\">{}</td><td><code>{}</code></td><td>{}</td><td>{}</td></tr>",
+                    verb.to_ascii_lowercase(),
+                    verb,
+                    path,
+                    summary,
+                    params
+                ));
+            }
+        }
+    }
+    let version = env!("CARGO_PKG_VERSION");
+    let html = format!(
+        r#"<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>lightbrowse — REST API docs</title>
+<style>
+body{{font-family:ui-monospace,Menlo,Consolas,monospace;max-width:960px;margin:40px auto;padding:0 16px;color:#222;background:#fafafa}}
+h1{{font-size:1.4rem}} h2{{font-size:1.1rem;margin-top:2rem}}
+code{{background:#eee;padding:1px 5px;border-radius:4px}}
+table{{border-collapse:collapse;width:100%;margin-top:1rem}}
+th,td{{text-align:left;padding:8px 10px;border-bottom:1px solid #ddd;vertical-align:top}}
+th{{background:#f0f0f0}}
+.verb{{font-weight:700;font-size:.75rem;padding:2px 6px;border-radius:4px;color:#fff}}
+.verb.get{{background:#2e7d32}}.verb.put{{background:#1565c0}}.verb.post{{background:#e65100}}.verb.delete{{background:#b71c1c}}
+.quiet{{color:#777}}
+</style></head><body>
+<h1>lightbrowse <span class="quiet">v{version}</span> — REST API</h1>
+<p class="quiet">Same backend as the CLI/MCP server. Machine-readable spec: <a href="/openapi.json">/openapi.json</a>.</p>
+<h2>Endpoints</h2>
+<table><tr><th>Method</th><th>Path</th><th>Summary</th><th>Query params</th></tr>{rows}</table>
+</body></html>
+"#
+    );
+    axum::response::Html(html)
+}
+
+/// The OpenAPI 3.0.3 spec for the REST API (#28). Hand-written summary;
+/// the axum routes map 1:1 to the CLI subcommands.
+fn openapi_spec() -> Value {
+    json!({
+        "openapi": "3.0.3",
+        "info": {
+            "title": "lightbrowse",
+            "description": "Featherweight, AI-native browser REST API — same backend as the CLI/MCP server.",
+            "version": env!("CARGO_PKG_VERSION")
+        },
+        "paths": {
+            "/health": { "get": { "summary": "Health + memory/cdp status", "responses": { "200": {"description": "ok"} } } },
+            "/v1/page": { "get": { "summary": "Fetch a URL, return summary + text preview", "parameters": [{"name": "url", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "engine", "in": "query", "schema": {"type": "string", "enum": ["auto","fetch","cdp"]}}], "responses": { "200": {"description": "page summary"} } } },
+            "/v1/extract": { "get": { "summary": "Extract text|links|forms|meta|headings", "parameters": [{"name": "url", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "mode", "in": "query", "schema": {"type": "string"}}], "responses": { "200": {"description": "extracted data"} } } },
+            "/v1/snapshot": { "get": { "summary": "Accessibility-style snapshot tree", "parameters": [{"name": "url", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "max_nodes", "in": "query", "schema": {"type": "integer"}}], "responses": { "200": {"description": "snapshot tree"} } } },
+            "/v1/search": { "get": { "summary": "DuckDuckGo web search", "parameters": [{"name": "q", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "max_results", "in": "query", "schema": {"type": "integer"}}], "responses": { "200": {"description": "search results"} } } },
+            "/v1/ask": { "get": { "summary": "Intent-aware reading: scored blocks for a question", "parameters": [{"name": "url", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "question", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "scored hits"} } } },
+            "/v1/memory/search": { "get": { "summary": "BM25 over previously read pages", "parameters": [{"name": "query", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "hits"} } } },
+            "/v1/current": { "get": { "summary": "Current CDP tab: url, title, text preview", "responses": { "200": {"description": "current page"} } } },
+            "/v1/evaluate": { "get": { "summary": "Run JS on the active CDP tab", "parameters": [{"name": "expression", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "JS result"} } } },
+            "/v1/screenshot": { "get": { "summary": "Screenshot the active CDP tab", "responses": { "200": {"description": "PNG"} } } },
+            "/v1/click": { "get": { "summary": "Click a CSS selector on the active tab", "parameters": [{"name": "selector", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "click result"} } } },
+            "/v1/type": { "get": { "summary": "Type text into an input on the active tab", "parameters": [{"name": "selector", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "text", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "type result"} } } },
+            "/v1/tabs": { "get": { "summary": "List open CDP tabs", "responses": { "200": {"description": "tabs"} } } },
+            "/v1/tab/close": { "get": { "summary": "Close a CDP tab", "parameters": [{"name": "session", "in": "query", "schema": {"type": "string"}}], "responses": { "200": {"description": "ok"} } } },
+            "/v1/cookies": { "get": { "summary": "All cookies (incl. httpOnly) for the active CDP session", "responses": { "200": {"description": "cookies"} } } },
+            "/v1/download": { "get": { "summary": "Programmatic download on the active CDP tab", "parameters": [{"name": "url", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "filename", "in": "query", "schema": {"type": "string"}}], "responses": { "200": {"description": "saved file info"} } } },
+            "/v1/downloads": { "get": { "summary": "Recent programmatic downloads (newest first)", "responses": { "200": {"description": "downloads"} } } },
+            "/v1/network/log": { "get": { "summary": "Captured network events + capture status (network/capture must be started first)", "responses": { "200": {"description": "events"} } } },
+            "/v1/network/capture": { "get": { "summary": "Control the network capture: action=start|stop|flush", "parameters": [{"name": "action", "in": "query", "required": true, "schema": {"type": "string", "enum": ["start", "stop", "flush"]}}], "responses": { "200": {"description": "capture status"} } } },
+            "/v1/submit": { "get": { "summary": "Submit a form on the active tab", "parameters": [{"name": "selector", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "submit result"} } } },
+            "/v1/memory/recent": { "get": { "summary": "Recently read pages", "responses": { "200": {"description": "pages"} } } },
+            "/v1/runbook/list": { "get": { "summary": "List saved runbooks", "responses": { "200": {"description": "runbooks"} } } },
+            "/v1/runbook/get": { "get": { "summary": "Get a runbook's steps", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "runbook"} } } },
+            "/v1/runbook/run": { "post": { "summary": "Replay a runbook", "parameters": [{"name": "name", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "outcome"} } } },
+            "/v1/proxy": { "get": { "summary": "Report proxy config", "responses": { "200": {"description": "proxy"} } }, "put": { "summary": "Set proxy", "responses": { "200": {"description": "proxy updated"} } } }
+        }
+    })
+}
+
+/// GET /openapi.json — machine-readable route catalog (#28).
+async fn openapi_json(State(_state): State<AppState>) -> Json<Value> {
+    Json(openapi_spec())
 }
 
 #[derive(Deserialize)]

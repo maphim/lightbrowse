@@ -1130,7 +1130,7 @@ dependencies = [
 
 [[package]]
 name = "lightbrowse"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "clap",
  "lightbrowse-cdp",
@@ -1147,7 +1147,7 @@ dependencies = [
 
 [[package]]
 name = "lightbrowse-cdp"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -1164,7 +1164,7 @@ dependencies = [
 
 [[package]]
 name = "lightbrowse-core"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -1181,7 +1181,7 @@ dependencies = [
 
 [[package]]
 name = "lightbrowse-fetch"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "lightbrowse-core",
@@ -1195,7 +1195,7 @@ dependencies = [
 
 [[package]]
 name = "lightbrowse-http"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "axum",
  "lightbrowse-cdp",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "lightbrowse-mcp"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "lightbrowse-cdp",
  "lightbrowse-core",
@@ -1224,7 +1224,7 @@ dependencies = [
 
 [[package]]
 name = "lightbrowse-memory"
-version = "0.3.4"
+version = "0.4.0"
 dependencies = [
  "lightbrowse-core",
  "rusqlite",

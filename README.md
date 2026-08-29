@@ -96,6 +96,13 @@ measured, not promised:
   (log in once, keep using it)
 - 🔌 **Three interfaces, one core** — CLI, HTTP/REST, MCP (stdio)
 - 🔍 **Built-in search** — DuckDuckGo lite, zero API key
+- ⬇️ **Programmatic downloads** — `download`/`downloads` tools (MCP+HTTP),
+  configurable dir, multiple downloads per session (no Chromium gate)
+- 🔭 **Network capture** — `network/capture start|stop|flush|log` records the
+  requests a SPA makes (API discovery, auth-flow analysis)
+- 🧲 **Attach to your real browser** — `--cdp-url` reuses a logged-in Chrome
+  via DevTools instead of a fresh temp profile
+- 📜 **Self-documenting REST API** — `/docs` + `/openapi.json`
 - 🧩 **Pluggable backends** — trait-based; CDP (real Chrome) and webview
   (GUI + screenshots) are on the roadmap
 
@@ -354,6 +361,9 @@ RAM" are opposing goals — so you only pay for what you need:
 | `LIGHTBROWSE_MAX_TABS` | unset | same as `--max-tabs` |
 | `LIGHTBROWSE_UA` | auto | User-Agent override. CDP engine derives a version-matched UA from the Chrome binary by default; set this to force a custom UA for both engines |
 | `CHROME_PATH` | auto-detect | Chrome/Chromium binary |
+| `--cdp-url <url>` / `LIGHTBROWSE_CDP_URL` | unset | attach to an existing Chrome DevTools endpoint (`http://host:port` or `ws://.../devtools/browser/...`) — reuse the user's logged-in browser; never closes it |
+| `--download-dir <dir>` / `LIGHTBROWSE_DOWNLOAD_DIR` | `~/Downloads` | where programmatic downloads land (`download` tool / `Browser.setDownloadBehavior`) |
+| `--preload <file>` / `LIGHTBROWSE_PRELOAD` | unset | JS file injected into every page before app scripts (fetch/XHR hooks, network spies) |
 | `LIGHTBROWSE_VAULT_DIR` | `~/.config/lightbrowse` | vault directory (`vault.enc` + `vault.key`) |
 | `LIGHTBROWSE_VAULT_KEY` | auto | 64-hex master key (overrides key file; else auto-generated `vault.key`, 0600) |
 
