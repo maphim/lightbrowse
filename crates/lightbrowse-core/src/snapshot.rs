@@ -54,6 +54,10 @@ pub struct SnapshotNode {
     /// `name` attribute (inputs).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// `type` attribute (inputs) — lets agents distinguish password/email
+    /// fields in login flows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -298,6 +302,11 @@ fn build_node(elm: &ElementRef, ctx: &mut Ctx, depth: usize) -> Option<SnapshotN
         text,
         href: e.attr("href").map(|s| s.to_string()),
         name: e.attr("name").map(|s| s.to_string()),
+        input_type: if tag == "input" {
+            e.attr("type").map(|s| s.to_string())
+        } else {
+            None
+        },
         placeholder: e.attr("placeholder").map(|s| s.to_string()),
         checked: e
             .attr("checked")
@@ -331,6 +340,7 @@ fn collect_children_only(elm: &ElementRef, ctx: &mut Ctx, depth: usize) -> Optio
             text: String::new(),
             href: None,
             name: None,
+            input_type: None,
             placeholder: None,
             checked: None,
             alt: None,

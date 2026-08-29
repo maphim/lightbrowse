@@ -145,6 +145,16 @@ enum Cmd {
         #[arg(long)]
         session: Option<String>,
     },
+    /// One-call login: navigate to URL, auto-detect username+password
+    /// fields, fill both, submit.
+    Login {
+        url: String,
+        username: String,
+        password: String,
+        /// Settle wait (ms) after navigate (bot challenges / heavy JS).
+        #[arg(long, default_value_t = 3000)]
+        settle_ms: u64,
+    },
     /// LLM-less extractive summary of a page (top sentences, no API key).
     Summarize {
         url: String,
@@ -460,6 +470,26 @@ async fn main() -> lightbrowse_core::Result<()> {
         }
         Cmd::ClickAt { x, y, session } => {
             let res = cdp.click_at(x, y, session.as_deref()).await?;
+            print_json(&res);
+        }
+        Cmd::Login {
+            url,
+            username,
+            password,
+            settle_ms,
+        } => {
+            lightbrowse_core::service::navigate(
+                &*fetch,
+                Some(&*cdp_trait),
+                &session,
+                &url,
+                Engine::Cdp,
+            )
+            .await?;
+            if settle_ms > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+            }
+            let res = cdp.fill_login(&username, &password, None).await?;
             print_json(&res);
         }
         Cmd::Summarize {
