@@ -15,5 +15,6 @@ lightbrowse-cdp = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+url = { workspace = true }
 tracing = { workspace = true }
 base64 = "0.22"

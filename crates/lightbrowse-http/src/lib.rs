@@ -41,6 +41,8 @@ pub struct AppState {
     pub engine: Engine,
     pub config: Arc<Config>,
     pub memory: Arc<MemoryStore>,
+    /// Encrypted credential vault (None when unavailable).
+    pub vault: Option<Arc<lightbrowse_core::vault::Vault>>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -859,21 +861,76 @@ async fn click_action(
 struct LoginQuery {
     username: String,
     password: String,
+    /// Auto-save credentials to the vault on detected login success.
+    #[serde(default = "default_true")]
+    save_vault: bool,
+    /// Vault entry name (default: hostname).
+    vault_name: Option<String>,
     /// Optional session id.
     session: Option<String>,
 }
 
 /// One-call login: auto-detect username+password fields, fill both, submit.
+/// With save_vault=true, auto-saves credentials on detected login success.
 async fn login_action(
     State(state): State<AppState>,
     Query(q): Query<LoginQuery>,
 ) -> Result<Response, ApiError> {
     let cdp_session = resolve_cdp_session(&state, q.session.as_deref())?;
-    let res = require_cdp(&state)?
-        .fill_login(&q.username, &q.password, cdp_session.as_deref())
+    let cdp = require_cdp(&state)?;
+    let mut username = q.username;
+    let mut password = q.password;
+    if let Some(vault) = &state.vault {
+        if password.starts_with("vault:") {
+            password = vault
+                .resolve_ref(&password)
+                .ok_or_else(|| ApiError::internal("unknown vault ref"))?
+                .map_err(ApiError::internal)?;
+        }
+        if username.starts_with("vault:") {
+            username = vault
+                .resolve_ref(&username)
+                .ok_or_else(|| ApiError::internal("unknown vault ref"))?
+                .map_err(ApiError::internal)?;
+        }
+    }
+    let res = cdp
+        .fill_login(&username, &password, cdp_session.as_deref())
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(res).into_response())
+    let mut saved = serde_json::Value::Null;
+    let mut probe = serde_json::Value::Null;
+    if res.get("ok").and_then(|v| v.as_bool()) == Some(true) && q.save_vault {
+        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        probe = cdp
+            .login_success_probe(cdp_session.as_deref())
+            .await
+            .map_err(ApiError::from)?;
+        if probe.get("detected").and_then(|v| v.as_bool()).unwrap_or(false) {
+            let url = probe.get("url").and_then(|v| v.as_str()).unwrap_or("");
+            let name = q.vault_name.clone().unwrap_or_else(|| {
+                url::Url::parse(url)
+                    .ok()
+                    .and_then(|u| u.host_str().map(|h| h.to_string()))
+                    .unwrap_or_else(|| "saved-login".into())
+            });
+            if let Some(vault) = &state.vault {
+                let entry = lightbrowse_core::vault::VaultEntry {
+                    url: url.to_string(),
+                    username: username.clone(),
+                    password: password.clone(),
+                    extra: serde_json::json!({"source": "login-auto-save"}),
+                    updated_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                };
+                vault.set(&name, entry).map_err(ApiError::internal)?;
+                saved = json!(name);
+            }
+        }
+    }
+    Ok(Json(json!({ "login": res, "probe": probe, "vault_saved": saved })).into_response())
 }
 
 #[derive(Deserialize)]
