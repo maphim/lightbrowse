@@ -5,10 +5,23 @@
 //! and visible text — each with a stable `uid` so the agent can refer to
 //! elements across calls (e.g. "click uid 42").
 
+use std::collections::HashMap;
+
 use scraper::{ElementRef, Html, Node, Selector};
 use serde::Serialize;
 
 use crate::extract::is_visible;
+
+/// Viewport-relative bounding box (CSS px, top-left origin) of a snapshot
+/// node. Populated only when a live renderer (CDP) can provide layout info;
+/// the pure-fetch engine omits it.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct Bbox {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct SnapshotOptions {
@@ -53,6 +66,9 @@ pub struct SnapshotNode {
     /// node (click/type/submit) via `document.querySelector`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selector: Option<String>,
+    /// Viewport bounding box (CDP engine only; `None` on fetch).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bbox: Option<Bbox>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<SnapshotNode>,
 }
@@ -290,6 +306,7 @@ fn build_node(elm: &ElementRef, ctx: &mut Ctx, depth: usize) -> Option<SnapshotN
         alt: e.attr("alt").map(|s| s.to_string()),
         level: heading_level(tag),
         selector: Some(css_path(elm)),
+        bbox: None,
         children: collect_children(elm, ctx, depth),
     };
 
@@ -319,6 +336,7 @@ fn collect_children_only(elm: &ElementRef, ctx: &mut Ctx, depth: usize) -> Optio
             alt: None,
             level: None,
             selector: None,
+            bbox: None,
             children,
         })
     }
@@ -336,6 +354,54 @@ fn collect_children(elm: &ElementRef, ctx: &mut Ctx, depth: usize) -> Vec<Snapsh
         }
     }
     out
+}
+
+/// Attach viewport bounding boxes (keyed by CSS selector) to a snapshot tree.
+/// Non-matching selectors keep `bbox: None`. Purely additive.
+pub fn attach_rects(tree: &mut SnapshotTree, rects: &HashMap<String, [f64; 4]>) {
+    fn walk(n: &mut SnapshotNode, rects: &HashMap<String, [f64; 4]>) {
+        if let Some(sel) = &n.selector {
+            if let Some(r) = rects.get(sel) {
+                n.bbox = Some(Bbox {
+                    x: r[0],
+                    y: r[1],
+                    w: r[2],
+                    h: r[3],
+                });
+            }
+        }
+        for c in &mut n.children {
+            walk(c, rects);
+        }
+    }
+    for n in &mut tree.nodes {
+        walk(n, rects);
+    }
+}
+
+/// Collect every CSS selector in the tree (breadth-first, stable order).
+pub fn collect_selectors(tree: &SnapshotTree) -> Vec<String> {
+    fn walk(n: &SnapshotNode, acc: &mut Vec<String>) {
+        if let Some(s) = &n.selector {
+            acc.push(s.clone());
+        }
+        for c in &n.children {
+            walk(c, acc);
+        }
+    }
+    let mut out = Vec::new();
+    for n in &tree.nodes {
+        walk(n, &mut out);
+    }
+    out
+}
+
+/// True if the node's role makes it a clickable target for SoM overlays.
+pub fn is_interactive(n: &SnapshotNode) -> bool {
+    matches!(
+        n.role.as_str(),
+        "link" | "button" | "textbox" | "combobox" | "checkbox" | "radio" | "select" | "option"
+    )
 }
 
 #[cfg(test)]

@@ -13,6 +13,7 @@ use lightbrowse_core::config::Engine;
 use lightbrowse_core::extract::{self, ExtractMode};
 use lightbrowse_core::session::Session;
 use lightbrowse_core::snapshot::{self, SnapshotOptions};
+use lightbrowse_core::vision;
 use lightbrowse_memory::{navigate_cached, MemoryStore};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -146,7 +147,7 @@ impl McpServer {
                     "serverInfo": {
                         "name": "lightbrowse",
                         "version": env!("CARGO_PKG_VERSION"),
-                        "description": "Featherweight browser MCP. 31 tools in 7 groups: [Read] fetch/extract/snapshot/search/ask — [Act] click/type/submit/press/evaluate/screenshot/page/current on live CDP tabs — [Download] download/downloads — [Research] research/memory/search — [Runbook] trail/clear + runbook/* — [Session] tabs/list + tab/close — [Network] proxy/get + proxy/set + network/capture + cookies — [Vault] vault/set + vault/list + vault/get + vault/delete (encrypted credentials). engine=auto picks fetch first, falls back to headless Chromium; engine=cdp keeps a live tab for actions. Call the 'help' tool for the grouped catalog with use-cases."
+                        "description": "Featherweight browser MCP. 33 tools in 7 groups: [Read] fetch/extract/snapshot/search/ask — [Act] click/click_at/visual_snapshot/type/submit/press/evaluate/screenshot/page/current on live CDP tabs — [Download] download/downloads — [Research] research/memory/search — [Runbook] trail/clear + runbook/* — [Session] tabs/list + tab/close — [Network] proxy/get + proxy/set + network/capture + cookies — [Vault] vault/set + vault/list + vault/get + vault/delete (encrypted credentials). engine=auto picks fetch first, falls back to headless Chromium; engine=cdp keeps a live tab for actions. visual_snapshot = SoM numbered overlay for human-like vision agents; click_at = coordinate click. Call the 'help' tool for the grouped catalog with use-cases."
                     }
                 }
             })),
@@ -325,7 +326,7 @@ impl McpServer {
                 }
             }
             "help" => Ok(pretty(&json!({
-                "about": "lightbrowse — featherweight browser MCP. 31 tools in 7 groups.",
+                "about": "lightbrowse — featherweight browser MCP. 33 tools in 7 groups.",
                 "workflow": [
                     "1. navigate (engine=auto for plain pages, engine=cdp for JS/login-heavy apps)",
                     "2. snapshot / extract / ask to understand the page",
@@ -343,7 +344,7 @@ impl McpServer {
                     {
                         "tag": "[Act]",
                         "when": "operate on a live engine=cdp tab (login forms, buttons, JS state)",
-                        "tools": ["click", "type", "submit", "press", "evaluate", "screenshot", "page/current"]
+                        "tools": ["click", "click_at", "visual_snapshot", "type", "submit", "press", "evaluate", "screenshot", "page/current"]
                     },
                     {
                         "tag": "[Research]",
@@ -670,6 +671,100 @@ impl McpServer {
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok(pretty(&json!({ "selector": selector, "result": res })))
+            }
+            "click_at" => {
+                let x = args
+                    .get("x")
+                    .and_then(|v| v.as_f64())
+                    .ok_or("click_at: x (number) required")?;
+                let y = args
+                    .get("y")
+                    .and_then(|v| v.as_f64())
+                    .ok_or("click_at: y (number) required")?;
+                let cdp = require_cdp(&s)?;
+                let session = opt_str(args, "session");
+                let res = cdp
+                    .click_at(x, y, session.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(pretty(&json!({ "x": x, "y": y, "result": res })))
+            }
+            "visual_snapshot" => {
+                let cdp = require_cdp(&s)?;
+                let session = opt_str(args, "session");
+                let max_nodes = args
+                    .get("max_nodes")
+                    .and_then(|n| n.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(400)
+                    .clamp(10, 2000);
+                let max_marks = args
+                    .get("max_marks")
+                    .and_then(|n| n.as_u64())
+                    .map(|n| n as usize)
+                    .unwrap_or(40)
+                    .clamp(1, 200);
+
+                // 1. Current rendered document (no re-navigate).
+                let (html, title, url) = cdp
+                    .current_dom(session.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+
+                // 2. Snapshot tree + bboxes via one JS pass.
+                let opts = SnapshotOptions {
+                    max_nodes,
+                    max_depth: 12,
+                    ..SnapshotOptions::default()
+                };
+                let mut tree = snapshot::snapshot(&html, &url, &opts);
+                let sels = snapshot::collect_selectors(&tree);
+                let rects = cdp
+                    .element_rects(&sels, session.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                snapshot::attach_rects(&mut tree, &rects);
+
+                // 3. Screenshot → overlay numbered frames → map.
+                let shot = std::env::temp_dir().join(format!(
+                    "lb-shot-{}.png",
+                    std::process::id()
+                ));
+                let shot_path = cdp
+                    .screenshot(&shot, false, session.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let png = std::fs::read(&shot_path).map_err(|e| e.to_string())?;
+                let marks = vision::select_marks(&tree, max_marks);
+                let som_marks: Vec<vision::Mark> = marks
+                    .iter()
+                    .map(|(label, _, _, b)| vision::Mark { label: *label, bbox: *b })
+                    .collect();
+                let overlaid = vision::overlay(&png, &som_marks).map_err(|e| e.to_string())?;
+
+                let mut map = serde_json::Map::new();
+                for (label, uid, text, bbox) in &marks {
+                    map.insert(
+                        label.to_string(),
+                        json!({
+                            "uid": uid,
+                            "text": text,
+                            "bbox": [bbox.x, bbox.y, bbox.w, bbox.h]
+                        }),
+                    );
+                }
+                let b64 = base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    &overlaid,
+                );
+                Ok(pretty(&json!({
+                    "url": url,
+                    "title": title,
+                    "count": marks.len(),
+                    "image_base64": b64,
+                    "map": map,
+                    "note": "The image has numbered red frames. Reply with the number(s) that match your goal, e.g. 'click 7' or '7 = login'."
+                })))
             }
             "type" => {
                 let selector = req_str(args, "selector")?;
@@ -1123,6 +1218,32 @@ fn tools_schema() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "click_at",
+            "description": "Click at raw viewport coordinates (CSS px, top-left origin) — the human-pointing action for SoM/vision workflows. Pair with visual_snapshot: pick a number, click its bbox center.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "x": { "type": "number", "description": "viewport x (CSS px)" },
+                    "y": { "type": "number", "description": "viewport y (CSS px)" },
+                    "session": { "type": "string", "description": "optional session id" }
+                },
+                "required": ["x", "y"]
+            }
+        }),
+        json!({
+            "name": "visual_snapshot",
+            "description": "Vision-grounded look at the ACTIVE tab: screenshot with numbered red frames (Set-of-Mark) over interactive elements + a JSON map (number -> uid/text/bbox). The host LLM sees the image and answers with numbers, like a human pointing. Works with non-vision hosts too via the map. Click the center of a bbox with click_at.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "max_marks": { "type": "integer", "minimum": 1, "maximum": 200, "default": 40, "description": "max numbered elements to draw" },
+                    "max_nodes": { "type": "integer", "minimum": 10, "maximum": 2000, "default": 400 },
+                    "session": { "type": "string", "description": "optional session id" }
+                },
+                "required": []
+            }
+        }),
+        json!({
             "name": "type",
             "description": "Type text into an input/textarea on the ACTIVE CDP tab (React-compatible events).",
             "inputSchema": {
@@ -1271,6 +1392,8 @@ fn tools_schema() -> Vec<Value> {
         ("ask", "[Read]"),
         // [Act] — operate on a live engine=cdp tab.
         ("click", "[Act]"),
+        ("click_at", "[Act]"),
+        ("visual_snapshot", "[Act]"),
         ("type", "[Act]"),
         ("submit", "[Act]"),
         ("press", "[Act]"),

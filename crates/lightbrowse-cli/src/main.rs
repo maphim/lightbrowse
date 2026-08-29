@@ -116,6 +116,31 @@ enum Cmd {
         #[arg(long, default_value = "auto", value_parser = parse_engine)]
         engine: Engine,
     },
+    /// Human-like look: screenshot the ACTIVE tab with numbered SoM frames
+    /// over interactive elements + a number→uid map. Vision LLMs pick numbers;
+    /// non-vision LLMs can still act from the map JSON.
+    VisualSnapshot {
+        /// Optional URL — when given, navigates first (engine=cdp). When
+        /// omitted, looks at the current active tab.
+        url: Option<String>,
+        #[arg(long, default_value_t = 40)]
+        max_marks: usize,
+        #[arg(long, default_value_t = 400)]
+        max_nodes: usize,
+        #[arg(long, default_value = "visual-snapshot.png")]
+        output: String,
+        /// Settle wait (ms) after navigate before looking — lets bot
+        /// challenges / heavy JS finish. Default 3000.
+        #[arg(long, default_value_t = 3000)]
+        settle_ms: u64,
+    },
+    /// Click at raw viewport coordinates (CSS px) — pairs with visual-snapshot.
+    ClickAt {
+        x: f64,
+        y: f64,
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Web search via DuckDuckGo (no API key).
     Search {
         query: String,
@@ -340,6 +365,77 @@ async fn main() -> lightbrowse_core::Result<()> {
             };
             let tree = snapshot::snapshot(&page.html, &page.url, &opts);
             print_json(&serde_json::to_value(tree).unwrap());
+        }
+        Cmd::VisualSnapshot {
+            url,
+            max_marks,
+            max_nodes,
+            output,
+            settle_ms,
+        } => {
+            if let Some(u) = url {
+                // Live tab needed — bypass the memory cache so the CDP
+                // backend actually registers the tab.
+                lightbrowse_core::service::navigate(
+                    &*fetch,
+                    Some(&*cdp_trait),
+                    &session,
+                    &u,
+                    Engine::Cdp,
+                )
+                .await?;
+                if settle_ms > 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+                }
+            }
+            let (html, title, url) = cdp.current_dom(None).await?;
+            let opts = SnapshotOptions {
+                max_nodes: max_nodes.clamp(10, 2000),
+                max_depth: 12,
+                ..SnapshotOptions::default()
+            };
+            let mut tree = snapshot::snapshot(&html, &url, &opts);
+            let sels = snapshot::collect_selectors(&tree);
+            let rects = cdp.element_rects(&sels, None).await?;
+            snapshot::attach_rects(&mut tree, &rects);
+
+            let shot = std::env::temp_dir().join(format!("lb-shot-{}.png", std::process::id()));
+            let shot_path = cdp.screenshot(&shot, false, None).await?;
+            let png = std::fs::read(&shot_path)?;
+            let marks = lightbrowse_core::vision::select_marks(&tree, max_marks.clamp(1, 200));
+            let som_marks: Vec<lightbrowse_core::vision::Mark> = marks
+                .iter()
+                .map(|(label, _, _, b)| lightbrowse_core::vision::Mark {
+                    label: *label,
+                    bbox: *b,
+                })
+                .collect();
+            let overlaid = lightbrowse_core::vision::overlay(&png, &som_marks)?;
+            std::fs::write(&output, &overlaid)?;
+
+            let mut map = serde_json::Map::new();
+            for (label, uid, text, bbox) in &marks {
+                map.insert(
+                    label.to_string(),
+                    json!({
+                        "uid": uid,
+                        "text": text,
+                        "bbox": [bbox.x, bbox.y, bbox.w, bbox.h]
+                    }),
+                );
+            }
+            print_json(&json!({
+                "url": url,
+                "title": title,
+                "count": marks.len(),
+                "overlay": output,
+                "map": map,
+                "note": "Open the overlay image, pick the number that matches your goal, then: lightbrowse click-at <x> <y>"
+            }));
+        }
+        Cmd::ClickAt { x, y, session } => {
+            let res = cdp.click_at(x, y, session.as_deref()).await?;
+            print_json(&res);
         }
         Cmd::Search { query, max_results } => {
             let ddg = format!(
