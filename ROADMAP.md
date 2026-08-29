@@ -36,7 +36,43 @@
 - [x] **SSO auth sharing** — all CDP sessions share the persistent Chromium
       profile: log into Microsoft SSO once, Outlook/Teams/SharePoint are
       auto-authenticated everywhere
-- [ ] **Stealth options** — fingerprinting toggles for bot-detected sites
+- [x] **Stealth options** — fingerprinting toggles for bot-detected sites
+      (`--no-stealth`; built-in injection: webdriver/UA/chrome/plugins/
+      languages/hardwareConcurrency/deviceMemory). Note: hard CF routes
+      (e.g. voz `/whats-new/`) may still block headless — see Stealth v2 below.
+
+## Vision-grounded perception (the agent sees like a human) 🪶👁️
+
+> **Paradigm:** screenshot + Set-of-Mark (SoM) numbered overlay → vision LLM
+> picks numbers like a human pointing → `click_at(x,y)` acts. The DOM is the
+> fallback, not the primary sense.
+
+- [x] **bbox per snapshot node** — `x/y/w/h` viewport rects, one JS
+      `getBoundingClientRect` pass (CDP only; fetch omits) — also gives
+      text-only LLMs spatial reasoning
+- [x] **`visual_snapshot`** — screenshot + numbered SoM frames over
+      interactive elements + `number→{uid,text,bbox}` map
+      (MCP / HTTP `/v1/visual_snapshot` / CLI `visual-snapshot`; embedded
+      5×7 bitmap font, no font files; `--settle-ms` waits out bot challenges)
+- [x] **`click_at(x,y)`** — coordinate click via `Input.dispatchMouseEvent`
+      (MCP / HTTP `/v1/click_at` / CLI `click-at`)
+- [x] **Gemini Web vision sidecar** (`tools/gemini-vision.py`) — FREE
+      reverse-engineered Gemini Web API, no API key, CDP cookie auto-detect.
+      Verified live: reads SoM overlay, identifies elements/threads.
+- [ ] **`visual_snapshot mode=gemini`** — Rust calls the sidecar server-side
+      (python subprocess), returns the vision answer directly — vision becomes
+      a lightbrowse feature, no host vision required
+- [ ] **VisionProvider trait** — pluggable `locate(image, prompt, candidates)
+      → {soom_id|uid|coords}`; providers: gemini-web (free) / anthropic /
+      openai / omni-parser (local)
+- [ ] **`click <n>` SoM convenience** — resolve number → bbox center in one
+      call (MCP/HTTP)
+- [ ] **`hover_at(x,y)`** — for hover-dependent menus
+- [ ] **post-click verification** — `elementFromPoint` check after click
+      (clicked the right thing? page changed?)
+- [ ] **Stealth v2 (undetected)** — CF-hard routes (voz `/whats-new/`,
+      cloudflare Turnstile) need a fuller human fingerprint (canvas noise,
+      CDP-detection patches, cf_clearance flow)
 
 ## Reading & extraction (what agents need most)
 
@@ -45,9 +81,13 @@
 - [x] CSS `selector` on snapshot nodes (for actions)
 - [x] **Intent-aware `ask`** — pass a question, get relevant blocks + score
 - [x] **Token & cost section** — benchmarked savings vs naive reads (see README)
-- [ ] **Page summarization** — optional LLM-less extractive summary
-- [ ] **Diff mode** — compare two versions of a page
+- [x] **Page summarization** — LLM-less extractive summary
+      (`lightbrowse summarize <url>`, TF×position scoring, timestamp-noise
+      filter; no model, no API)
+- [x] **Diff mode** — `lightbrowse diff <urlA> <urlB>`: line-level LCS,
+      context compaction, change stats (CLI); MCP/HTTP expose planned
 - [ ] **Multi-page research** — batch N URLs, aggregated answer
+      (research tool exists in MCP — CLI batch mode planned)
 
 ## Browsing memory (why no vector DB — yet)
 
@@ -96,8 +136,8 @@
 - [x] CLI (`fetch`, `extract`, `snapshot`, `search`, `ask`, `memory-*`, `serve`, `mcp`)
 - [x] MCP server — navigate/extract/snapshot/search/ask/research/memory/click/type/submit/press/screenshot/evaluate/runbook
 - [x] HTTP API — `/v1/{page,extract,snapshot,search,ask,memory,click,type,submit,current,cookies,download,downloads,network/log,network/capture}` + `/docs` + `/openapi.json`
-- [ ] WebSocket streaming for long-running research tasks
-- [ ] Optional GUI (wry) — off by default, for humans who want to watch
+- [ ] **WebSocket streaming for long-running research tasks**
+- [ ] **Optional GUI (wry)** — off by default, for humans who want to watch
 
 ## Non-goals (deliberately)
 

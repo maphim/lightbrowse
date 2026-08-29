@@ -10,6 +10,7 @@
 pub mod backend;
 pub mod config;
 pub mod cookie;
+pub mod diff;
 pub mod error;
 pub mod extract;
 pub mod page;
@@ -17,6 +18,7 @@ pub mod proxy;
 pub mod service;
 pub mod session;
 pub mod snapshot;
+pub mod summarize;
 pub mod vault;
 pub mod vision;
 

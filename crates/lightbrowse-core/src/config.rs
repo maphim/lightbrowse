@@ -69,6 +69,10 @@ pub struct Config {
     /// (via `Page.addScriptToEvaluateOnNewDocument`) — for fetch/XHR hooks,
     /// globals, network spies. Env: LIGHTBROWSE_PRELOAD.
     pub preload_script: Option<std::path::PathBuf>,
+    /// Fingerprint-masking injection (navigator.webdriver, UA, chrome,
+    /// plugins, languages, hardwareConcurrency, deviceMemory). Default true;
+    /// disable with `--no-stealth` when a site misbehaves.
+    pub stealth: bool,
 }
 
 impl Default for Config {
@@ -86,6 +90,7 @@ impl Default for Config {
             cdp_url: None,
             download_dir: None,
             preload_script: None,
+            stealth: true,
         }
     }
 }

@@ -67,6 +67,10 @@ struct Cli {
     /// (fetch/XHR hooks, network spies). Also settable via LIGHTBROWSE_PRELOAD.
     #[arg(long, global = true)]
     preload: Option<std::path::PathBuf>,
+    /// Disable fingerprint-masking (navigator.webdriver, hardwareConcurrency,
+    /// languages, chrome, …). On by default; disable if a site misbehaves.
+    #[arg(long, global = true)]
+    no_stealth: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -140,6 +144,24 @@ enum Cmd {
         y: f64,
         #[arg(long)]
         session: Option<String>,
+    },
+    /// LLM-less extractive summary of a page (top sentences, no API key).
+    Summarize {
+        url: String,
+        #[arg(long, default_value_t = 5)]
+        max_sentences: usize,
+        #[arg(long, default_value = "auto", value_parser = parse_engine)]
+        engine: Engine,
+    },
+    /// Diff two pages (or the same URL twice) line-by-line — what changed?
+    Diff {
+        url_a: String,
+        url_b: String,
+        #[arg(long, default_value = "auto", value_parser = parse_engine)]
+        engine: Engine,
+        /// Context lines around each change (0 = only changes).
+        #[arg(long, default_value_t = 2)]
+        context: usize,
     },
     /// Web search via DuckDuckGo (no API key).
     Search {
@@ -252,6 +274,9 @@ async fn main() -> lightbrowse_core::Result<()> {
             .filter(|s| !s.is_empty())
             .map(std::path::PathBuf::from)
     });
+    if cli.no_stealth {
+        config.stealth = false;
+    }
     // Proxy: CLI flag wins over the environment; validate early so a typo
     // fails before any request is made.
     config.proxy = cli
@@ -436,6 +461,83 @@ async fn main() -> lightbrowse_core::Result<()> {
         Cmd::ClickAt { x, y, session } => {
             let res = cdp.click_at(x, y, session.as_deref()).await?;
             print_json(&res);
+        }
+        Cmd::Summarize {
+            url,
+            max_sentences,
+            engine,
+        } => {
+            let (page, _) = nav_cached(
+                &memory,
+                &*fetch,
+                Some(&*cdp_trait),
+                &session,
+                &url,
+                engine,
+                ttl,
+            )
+            .await?;
+            let s = lightbrowse_core::summarize::summarize(
+                &page.html,
+                max_sentences.clamp(1, 20),
+            );
+            print_json(&json!({
+                "url": page.url,
+                "title": s.title,
+                "total_sentences": s.total_sentences,
+                "summary": s.sentences,
+            }));
+        }
+        Cmd::Diff {
+            url_a,
+            url_b,
+            engine,
+            context,
+        } => {
+            let (pa, _) = nav_cached(
+                &memory,
+                &*fetch,
+                Some(&*cdp_trait),
+                &session,
+                &url_a,
+                engine,
+                ttl,
+            )
+            .await?;
+            let (pb, _) = nav_cached(
+                &memory,
+                &*fetch,
+                Some(&*cdp_trait),
+                &session,
+                &url_b,
+                engine,
+                ttl,
+            )
+            .await?;
+            let ta = extract::extract_text(&pa.html).text;
+            let tb = extract::extract_text(&pb.html).text;
+            let full = lightbrowse_core::diff::diff_texts(&ta, &tb);
+            let compacted = lightbrowse_core::diff::compact(full.clone(), context);
+            let (same, added, removed) = lightbrowse_core::diff::diff_stats(&full);
+            let lines: Vec<Value> = compacted
+                .iter()
+                .map(|l| {
+                    json!({
+                        "kind": match l.kind {
+                            lightbrowse_core::diff::DiffKind::Same => "same",
+                            lightbrowse_core::diff::DiffKind::Added => "added",
+                            lightbrowse_core::diff::DiffKind::Removed => "removed",
+                        },
+                        "text": l.text,
+                    })
+                })
+                .collect();
+            print_json(&json!({
+                "url_a": pa.url,
+                "url_b": pb.url,
+                "stats": { "same": same, "added": added, "removed": removed },
+                "lines": lines,
+            }));
         }
         Cmd::Search { query, max_results } => {
             let ddg = format!(

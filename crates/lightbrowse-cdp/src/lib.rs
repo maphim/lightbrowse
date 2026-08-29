@@ -524,6 +524,7 @@ impl CdpBackend {
             url,
             &ua,
             self.config.js_wait_ms,
+            self.config.stealth,
             self.config.preload_script.as_deref(),
             self.config.download_dir.as_deref(),
         )
@@ -1827,6 +1828,7 @@ async fn navigate_and_render(
     url: &str,
     user_agent: &str,
     js_wait_ms: u64,
+    stealth: bool,
     preload_script: Option<&std::path::Path>,
     download_dir: Option<&std::path::Path>,
 ) -> Result<(String, String, String)> {
@@ -1835,7 +1837,7 @@ async fn navigate_and_render(
         .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
 
     rpc_expect(&mut ws, "Page.enable", json!({})).await?;
-    stealth_setup(&mut ws, user_agent, preload_script).await?;
+    stealth_setup(&mut ws, user_agent, stealth, preload_script).await?;
 
     // Allow programmatic downloads (anchor clicks / the `download` tool)
     // without Chromium's "multiple automatic downloads" gate, and route
@@ -2033,6 +2035,7 @@ async fn navigate_and_render(
 async fn stealth_setup(
     ws: &mut CdpWs,
     user_agent: &str,
+    stealth: bool,
     preload_script: Option<&std::path::Path>,
 ) -> Result<()> {
     if let Err(e) = rpc_expect(
@@ -2061,16 +2064,24 @@ async fn stealth_setup(
     Object.defineProperty(navigator, 'languages', {{
         get: () => ['en-US', 'en', 'vi'],
     }});
+    Object.defineProperty(navigator, 'hardwareConcurrency', {{
+        get: () => 8,
+    }});
+    Object.defineProperty(navigator, 'deviceMemory', {{
+        get: () => 8,
+    }});
 }})();
 "#,
         ua_json = serde_json::to_string(user_agent).map_err(|e| Error::Parse(e.to_string()))?
     );
-    let _ = rpc_expect(
-        ws,
-        "Page.addScriptToEvaluateOnNewDocument",
-        json!({ "source": stealth_js }),
-    )
-    .await;
+    if stealth {
+        let _ = rpc_expect(
+            ws,
+            "Page.addScriptToEvaluateOnNewDocument",
+            json!({ "source": stealth_js }),
+        )
+        .await;
+    }
     // Optional user preload hook (--preload / LIGHTBROWSE_PRELOAD): runs
     // before the page's own scripts, e.g. fetch/XHR wrappers for API
     // discovery (see #31).
