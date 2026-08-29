@@ -23,6 +23,7 @@ use lightbrowse_core::config::{Config, Engine};
 use lightbrowse_core::extract::{self, ExtractMode};
 use lightbrowse_core::session::Session;
 use lightbrowse_core::snapshot::{self, SnapshotOptions};
+use lightbrowse_core::vision;
 use lightbrowse_memory::{navigate_cached, MemoryStore};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -57,6 +58,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runbook/get", get(runbook_get))
         .route("/v1/runbook/run", axum::routing::post(runbook_run))
         .route("/v1/click", get(click_action))
+        .route("/v1/click_at", get(click_at_action))
+        .route("/v1/visual_snapshot", get(visual_snapshot))
         .route("/v1/type", get(type_action))
         .route("/v1/submit", get(submit_action))
         .route("/v1/tabs", get(tabs_list))
@@ -688,6 +691,8 @@ fn openapi_spec() -> Value {
             "/v1/evaluate": { "get": { "summary": "Run JS on the active CDP tab", "parameters": [{"name": "expression", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "JS result"} } } },
             "/v1/screenshot": { "get": { "summary": "Screenshot the active CDP tab", "responses": { "200": {"description": "PNG"} } } },
             "/v1/click": { "get": { "summary": "Click a CSS selector on the active tab", "parameters": [{"name": "selector", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "click result"} } } },
+            "/v1/click_at": { "get": { "summary": "Click at viewport coordinates (CSS px) — the human-pointing action for SoM/vision", "parameters": [{"name": "x", "in": "query", "required": true, "schema": {"type": "number"}}, {"name": "y", "in": "query", "required": true, "schema": {"type": "number"}}], "responses": { "200": {"description": "click result"} } } },
+            "/v1/visual_snapshot": { "get": { "summary": "Vision-grounded look: screenshot + Set-of-Mark numbered overlay + uid map (base64 image)", "parameters": [{"name": "max_marks", "in": "query", "schema": {"type": "integer"}}, {"name": "max_nodes", "in": "query", "schema": {"type": "integer"}}], "responses": { "200": {"description": "JSON with image_base64 + map"} } } },
             "/v1/type": { "get": { "summary": "Type text into an input on the active tab", "parameters": [{"name": "selector", "in": "query", "required": true, "schema": {"type": "string"}}, {"name": "text", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "type result"} } } },
             "/v1/tabs": { "get": { "summary": "List open CDP tabs", "responses": { "200": {"description": "tabs"} } } },
             "/v1/tab/close": { "get": { "summary": "Close a CDP tab", "parameters": [{"name": "session", "in": "query", "schema": {"type": "string"}}], "responses": { "200": {"description": "ok"} } } },
@@ -842,6 +847,97 @@ async fn click_action(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "selector": q.selector, "result": res })).into_response())
+}
+
+#[derive(Deserialize)]
+struct CoordQuery {
+    x: f64,
+    y: f64,
+    /// Optional session id.
+    session: Option<String>,
+}
+
+async fn click_at_action(
+    State(state): State<AppState>,
+    Query(q): Query<CoordQuery>,
+) -> Result<Response, ApiError> {
+    let cdp_session = resolve_cdp_session(&state, q.session.as_deref())?;
+    let res = require_cdp(&state)?
+        .click_at(q.x, q.y, cdp_session.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "x": q.x, "y": q.y, "result": res })).into_response())
+}
+
+#[derive(Deserialize)]
+struct VisualQuery {
+    /// Optional session id.
+    session: Option<String>,
+    max_marks: Option<usize>,
+    max_nodes: Option<usize>,
+}
+
+/// Vision-grounded look: screenshot + SoM numbered overlay + uid map.
+async fn visual_snapshot(
+    State(state): State<AppState>,
+    Query(q): Query<VisualQuery>,
+) -> Result<Response, ApiError> {
+    let cdp_session = resolve_cdp_session(&state, q.session.as_deref())?;
+    let cdp = require_cdp(&state)?;
+    let max_nodes = q.max_nodes.unwrap_or(400).clamp(10, 2000);
+    let max_marks = q.max_marks.unwrap_or(40).clamp(1, 200);
+
+    let (html, title, url) = cdp
+        .current_dom(cdp_session.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+    let opts = SnapshotOptions {
+        max_nodes,
+        max_depth: 12,
+        ..SnapshotOptions::default()
+    };
+    let mut tree = snapshot::snapshot(&html, &url, &opts);
+    let sels = snapshot::collect_selectors(&tree);
+    let rects = cdp
+        .element_rects(&sels, cdp_session.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+    snapshot::attach_rects(&mut tree, &rects);
+
+    let shot = std::env::temp_dir().join(format!("lb-shot-{}.png", std::process::id()));
+    let shot_path = cdp
+        .screenshot(&shot, false, cdp_session.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+    let png = std::fs::read(&shot_path)
+        .map_err(|e| ApiError::internal(format!("read screenshot: {e}")))?;
+    let marks = vision::select_marks(&tree, max_marks);
+    let som_marks: Vec<vision::Mark> = marks
+        .iter()
+        .map(|(label, _, _, b)| vision::Mark { label: *label, bbox: *b })
+        .collect();
+    let overlaid = vision::overlay(&png, &som_marks).map_err(ApiError::from)?;
+
+    let mut map = serde_json::Map::new();
+    for (label, uid, text, bbox) in &marks {
+        map.insert(
+            label.to_string(),
+            json!({
+                "uid": uid,
+                "text": text,
+                "bbox": [bbox.x, bbox.y, bbox.w, bbox.h]
+            }),
+        );
+    }
+    let b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &overlaid);
+    Ok(Json(json!({
+        "url": url,
+        "title": title,
+        "count": marks.len(),
+        "image_base64": b64,
+        "map": map
+    }))
+    .into_response())
 }
 
 async fn type_action(

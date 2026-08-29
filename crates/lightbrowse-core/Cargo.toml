@@ -19,3 +19,4 @@ aes-gcm = { workspace = true }
 rand = { workspace = true }
 zeroize = { workspace = true }
 hex = { workspace = true }
+image = "0.25"

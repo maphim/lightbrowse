@@ -1061,6 +1061,80 @@ impl CdpBackend {
         Ok(json!({ "ok": true, "tag": tag, "x": x.round() as u64, "y": y.round() as u64 }))
     }
 
+    /// Click at raw viewport coordinates (CSS px, top-left origin) — the
+    /// "human pointing" action for SoM/vision agents. Dispatches a real
+    /// mouseMoved → pressed → released sequence at the given point.
+    pub async fn click_at(&self, x: f64, y: f64, session: Option<&str>) -> Result<Value> {
+        let (sid, active) = self.active_page(session).await?;
+        if x < 0.0 || y < 0.0 {
+            return Ok(json!({ "ok": false, "reason": "coordinates must be >= 0" }));
+        }
+        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
+            .await
+            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+        let (rx, ry) = (x.round() as u64, y.round() as u64);
+        for (typ, buttons) in [("mouseMoved", 0), ("mousePressed", 1), ("mouseReleased", 0)] {
+            rpc_expect(
+                &mut ws,
+                "Input.dispatchMouseEvent",
+                json!({
+                    "type": typ,
+                    "x": rx,
+                    "y": ry,
+                    "button": "left",
+                    "buttons": buttons,
+                    "clickCount": 1
+                }),
+            )
+            .await?;
+        }
+        let _ = ws.close(None).await;
+        self.touch();
+        self.touch_tab(&sid).await;
+        Ok(json!({ "ok": true, "x": rx, "y": ry }))
+    }
+
+    /// Get viewport bounding boxes for a batch of CSS selectors in ONE JS
+    /// pass. Returns a map {selector: [x, y, w, h]} for elements that are
+    /// visible and non-zero-sized. Selectors are top-document paths (the
+    /// same ones the snapshot tree emits).
+    pub async fn element_rects(
+        &self,
+        selectors: &[String],
+        session: Option<&str>,
+    ) -> Result<std::collections::HashMap<String, [f64; 4]>> {
+        if selectors.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let list = serde_json::to_string(selectors)
+            .map_err(|e| Error::Parse(format!("element_rects encode: {e}")))?;
+        let expr = format!(
+            "(() => {{ const sels = {list}; const out = {{}}; \
+             for (const s of sels) {{ \
+               const el = document.querySelector(s); if (!el) continue; \
+               const r = el.getBoundingClientRect(); \
+               if (r.width < 1 || r.height < 1) continue; \
+               const cs = getComputedStyle(el); \
+               if (cs.visibility === 'hidden' || cs.display === 'none') continue; \
+               out[s] = [Math.round(r.x), Math.round(r.y), Math.round(r.width), Math.round(r.height)]; \
+             }} \
+             return out; }})()"
+        );
+        let v = self.evaluate(&expr, session).await?;
+        let mut out = std::collections::HashMap::new();
+        if let Some(obj) = v.as_object() {
+            for (sel, arr) in obj {
+                if let Some(a) = arr.as_array() {
+                    let vals: Vec<f64> = a.iter().filter_map(|x| x.as_f64()).collect();
+                    if vals.len() == 4 {
+                        out.insert(sel.clone(), [vals[0], vals[1], vals[2], vals[3]]);
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Type text like a real keyboard (CDP `Input.insertText` — fires genuine
     /// input events; React and anti-bot both see a human typing).
     pub async fn type_text(
