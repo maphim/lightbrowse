@@ -1464,7 +1464,7 @@ impl CdpBackend {
         let submitted = if submit {
             let sub_js = r#"(() => {
   const btn = Array.from(document.querySelectorAll('button[type=submit], input[type=submit], button'))
-    .find(b => /submit|login|register|sign\s*up|create|save|đăng ký|đăng nhập|đồng ý|tiếp tục|gửi/i.test((b.textContent || b.value || '')));
+    .find(b => /submit|login|log\s*in|sign\s*in|sign\s*up|register|create|save|continue|next|đăng ký|đăng nhập|đồng ý|tiếp tục|gửi/i.test((b.textContent || b.value || '')));
   if (btn) { btn.click(); return 'click:' + (btn.textContent || btn.value || '').trim().slice(0, 30); }
   return null;
 })()"#;
