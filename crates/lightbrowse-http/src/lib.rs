@@ -907,7 +907,11 @@ async fn login_action(
             .login_success_probe(cdp_session.as_deref())
             .await
             .map_err(ApiError::from)?;
-        if probe.get("detected").and_then(|v| v.as_bool()).unwrap_or(false) {
+        if probe
+            .get("detected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
             let url = probe.get("url").and_then(|v| v.as_str()).unwrap_or("");
             let name = q.vault_name.clone().unwrap_or_else(|| {
                 url::Url::parse(url)
@@ -934,7 +938,11 @@ async fn login_action(
                     let steps_json = serde_json::to_string(&trail)
                         .map_err(|e| ApiError::internal(format!("runbook serialize: {e}")))?;
                     let rb_name = format!("login-{name}");
-                    if state.memory.save_runbook(&rb_name, url, &steps_json).is_ok() {
+                    if state
+                        .memory
+                        .save_runbook(&rb_name, url, &steps_json)
+                        .is_ok()
+                    {
                         runbook_saved = json!(rb_name);
                     }
                 }
@@ -1038,7 +1046,10 @@ async fn visual_snapshot(
     let marks = vision::select_marks(&tree, max_marks);
     let som_marks: Vec<vision::Mark> = marks
         .iter()
-        .map(|(label, _, _, b)| vision::Mark { label: *label, bbox: *b })
+        .map(|(label, _, _, b)| vision::Mark {
+            label: *label,
+            bbox: *b,
+        })
         .collect();
     let overlaid = vision::overlay(&png, &som_marks).map_err(ApiError::from)?;
 

@@ -726,10 +726,7 @@ impl McpServer {
                 snapshot::attach_rects(&mut tree, &rects);
 
                 // 3. Screenshot → overlay numbered frames → map.
-                let shot = std::env::temp_dir().join(format!(
-                    "lb-shot-{}.png",
-                    std::process::id()
-                ));
+                let shot = std::env::temp_dir().join(format!("lb-shot-{}.png", std::process::id()));
                 let shot_path = cdp
                     .screenshot(&shot, false, session.as_deref())
                     .await
@@ -738,7 +735,10 @@ impl McpServer {
                 let marks = vision::select_marks(&tree, max_marks);
                 let som_marks: Vec<vision::Mark> = marks
                     .iter()
-                    .map(|(label, _, _, b)| vision::Mark { label: *label, bbox: *b })
+                    .map(|(label, _, _, b)| vision::Mark {
+                        label: *label,
+                        bbox: *b,
+                    })
                     .collect();
                 let overlaid = vision::overlay(&png, &som_marks).map_err(|e| e.to_string())?;
 
@@ -753,10 +753,8 @@ impl McpServer {
                         }),
                     );
                 }
-                let b64 = base64::Engine::encode(
-                    &base64::engine::general_purpose::STANDARD,
-                    &overlaid,
-                );
+                let b64 =
+                    base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &overlaid);
                 Ok(pretty(&json!({
                     "url": url,
                     "title": title,
@@ -859,13 +857,10 @@ impl McpServer {
                         let trail = cdp.trail();
                         if !trail.is_empty() {
                             if let Some(m) = &s.memory {
-                                let steps_json = serde_json::to_string(&trail)
-                                    .map_err(|e| e.to_string())?;
+                                let steps_json =
+                                    serde_json::to_string(&trail).map_err(|e| e.to_string())?;
                                 let rb_name = format!("login-{name}");
-                                if m
-                                    .save_runbook(&rb_name, url, &steps_json)
-                                    .is_ok()
-                                {
+                                if m.save_runbook(&rb_name, url, &steps_json).is_ok() {
                                     runbook_saved = json!(rb_name);
                                 }
                             }
@@ -886,10 +881,7 @@ impl McpServer {
                     .and_then(|v| v.as_object())
                     .cloned()
                     .unwrap_or_default();
-                let auto = args
-                    .get("auto")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
+                let auto = args.get("auto").and_then(|v| v.as_bool()).unwrap_or(true);
                 let submit = args
                     .get("submit")
                     .and_then(|v| v.as_bool())

@@ -1065,7 +1065,8 @@ impl CdpBackend {
     /// Click at raw viewport coordinates (CSS px, top-left origin) — the
     /// "human pointing" action for SoM/vision agents. Dispatches a real
     /// mouseMoved → pressed → released sequence at the given point.
-    pub async fn click_at(&self, x: f64, y: f64, session: Option<&str>) -> Result<Value> {        let (sid, active) = self.active_page(session).await?;
+    pub async fn click_at(&self, x: f64, y: f64, session: Option<&str>) -> Result<Value> {
+        let (sid, active) = self.active_page(session).await?;
         if x < 0.0 || y < 0.0 {
             return Ok(json!({ "ok": false, "reason": "coordinates must be >= 0" }));
         }
@@ -1263,11 +1264,19 @@ impl CdpBackend {
         let raw = v.as_str().unwrap_or("{}");
         let parsed: Value = serde_json::from_str(raw)
             .map_err(|e| Error::Parse(format!("fill_login detect parse: {e}")))?;
-        let pass_sel = parsed.get("pass").and_then(|s| s.as_str()).map(|s| s.to_string());
-        let user_sel = parsed.get("user").and_then(|s| s.as_str()).map(|s| s.to_string());
+        let pass_sel = parsed
+            .get("pass")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+        let user_sel = parsed
+            .get("user")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
 
         let Some(pass_sel) = pass_sel else {
-            return Ok(json!({ "ok": false, "reason": "no password field found (input[type=password])" }));
+            return Ok(
+                json!({ "ok": false, "reason": "no password field found (input[type=password])" }),
+            );
         };
         let Some(user_sel) = user_sel else {
             return Ok(json!({ "ok": false, "reason": "no username field found" }));
@@ -1340,9 +1349,8 @@ impl CdpBackend {
             .map_err(|e| Error::Parse(format!("fill_form enumerate parse: {e}")))?;
 
         // ── 2. Build match keys (normalized) for caller values.
-        let norm = |s: &str| -> String {
-            s.to_lowercase().trim().trim_end_matches(':').to_string()
-        };
+        let norm =
+            |s: &str| -> String { s.to_lowercase().trim().trim_end_matches(':').to_string() };
         let mut used = std::collections::HashSet::new();
         let mut filled = Vec::new();
         let mut unmatched_user_keys = Vec::new();
@@ -1353,7 +1361,11 @@ impl CdpBackend {
             let id = f.get("id").and_then(|x| x.as_str()).unwrap_or("");
             let placeholder = f.get("placeholder").and_then(|x| x.as_str()).unwrap_or("");
             let label = f.get("label").and_then(|x| x.as_str()).unwrap_or("");
-            let css = f.get("css").and_then(|x| x.as_str()).unwrap_or("").to_string();
+            let css = f
+                .get("css")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
 
             let keys: Vec<String> = [label, name, id, placeholder]
                 .iter()
@@ -1391,7 +1403,12 @@ impl CdpBackend {
                 .cloned()
                 .unwrap_or_default();
             let generated = if value.is_none() && auto {
-                Some(auto_value(ftype, &norm(&format!("{name} {label} {placeholder}")), &rand_suffix(), &options))
+                Some(auto_value(
+                    ftype,
+                    &norm(&format!("{name} {label} {placeholder}")),
+                    &rand_suffix(),
+                    &options,
+                ))
             } else {
                 None
             };
@@ -1413,22 +1430,34 @@ impl CdpBackend {
             // ── 3. Fill by type.
             let ok = match ftype {
                 "checkbox" => {
-                    let target = val.eq_ignore_ascii_case("true") || val.eq_ignore_ascii_case("yes") || val == "1" || val.is_empty();
+                    let target = val.eq_ignore_ascii_case("true")
+                        || val.eq_ignore_ascii_case("yes")
+                        || val == "1"
+                        || val.is_empty();
                     if target != f.get("checked").and_then(|c| c.as_bool()).unwrap_or(false) {
-                        self.click(&css, session).await.map(|r| r.get("ok").and_then(|o| o.as_bool()).unwrap_or(false)).unwrap_or(false)
-                    } else { true }
+                        self.click(&css, session)
+                            .await
+                            .map(|r| r.get("ok").and_then(|o| o.as_bool()).unwrap_or(false))
+                            .unwrap_or(false)
+                    } else {
+                        true
+                    }
                 }
-                "radio" => {
-                    self.click(&css, session).await.map(|r| r.get("ok").and_then(|o| o.as_bool()).unwrap_or(false)).unwrap_or(false)
-                }
+                "radio" => self
+                    .click(&css, session)
+                    .await
+                    .map(|r| r.get("ok").and_then(|o| o.as_bool()).unwrap_or(false))
+                    .unwrap_or(false),
                 "select" => {
                     let set_js = format!(
                         "(() => {{ const el = document.querySelector({sel}); if (!el) return false;                          const want = {want}; const opt = Array.from(el.options).find(o => o.value === want || o.textContent.trim() === want);                          if (!opt) return false; el.value = opt.value;                          el.dispatchEvent(new Event('change', {{bubbles: true}})); return true; }})()",
                         sel = serde_json::to_string(&css).unwrap_or_default(),
                         want = serde_json::to_string(&val).unwrap_or_default()
                     );
-                    self.evaluate(&set_js, session).await
-                        .map(|r| r.as_bool().unwrap_or(false)).unwrap_or(false)
+                    self.evaluate(&set_js, session)
+                        .await
+                        .map(|r| r.as_bool().unwrap_or(false))
+                        .unwrap_or(false)
                 }
                 "date" | "time" | "month" => {
                     let set_js = format!(
@@ -1436,8 +1465,10 @@ impl CdpBackend {
                         sel = serde_json::to_string(&css).unwrap_or_default(),
                         want = serde_json::to_string(&val).unwrap_or_default()
                     );
-                    self.evaluate(&set_js, session).await
-                        .map(|r| r.as_bool().unwrap_or(false)).unwrap_or(false)
+                    self.evaluate(&set_js, session)
+                        .await
+                        .map(|r| r.as_bool().unwrap_or(false))
+                        .unwrap_or(false)
                 }
                 _ => {
                     let typed = self.type_text(&css, &val, session).await?;
@@ -1515,10 +1546,23 @@ impl CdpBackend {
         let raw = v.as_str().unwrap_or("{}");
         let parsed: Value = serde_json::from_str(raw)
             .map_err(|e| Error::Parse(format!("login probe parse: {e}")))?;
-        let on_login = parsed.get("on_login_page").and_then(|b| b.as_bool()).unwrap_or(true);
-        let logged_in = parsed.get("has_logout").and_then(|b| b.as_bool()).unwrap_or(false)
-            || parsed.get("has_user_menu").and_then(|b| b.as_bool()).unwrap_or(false);
-        let url = parsed.get("url").and_then(|s| s.as_str()).unwrap_or("").to_string();
+        let on_login = parsed
+            .get("on_login_page")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(true);
+        let logged_in = parsed
+            .get("has_logout")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false)
+            || parsed
+                .get("has_user_menu")
+                .and_then(|b| b.as_bool())
+                .unwrap_or(false);
+        let url = parsed
+            .get("url")
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string();
         let detected = !on_login || logged_in;
         Ok(json!({
             "detected": detected,
@@ -2422,9 +2466,13 @@ fn auto_value(ftype: &str, hints: &str, rnd: &str, options: &[Value]) -> String 
             format!("09{digits}")
         }
         "number" => {
-            if hints.contains("tuoi") || hints.contains("age") { "25".into() }
-            else if hints.contains("so luong") || hints.contains("quantity") { "2".into() }
-            else { "42".into() }
+            if hints.contains("tuoi") || hints.contains("age") {
+                "25".into()
+            } else if hints.contains("so luong") || hints.contains("quantity") {
+                "2".into()
+            } else {
+                "42".into()
+            }
         }
         "date" => "2026-08-30".into(),
         "select" => options
@@ -2434,19 +2482,33 @@ fn auto_value(ftype: &str, hints: &str, rnd: &str, options: &[Value]) -> String 
             .unwrap_or_else(|| "1".into()),
         "checkbox" | "radio" => "true".into(),
         _ => {
-            if hints.contains("email") { format!("lb.{rnd}@test.dev") }
-            else if hints.contains("user") || hints.contains("tai khoan") || hints.contains("ten dang nhap") {
+            if hints.contains("email") {
+                format!("lb.{rnd}@test.dev")
+            } else if hints.contains("user")
+                || hints.contains("tai khoan")
+                || hints.contains("ten dang nhap")
+            {
                 format!("lbuser{rnd}")
             } else if hints.contains("pass") || hints.contains("mat khau") {
                 format!("Passw0rd!{rnd}")
             } else if hints.contains("ho") || hints.contains("ten") || hints.contains("name") {
                 format!("Nguyen Van {rnd}")
-            } else if hints.contains("sdt") || hints.contains("phone") || hints.contains("dien thoai") {
+            } else if hints.contains("sdt")
+                || hints.contains("phone")
+                || hints.contains("dien thoai")
+            {
                 let digits: String = rnd.chars().filter(|c| c.is_ascii_digit()).take(8).collect();
                 format!("09{digits}")
-            } else if hints.contains("dia chi") || hints.contains("address") || hints.contains("city") || hints.contains("thanh pho") {
+            } else if hints.contains("dia chi")
+                || hints.contains("address")
+                || hints.contains("city")
+                || hints.contains("thanh pho")
+            {
                 "Ha Noi".into()
-            } else if hints.contains("birth") || hints.contains("ngay sinh") || hints.contains("namsinh") {
+            } else if hints.contains("birth")
+                || hints.contains("ngay sinh")
+                || hints.contains("namsinh")
+            {
                 "1991-04-05".into()
             } else if hints.contains("gioi tinh") || hints.contains("gender") {
                 "Nam".into()
@@ -2463,13 +2525,22 @@ fn auto_value(ftype: &str, hints: &str, rnd: &str, options: &[Value]) -> String 
 /// (time + thread-id hash — no extra crate needed).
 fn rand_suffix() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let mut seed = t as u64 ^ std::process::id() as u64;
     let mut out = String::with_capacity(10);
     for _ in 0..10 {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let c = ((seed >> 33) % 36) as u8;
-        out.push(if c < 10 { (b'0' + c) as char } else { (b'a' + c - 10) as char });
+        out.push(if c < 10 {
+            (b'0' + c) as char
+        } else {
+            (b'a' + c - 10) as char
+        });
     }
     out
 }

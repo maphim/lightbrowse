@@ -34,8 +34,17 @@ fn split_sentences(text: &str) -> Vec<String> {
 fn looks_timestamp(s: &str) -> bool {
     let low = s.to_lowercase();
     let markers = [
-        "yesterday", "today", "ago", "minutes", "hours", "at ",
-        "hôm qua", "hôm nay", "lúc ", "phút trước", "giờ trước",
+        "yesterday",
+        "today",
+        "ago",
+        "minutes",
+        "hours",
+        "at ",
+        "hôm qua",
+        "hôm nay",
+        "lúc ",
+        "phút trước",
+        "giờ trước",
     ];
     let hits = markers.iter().filter(|m| low.contains(**m)).count();
     // Mostly digits / clock tokens?
@@ -54,15 +63,71 @@ fn content_words(s: &str) -> Vec<String> {
             w.len() >= 4
                 && !matches!(
                     w.as_str(),
-                    "the" | "this" | "that" | "with" | "from" | "have" | "they" | "there"
-                        | "their" | "which" | "would" | "could" | "about" | "these" | "those"
-                        | "being" | "been" | "were" | "than" | "then" | "when" | "what" | "where"
-                        | "while" | "after" | "before" | "because" | "between" | "through"
-                        | "during" | "without" | "within" | "across" | "against" | "along"
-                        | "around" | "under" | "above" | "below" | "again" | "further"
-                        | "và" | "của" | "cho" | "các" | "được" | "không" | "những" | "một"
-                        | "với" | "người" | "khi" | "để" | "trong" | "cũng" | "này" | "đó"
-                        | "về" | "như" | "từ" | "đã" | "sẽ" | "đang" | "là" | "có"
+                    "the"
+                        | "this"
+                        | "that"
+                        | "with"
+                        | "from"
+                        | "have"
+                        | "they"
+                        | "there"
+                        | "their"
+                        | "which"
+                        | "would"
+                        | "could"
+                        | "about"
+                        | "these"
+                        | "those"
+                        | "being"
+                        | "been"
+                        | "were"
+                        | "than"
+                        | "then"
+                        | "when"
+                        | "what"
+                        | "where"
+                        | "while"
+                        | "after"
+                        | "before"
+                        | "because"
+                        | "between"
+                        | "through"
+                        | "during"
+                        | "without"
+                        | "within"
+                        | "across"
+                        | "against"
+                        | "along"
+                        | "around"
+                        | "under"
+                        | "above"
+                        | "below"
+                        | "again"
+                        | "further"
+                        | "và"
+                        | "của"
+                        | "cho"
+                        | "các"
+                        | "được"
+                        | "không"
+                        | "những"
+                        | "một"
+                        | "với"
+                        | "người"
+                        | "khi"
+                        | "để"
+                        | "trong"
+                        | "cũng"
+                        | "này"
+                        | "đó"
+                        | "về"
+                        | "như"
+                        | "từ"
+                        | "đã"
+                        | "sẽ"
+                        | "đang"
+                        | "là"
+                        | "có"
                 )
         })
         .collect()

@@ -551,8 +551,9 @@ async fn main() -> lightbrowse_core::Result<()> {
                     let mut runbook_saved = serde_json::Value::Null;
                     let trail = cdp.trail();
                     if !trail.is_empty() {
-                        let steps_json = serde_json::to_string(&trail)
-                            .map_err(|e| lightbrowse_core::Error::Parse(format!("runbook serialize: {e}")))?;
+                        let steps_json = serde_json::to_string(&trail).map_err(|e| {
+                            lightbrowse_core::Error::Parse(format!("runbook serialize: {e}"))
+                        })?;
                         let rb_name = format!("login-{name}");
                         if memory.save_runbook(&rb_name, cur_url, &steps_json).is_ok() {
                             runbook_saved = json!(rb_name);
@@ -588,13 +589,12 @@ async fn main() -> lightbrowse_core::Result<()> {
                 tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
             }
             let values: serde_json::Map<String, Value> = match &values {
-                Some(raw) => serde_json::from_str(raw)
-                    .map_err(|e| lightbrowse_core::Error::Unsupported(format!("values JSON: {e}")))?,
+                Some(raw) => serde_json::from_str(raw).map_err(|e| {
+                    lightbrowse_core::Error::Unsupported(format!("values JSON: {e}"))
+                })?,
                 None => serde_json::Map::new(),
             };
-            let res = cdp
-                .fill_form(&values, !no_auto, submit, None)
-                .await?;
+            let res = cdp.fill_form(&values, !no_auto, submit, None).await?;
             print_json(&res);
         }
         Cmd::Summarize {
@@ -612,10 +612,7 @@ async fn main() -> lightbrowse_core::Result<()> {
                 ttl,
             )
             .await?;
-            let s = lightbrowse_core::summarize::summarize(
-                &page.html,
-                max_sentences.clamp(1, 20),
-            );
+            let s = lightbrowse_core::summarize::summarize(&page.html, max_sentences.clamp(1, 20));
             print_json(&json!({
                 "url": page.url,
                 "title": s.title,

@@ -39,23 +39,38 @@ pub fn diff_texts(a: &str, b: &str) -> Vec<DiffLine> {
     let (mut i, mut j) = (0, 0);
     while i < n && j < m {
         if a[i] == b[j] {
-            out.push(DiffLine { kind: DiffKind::Same, text: a[i].to_string() });
+            out.push(DiffLine {
+                kind: DiffKind::Same,
+                text: a[i].to_string(),
+            });
             i += 1;
             j += 1;
         } else if lcs[i + 1][j] >= lcs[i][j + 1] {
-            out.push(DiffLine { kind: DiffKind::Removed, text: a[i].to_string() });
+            out.push(DiffLine {
+                kind: DiffKind::Removed,
+                text: a[i].to_string(),
+            });
             i += 1;
         } else {
-            out.push(DiffLine { kind: DiffKind::Added, text: b[j].to_string() });
+            out.push(DiffLine {
+                kind: DiffKind::Added,
+                text: b[j].to_string(),
+            });
             j += 1;
         }
     }
     while i < n {
-        out.push(DiffLine { kind: DiffKind::Removed, text: a[i].to_string() });
+        out.push(DiffLine {
+            kind: DiffKind::Removed,
+            text: a[i].to_string(),
+        });
         i += 1;
     }
     while j < m {
-        out.push(DiffLine { kind: DiffKind::Added, text: b[j].to_string() });
+        out.push(DiffLine {
+            kind: DiffKind::Added,
+            text: b[j].to_string(),
+        });
         j += 1;
     }
     out
@@ -82,7 +97,10 @@ pub fn compact(diff: Vec<DiffLine>, context: usize) -> Vec<DiffLine> {
         if line.kind != DiffKind::Same {
             // Emit any pending context (context lines before this change).
             let emit = unchanged_run.min(context);
-            out.push_back(DiffLine { kind: DiffKind::Same, text: format!("⋯ {emit} unchanged ⋯") });
+            out.push_back(DiffLine {
+                kind: DiffKind::Same,
+                text: format!("⋯ {emit} unchanged ⋯"),
+            });
             out.push_back(line);
             unchanged_run = 0;
         } else {
