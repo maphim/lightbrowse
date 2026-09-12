@@ -124,6 +124,31 @@ fn secret_var_name(secret_ref: Option<&str>) -> &str {
         .unwrap_or(raw)
 }
 
+/// Field types whose value must never be echoed back or persisted.
+fn is_secret_field(ftype: &str) -> bool {
+    ftype.eq_ignore_ascii_case("password")
+}
+
+/// Redact a field value for a tool result: a password never round-trips.
+fn redact_value(ftype: &str, value: &str) -> Value {
+    if is_secret_field(ftype) {
+        Value::Null
+    } else {
+        Value::String(value.to_string())
+    }
+}
+
+/// Build a `type` result. A secret is reported as `value: null` with
+/// `secret: true` — protecting storage is not enough if the response echoes the
+/// value back into the tool/LLM context.
+fn type_result(value: Value, secret: bool) -> Value {
+    json!({
+        "ok": true,
+        "value": if secret { Value::Null } else { value },
+        "secret": secret,
+    })
+}
+
 /// CDP backend with lazy Chromium spawn + idle suspension.
 pub struct CdpBackend {
     config: Config,
@@ -1224,25 +1249,10 @@ impl CdpBackend {
             return Ok(clicked);
         }
         let (sid, active) = self.active_page(session).await?;
-        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
-            .await
-            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
-        rpc_expect(&mut ws, "Input.insertText", json!({ "text": text })).await?;
-        let _ = ws.close(None).await;
-        self.touch();
-        self.touch_tab(&sid).await;
-        // Confirm what landed in the field (may live in an iframe).
         let sel = serde_json::to_string(selector).map_err(|e| Error::Parse(e.to_string()))?;
-        let value = eval_across_frames_value(
-            active.port,
-            &active.ws_url,
-            &format!(
-                "(() => {{ const el = document.querySelector({sel}); return el ? el.value : null; }})()"
-            ),
-        )
-        .await?;
-        // Classify the value as secret: an explicit caller hint, or a password
-        // input (so a manual `type` into a password field is redacted too).
+        // Classify secret BEFORE typing: the element is still present here, so a
+        // field that navigates/removes itself during input can never be
+        // misread as non-secret (which would persist the literal).
         let is_secret = match secret {
             Some(s) => s,
             None => eval_across_frames_value(
@@ -1257,9 +1267,30 @@ impl CdpBackend {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
         };
+        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
+            .await
+            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+        rpc_expect(&mut ws, "Input.insertText", json!({ "text": text })).await?;
+        let _ = ws.close(None).await;
+        self.touch();
+        self.touch_tab(&sid).await;
+        // Confirm the landed value only for non-secret input — never read a
+        // secret back into the tool result.
+        let value = if is_secret {
+            Value::Null
+        } else {
+            eval_across_frames_value(
+                active.port,
+                &active.ws_url,
+                &format!(
+                    "(() => {{ const el = document.querySelector({sel}); return el ? el.value : null; }})()"
+                ),
+            )
+            .await?
+        };
         let fallbacks = self.collect_fallbacks(selector, session).await;
         self.record_step(type_trail_step(selector, fallbacks, text, is_secret));
-        Ok(json!({ "ok": true, "value": value }))
+        Ok(type_result(value, is_secret))
     }
 
     /// Press a physical key on the focused element (Enter, Tab, Backspace...).
@@ -1605,7 +1636,11 @@ impl CdpBackend {
                         .unwrap_or(false)
                 }
                 _ => {
-                    let typed = self.type_text(&css, &val, session).await?;
+                    let typed = if is_secret_field(ftype) {
+                        self.type_text_secret(&css, &val, session).await?
+                    } else {
+                        self.type_text(&css, &val, session).await?
+                    };
                     typed.get("ok").and_then(|o| o.as_bool()).unwrap_or(false)
                 }
             };
@@ -1614,7 +1649,8 @@ impl CdpBackend {
                 "field": if !label.is_empty() { label } else if !name.is_empty() { name } else { id },
                 "key": value.map(|(k, _)| k).unwrap_or("(auto)"),
                 "type": ftype,
-                "value": val,
+                "value": redact_value(ftype, &val),
+                "secret": is_secret_field(ftype),
                 "ok": ok,
             }));
         }
@@ -3625,7 +3661,14 @@ pub async fn run_runbook(
                 let mut detail = String::new();
                 let mut done = false;
                 for sel in &candidates {
-                    match cdp.type_text(sel, &text, None).await {
+                    // Replay through the explicit secret path so redaction is
+                    // guaranteed even if the page changes during input.
+                    let typed = if step.secret {
+                        cdp.type_text_secret(sel, &text, None).await
+                    } else {
+                        cdp.type_text(sel, &text, None).await
+                    };
+                    match typed {
                         Ok(v) if v.get("ok").and_then(|x| x.as_bool()) == Some(true) => {
                             detail = format!("typed into {sel}");
                             done = true;
@@ -3883,6 +3926,27 @@ mod tests {
         assert_eq!(sum_tree_rss(999, &rows), None);
         assert_eq!(parse_ps_tree("garbage\n\n").len(), 0);
     }
+
+    /// Tool results must never echo a secret back to the caller — the storage
+    /// fix alone is insufficient because the response is what the LLM sees.
+    #[test]
+    fn secret_values_never_echoed_in_results() {
+        let leaked = type_result(json!("s3cret-pw"), true);
+        assert_eq!(leaked["value"], Value::Null);
+        assert_eq!(leaked["secret"], true);
+        assert!(!leaked.to_string().contains("s3cret-pw"));
+
+        let plain = type_result(json!("alice"), false);
+        assert_eq!(plain["value"], "alice");
+        assert_eq!(plain["secret"], false);
+
+        // fill_form field results use the same rule.
+        assert!(is_secret_field("password"));
+        assert!(is_secret_field("PASSWORD"));
+        assert!(!is_secret_field("text"));
+        assert_eq!(redact_value("password", "s3cret-pw"), Value::Null);
+        assert_eq!(redact_value("text", "alice"), json!("alice"));
+    }
 }
 
 /// Integration test: CDP must self-heal when the Chromium process is killed
@@ -3918,11 +3982,9 @@ async fn recovers_after_chromium_killed() {
         .as_ref()
         .expect("spawned browser")
         .id();
-    let _ = std::process::Command::new("pkill")
-        .arg("-9")
-        .arg("-f")
-        .arg("--user-data-dir=.*lightbrowse-chrome")
-        .status();
+    // Kill ONLY this test's own browser main process. A broad
+    // `pkill -f lightbrowse-chrome` could kill a concurrent LightBrowse
+    // instance elsewhere on the machine, so we never use it.
     let _ = std::process::Command::new("kill")
         .arg("-9")
         .arg(pid.to_string())
@@ -3942,4 +4004,97 @@ async fn recovers_after_chromium_killed() {
     assert!(backend.navigate_count() >= 2, "both navigations counted");
 
     backend.reset_browser().await;
+}
+
+/// Live proof that a tool result never echoes a secret: the password input
+/// removes itself on input, so classification must happen BEFORE typing (a
+/// post-input check would see nothing and persist the literal).
+#[tokio::test]
+#[ignore = "requires Chrome"]
+#[cfg_attr(windows, ignore = "uses a file:// fixture (unix paths)")]
+async fn secret_type_result_never_echoes_password() {
+    const MARKER: &str = "P0-LEAK-MARKER-42";
+    let dir = std::env::temp_dir().join(format!("lb-secret-type-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let page = dir.join("self-removing.html");
+    std::fs::write(
+        &page,
+        "<html><body><input id=\"p\" type=\"password\" oninput=\"this.remove()\"></body></html>",
+    )
+    .unwrap();
+    let url = format!("file://{}", page.display());
+
+    let backend = CdpBackend::new(lightbrowse_core::config::Config::default());
+    let session = Session::new();
+    backend.navigate(&session, &url).await.expect("navigate");
+
+    let res = backend
+        .type_text("#p", MARKER, None)
+        .await
+        .expect("type_text");
+    assert_eq!(
+        res["value"],
+        serde_json::Value::Null,
+        "secret value must be redacted in the result"
+    );
+    assert_eq!(
+        res["secret"], true,
+        "password input must classify as secret"
+    );
+    assert!(!res.to_string().contains(MARKER), "result leaked: {res}");
+
+    let trail = serde_json::to_string(&backend.trail()).unwrap();
+    assert!(!trail.contains(MARKER), "trail leaked: {trail}");
+
+    backend.reset_browser().await;
+    let _ = std::fs::remove_file(&page);
+}
+
+/// Live proof that a secret runbook step takes its value from a variable and
+/// never from the stored step, and fails clearly when the variable is absent.
+#[tokio::test]
+#[ignore = "requires Chrome"]
+#[cfg_attr(windows, ignore = "uses a file:// fixture (unix paths)")]
+async fn secret_replay_uses_variable_and_never_leaks() {
+    const MARKER: &str = "P0-REPLAY-MARKER-77";
+    let dir = std::env::temp_dir().join(format!("lb-secret-replay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let page = dir.join("password.html");
+    std::fs::write(
+        &page,
+        "<html><body><input id=\"p\" type=\"password\"></body></html>",
+    )
+    .unwrap();
+    let url = format!("file://{}", page.display());
+
+    let backend = CdpBackend::new(lightbrowse_core::config::Config::default());
+    let steps: Vec<RunbookStep> = serde_json::from_value(json!([
+        {"action": "type", "selector": "#p", "secret": true, "secret_ref": "{{PASSWORD}}"}
+    ]))
+    .unwrap();
+
+    // Value supplied → replay succeeds and nothing leaks.
+    let mut vars = std::collections::HashMap::new();
+    vars.insert("PASSWORD".to_string(), MARKER.to_string());
+    let out = run_runbook(&backend, &url, &steps, &vars)
+        .await
+        .expect("run");
+    assert!(out.ok, "secret replay should succeed when PASSWORD is set");
+    let js = serde_json::to_string(&out).unwrap();
+    assert!(!js.contains(MARKER), "replay outcome leaked: {js}");
+
+    // Value absent → must fail loudly, never type a stale literal.
+    let out2 = run_runbook(&backend, &url, &steps, &std::collections::HashMap::new())
+        .await
+        .expect("run");
+    assert!(!out2.ok, "secret replay without PASSWORD must fail");
+    assert!(
+        serde_json::to_string(&out2)
+            .unwrap()
+            .contains("secret value missing"),
+        "failure must explain the missing variable"
+    );
+
+    backend.reset_browser().await;
+    let _ = std::fs::remove_file(&page);
 }
