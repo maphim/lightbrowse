@@ -369,8 +369,11 @@ RAM" are opposing goals — so you only pay for what you need:
 
 ## Sessions & isolation
 
-Every `?session=<id>` (HTTP) names a private browsing context: its own
-cookies **and** its own CDP tab. Concurrent agents never step on each other:
+Every `?session=<id>` (HTTP) names a private CDP tab: its own page/DOM state,
+navigation and network capture. **Cookies are currently shared** by the
+underlying browser profile across all tabs in one lightbrowse process — session
+cookie jars are not isolated yet (per-session browser contexts are future
+work). Concurrent agents get separate tabs, not separate logins.
 
 ```bash
 # agent A
@@ -384,10 +387,17 @@ curl 'localhost:8787/v1/current?session=bob'
 
 MCP: mỗi process là một session riêng; tools `click/type/submit/press/…`
 nhận thêm `session` (optional) để nhắm đúng tab. `cookies`, `download` và
-`network/capture` (start/stop) cũng nhận `session`; khi có **nhiều hơn 1 tab**
-thì `session` là **bắt buộc**, để một lệnh không thể vô tình tác động lên tab
-đang active. `cookies` mặc định **che giá trị** (`value = null`) — chỉ trả về
-secret khi truyền `include_values: true`.
+`network/capture` (start/stop/flush/log) cũng nhận `session`; khi có **nhiều
+hơn 1 tab** thì `session` là **bắt buộc**, để một lệnh không thể vô tình tác
+động lên tab đang active.
+
+- `network/capture`: trạng thái capture là **per-session** — tab A không thể
+  stop/read capture của tab B; mỗi event có field `session`.
+- `cookies`: mặc định **che giá trị** (`value = null`) — chỉ trả về secret khi
+  truyền `include_values: true`. Lưu ý: cookie jar hiện **dùng chung** giữa các
+  tab (xem mục Sessions ở trên).
+- `downloads`: danh sách audit **process-global**; mỗi record có `session` và
+  có thể lọc bằng tham số `session`.
 
 ## Resource manager
 

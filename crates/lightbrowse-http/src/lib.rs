@@ -572,9 +572,9 @@ async fn downloads(State(state): State<AppState>) -> Result<Json<Value>, ApiErro
 /// GET /v1/network/log — captured network events + capture status.
 async fn network_log(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let cdp = require_cdp(&state)?;
-    let events = cdp.network_log();
+    let events = cdp.network_log(None);
     Ok(Json(json!({
-        "capturing": cdp.network_capturing(),
+        "capturing": cdp.network_capturing(None),
         "count": events.len(),
         "events": events
     })))
@@ -596,7 +596,7 @@ async fn network_capture_action(
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?,
         "flush" => {
-            cdp.network_log_clear();
+            cdp.network_log_clear(None);
             json!({ "cleared": true })
         }
         other => {

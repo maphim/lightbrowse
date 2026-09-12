@@ -297,9 +297,20 @@ impl McpServer {
             }
             "downloads" => {
                 let cdp = require_cdp(&s)?;
+                // Process-global audit list; an optional `session` filters it.
+                let session = opt_str(args, "session");
+                let all = cdp.downloads();
+                let items: Vec<Value> = match &session {
+                    Some(s) => all
+                        .into_iter()
+                        .filter(|d| d.get("session").and_then(|v| v.as_str()) == Some(s.as_str()))
+                        .collect(),
+                    None => all,
+                };
                 Ok(pretty(&json!({
-                    "count": cdp.downloads().len(),
-                    "downloads": cdp.downloads()
+                    "count": items.len(),
+                    "session": session,
+                    "downloads": items
                 })))
             }
             "network/capture" => {
@@ -325,13 +336,16 @@ impl McpServer {
                         ))
                     }
                     "flush" => {
-                        cdp.network_log_clear();
-                        Ok(pretty(&json!({ "cleared": true })))
+                        let session = require_session(cdp, args).await?;
+                        cdp.network_log_clear(session.as_deref());
+                        Ok(pretty(&json!({ "cleared": true, "session": session })))
                     }
                     "log" => {
-                        let events = cdp.network_log();
+                        let session = require_session(cdp, args).await?;
+                        let events = cdp.network_log(session.as_deref());
+                        let capturing = cdp.network_capturing(session.as_deref());
                         Ok(pretty(
-                            &json!({ "capturing": cdp.network_capturing(), "count": events.len(), "events": events }),
+                            &json!({ "capturing": capturing, "count": events.len(), "events": events, "session": session }),
                         ))
                     }
                     other => Err(format!(
@@ -1518,20 +1532,22 @@ fn tools_schema() -> Vec<Value> {
         }),
         json!({
             "name": "downloads",
-            "description": "Recent programmatic downloads (last 200, newest first): url, saved filename after Chromium dedupe, bytes, timestamp. Lets you confirm a download finished and see where the file landed without polling the filesystem. Requires a live engine=cdp tab for the session.",
+            "description": "Recent programmatic downloads (last 200, newest first). This is a PROCESS-GLOBAL audit list — every session's downloads share it. Each record: url, saved (final filename after Chromium dedupe), bytes, ts, dir, and the originating `session`. Pass an optional 'session' to filter to one tab. Requires a live engine=cdp tab.",
             "inputSchema": {
                 "type": "object",
-                "properties": {}
+                "properties": {
+                    "session": { "type": "string", "description": "Optional filter: only downloads started by this tab session (see tabs/list)" }
+                }
             }
         }),
         json!({
             "name": "network/capture",
-            "description": "Network request log for SPA API discovery / auth-flow analysis. Actions: start (begin capturing requests/responses/failures on the active tab), stop (end capture, keep log), flush (clear log), log (read captured events, newest first). Each event: kind (request/response/failed), url, method, status, mime, request_id, ts. Requires a live engine=cdp tab.",
+            "description": "Per-session network request log for SPA API discovery / auth-flow analysis. Actions: start (begin capturing on the given session's tab), stop (end that session's capture, keep its log), flush (clear that session's log), log (read that session's events, newest first). Capture state is PER SESSION: one tab cannot stop or read another tab's capture. Each event: kind (request/response/failed), url, method, status, mime, request_id, ts, session. When more than one tab is open, 'session' is required. Requires a live engine=cdp tab.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "action": { "type": "string", "enum": ["start", "stop", "flush", "log"], "description": "start | stop | flush | log (default log)" },
-                    "session": { "type": "string", "description": "Tab session id from tabs/list (required for start/stop when >1 tab is open)" }
+                    "session": { "type": "string", "description": "Tab session id from tabs/list (required when >1 tab is open)" }
                 }
             }
         }),
@@ -1722,5 +1738,74 @@ mod tests {
         assert!(!redacted.to_string().contains("super-secret"));
         let revealed = cookie_view(&c, true);
         assert_eq!(revealed["value"], "super-secret");
+    }
+
+    /// Live two-tab enforcement: with 2 tabs open, every tab-scoped tool must
+    /// reject a missing session instead of silently using the MRU tab. Runs in
+    /// CI via `cargo test -p lightbrowse-mcp -- --include-ignored`.
+    #[tokio::test]
+    #[ignore = "requires Chrome + network"]
+    #[cfg_attr(windows, ignore = "requires Chrome + network fixtures")]
+    async fn call_tool_requires_session_with_two_tabs() {
+        let config = lightbrowse_core::config::Config {
+            memory_budget_mb: 8192,
+            max_tabs: 8,
+            ..Default::default()
+        };
+        let backend = Arc::new(lightbrowse_cdp::CdpBackend::new(config));
+        let sa = Session::new();
+        let sb = Session::new();
+        backend
+            .navigate(&sa, "https://example.com/?a")
+            .await
+            .unwrap();
+        backend
+            .navigate(&sb, "https://example.com/?b")
+            .await
+            .unwrap();
+        assert_eq!(backend.tab_count().await, 2, "two tabs expected");
+
+        let server = McpServer {
+            state: McpState {
+                backend: backend.clone(),
+                cdp: Some(backend.clone()),
+                session: Arc::new(Mutex::new(Session::new())),
+                engine: Engine::Cdp,
+                memory: None,
+                vault: None,
+            },
+        };
+
+        // No session + 2 tabs → each tab-scoped tool must refuse with guidance.
+        for tool in ["cookies", "download", "network/capture"] {
+            let mut args = Map::new();
+            match tool {
+                "download" => {
+                    args.insert("url".into(), json!("https://example.com/file.txt"));
+                }
+                "network/capture" => {
+                    args.insert("action".into(), json!("start"));
+                }
+                _ => {}
+            }
+            let err = server.call_tool(tool, &args).await.unwrap_err();
+            assert!(
+                err.contains("2 tabs are open"),
+                "{tool} should require a session: {err}"
+            );
+        }
+
+        // Explicit session → routed to that tab, cookie values redacted.
+        let mut args = Map::new();
+        args.insert("session".into(), json!(sa.id));
+        let out = server
+            .call_tool("cookies", &args)
+            .await
+            .expect("explicit session must work");
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["session"].as_str(), Some(sa.id.as_str()));
+        assert_eq!(v["include_values"], false);
+
+        backend.reset_browser().await;
     }
 }

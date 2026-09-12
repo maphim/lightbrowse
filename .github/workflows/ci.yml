@@ -27,6 +27,8 @@ jobs:
         run: cargo test --workspace
       - name: Integration tests (CDP self-healing — needs Chrome + network)
         run: cargo test -p lightbrowse-cdp -- --include-ignored
+      - name: Integration tests (MCP session scoping — needs Chrome + network)
+        run: cargo test -p lightbrowse-mcp -- --include-ignored
 
   release-build:
     name: Release build (static-ish, stripped)

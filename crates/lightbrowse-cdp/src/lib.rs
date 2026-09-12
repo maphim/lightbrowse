@@ -170,12 +170,16 @@ pub struct CdpBackend {
     /// Lets agents confirm a download finished and see the final filename
     /// (after Chromium dedupe) instead of polling ~/Downloads (#25).
     recent_downloads: Arc<Mutex<VecDeque<Value>>>,
-    /// Bounded capture buffer for the network request log (#29/#31).
-    network_log: Arc<Mutex<VecDeque<Value>>>,
-    /// Cancellation handle for the active network-capture background task.
-    network_capture_token: Mutex<Option<CancellationToken>>,
-    /// True while the capture task is running (toggled off on task exit).
-    network_capturing: Arc<std::sync::atomic::AtomicBool>,
+    /// Per-session network capture state, keyed by session id. Capture is
+    /// session-scoped: one tab can never stop or read another tab's log.
+    network_captures: Mutex<HashMap<String, NetworkCapture>>,
+}
+
+/// Live capture state for one session/tab.
+struct NetworkCapture {
+    token: CancellationToken,
+    log: Arc<Mutex<VecDeque<Value>>>,
+    active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl CdpBackend {
@@ -191,9 +195,7 @@ impl CdpBackend {
             peak_ram: std::sync::atomic::AtomicU64::new(0),
             navigations: std::sync::atomic::AtomicU64::new(0),
             recent_downloads: Arc::new(Mutex::new(VecDeque::new())),
-            network_log: Arc::new(Mutex::new(VecDeque::new())),
-            network_capture_token: Mutex::new(None),
-            network_capturing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            network_captures: Mutex::new(HashMap::new()),
         }
     }
 
@@ -948,7 +950,8 @@ impl CdpBackend {
                     "url": url,
                     "saved": final_path.display().to_string(),
                     "bytes": size,
-                    "dir": dir.display().to_string()
+                    "dir": dir.display().to_string(),
+                    "session": sid.clone()
                 }));
                 break;
             }
@@ -979,77 +982,154 @@ impl CdpBackend {
     }
 
     /// Start (`enable=true`) or stop (`enable=false`) a network capture on
-    /// the active tab. While capturing, a background task holds a DevTools
-    /// connection open and records requests/responses/failures (url, method,
-    /// status, mime) into a bounded ring buffer — for SPA API discovery
-    /// (#31) and auth-flow analysis (#29). Returns capture status + count.
+    /// the tab for `session`. Capture is PER SESSION: stopping or reading one
+    /// session can never affect another. While capturing, a background task
+    /// holds a DevTools connection open and records requests/responses/failures
+    /// (url, method, status, mime) into a bounded ring buffer tagged with the
+    /// session id — for SPA API discovery (#31) and auth-flow analysis (#29).
     pub async fn network_capture(&self, enable: bool, session: Option<&str>) -> Result<Value> {
         let (sid, active) = self.active_page(session).await?;
-        if !enable {
-            let mut token_guard = self
-                .network_capture_token
+        // Decide under the lock, then release it BEFORE any await so this
+        // future stays Send (axum handlers require that).
+        enum Plan {
+            Stopped(usize),
+            Already(bool, usize),
+            Start,
+        }
+        type StartState = (
+            CancellationToken,
+            Arc<Mutex<VecDeque<Value>>>,
+            Arc<std::sync::atomic::AtomicBool>,
+        );
+        let mut started: Option<StartState> = None;
+        let plan = {
+            let mut caps = self
+                .network_captures
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            if let Some(t) = token_guard.take() {
-                t.cancel();
+            if !enable {
+                Plan::Stopped(match caps.remove(&sid) {
+                    Some(c) => {
+                        c.token.cancel();
+                        c.log.lock().unwrap_or_else(|e| e.into_inner()).len()
+                    }
+                    None => 0,
+                })
+            } else if let Some(c) = caps.get(&sid) {
+                let n = c.log.lock().unwrap_or_else(|e| e.into_inner()).len();
+                Plan::Already(c.active.load(Ordering::Relaxed), n)
+            } else {
+                let token = CancellationToken::new();
+                let log: Arc<Mutex<VecDeque<Value>>> = Arc::new(Mutex::new(VecDeque::new()));
+                let active_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                caps.insert(
+                    sid.clone(),
+                    NetworkCapture {
+                        token: token.clone(),
+                        log: log.clone(),
+                        active: active_flag.clone(),
+                    },
+                );
+                started = Some((token, log, active_flag));
+                Plan::Start
             }
-            drop(token_guard);
-            self.network_capturing.store(false, Ordering::Relaxed);
-            let n = self
-                .network_log
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .len();
-            return Ok(json!({ "capturing": false, "events": n }));
-        }
-        if self.network_capturing.load(Ordering::Relaxed) {
-            let n = self
-                .network_log
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .len();
-            return Ok(json!({ "capturing": true, "events": n }));
-        }
-        let token = CancellationToken::new();
-        {
-            let mut token_guard = self
-                .network_capture_token
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            *token_guard = Some(token.clone());
-        }
-        self.network_capturing.store(true, Ordering::Relaxed);
-        let ws_url = active.ws_url.clone();
-        let log: Arc<Mutex<VecDeque<Value>>> = self.network_log.clone();
-        let capturing = self.network_capturing.clone();
-        self.touch_tab(&sid).await;
-        tokio::spawn(async move {
-            let res = network_capture_loop(&ws_url, &log, &token).await;
-            if let Err(e) = res {
-                tracing::warn!("cdp: network capture ended: {e}");
+        };
+        match plan {
+            Plan::Stopped(events) => {
+                Ok(json!({ "capturing": false, "events": events, "session": sid }))
             }
-            capturing.store(false, Ordering::Relaxed);
-        });
-        Ok(json!({ "capturing": true, "events": 0 }))
+            Plan::Already(capturing, n) => {
+                Ok(json!({ "capturing": capturing, "events": n, "session": sid }))
+            }
+            Plan::Start => {
+                let ws_url = active.ws_url.clone();
+                self.touch_tab(&sid).await;
+                let sid_for_task = sid.clone();
+                if let Some((token, log, active_flag)) = started {
+                    tokio::spawn(async move {
+                        let res = network_capture_loop(&ws_url, &log, &token, &sid_for_task).await;
+                        if let Err(e) = res {
+                            tracing::warn!("cdp: network capture ended: {e}");
+                        }
+                        active_flag.store(false, Ordering::Relaxed);
+                    });
+                }
+                Ok(json!({ "capturing": true, "events": 0, "session": sid }))
+            }
+        }
     }
 
-    /// Current network capture buffer (newest first) + capture status.
-    pub fn network_log(&self) -> Vec<Value> {
-        let log = self.network_log.lock().unwrap_or_else(|e| e.into_inner());
-        log.iter().rev().cloned().collect()
-    }
-
-    /// Whether a network capture is currently running.
-    pub fn network_capturing(&self) -> bool {
-        self.network_capturing.load(Ordering::Relaxed)
-    }
-
-    /// Clear the network capture buffer.
-    pub fn network_log_clear(&self) {
-        self.network_log
+    /// Captured events (newest first). `Some(session)` returns only that
+    /// session's log; `None` aggregates every session (HTTP/legacy callers).
+    pub fn network_log(&self, session: Option<&str>) -> Vec<Value> {
+        let caps = self
+            .network_captures
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+            .unwrap_or_else(|e| e.into_inner());
+        let mut out: Vec<Value> = match session {
+            Some(s) => caps
+                .get(s)
+                .map(|c| {
+                    c.log
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .rev()
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
+            None => caps
+                .values()
+                .flat_map(|c| {
+                    c.log
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .iter()
+                        .rev()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .collect(),
+        };
+        out.sort_by_key(|v| v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0));
+        out.reverse();
+        out
+    }
+
+    /// Whether a network capture is running for `session` (`None` = any).
+    pub fn network_capturing(&self, session: Option<&str>) -> bool {
+        let caps = self
+            .network_captures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match session {
+            Some(s) => caps
+                .get(s)
+                .map(|c| c.active.load(Ordering::Relaxed))
+                .unwrap_or(false),
+            None => caps.values().any(|c| c.active.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Clear captured events for `session` (`None` = all sessions).
+    pub fn network_log_clear(&self, session: Option<&str>) {
+        let caps = self
+            .network_captures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match session {
+            Some(s) => {
+                if let Some(c) = caps.get(s) {
+                    c.log.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                }
+            }
+            None => {
+                for c in caps.values() {
+                    c.log.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                }
+            }
+        }
     }
     /// pressed → released at the element's center), which is far harder for
     /// anti-bot systems to flag than `el.click()`. Works across iframes
@@ -3378,7 +3458,9 @@ async fn network_capture_loop(
     ws_url: &str,
     log: &Arc<Mutex<VecDeque<Value>>>,
     token: &CancellationToken,
+    session_id: &str,
 ) -> Result<()> {
+    let session_id = session_id.to_string();
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
         .await
         .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
@@ -3421,7 +3503,13 @@ async fn network_capture_loop(
                                 })),
                                 _ => None,
                             };
-                            if let Some(entry) = entry {
+                            if let Some(mut entry) = entry {
+                                if let Some(obj) = entry.as_object_mut() {
+                                    obj.insert(
+                                        "session".into(),
+                                        Value::String(session_id.clone()),
+                                    );
+                                }
                                 let mut guard = log.lock().unwrap_or_else(|e| e.into_inner());
                                 if guard.len() >= 500 {
                                     guard.pop_front();
@@ -4048,6 +4136,101 @@ async fn secret_type_result_never_echoes_password() {
 
     backend.reset_browser().await;
     let _ = std::fs::remove_file(&page);
+}
+
+/// Two-tab session contract: network capture is PER SESSION (one tab cannot
+/// stop or read another's), while cookies are SHARED across tabs in one
+/// browser process (documented in the README). Runs in CI via --include-ignored.
+#[tokio::test]
+#[ignore = "requires Chrome + network"]
+#[cfg_attr(windows, ignore = "uses a file:// fixture (unix paths)")]
+async fn two_tabs_isolate_capture_and_share_cookies() {
+    // A generous budget keeps the RAM governor from evicting one of the two
+    // tabs mid-test (it evicts LRU tabs once actual Chromium RAM > budget).
+    let config = lightbrowse_core::config::Config {
+        memory_budget_mb: 8192,
+        max_tabs: 8,
+        ..Default::default()
+    };
+    let backend = CdpBackend::new(config);
+    let sa = Session::new();
+    let sb = Session::new();
+
+    backend
+        .navigate(&sa, "https://example.com/?a")
+        .await
+        .expect("nav A");
+    backend
+        .navigate(&sb, "https://example.com/?b")
+        .await
+        .expect("nav B");
+    assert_eq!(backend.tab_count().await, 2, "two tabs expected");
+
+    // --- Per-session network capture ---
+    let started = backend
+        .network_capture(true, Some(sa.id.as_str()))
+        .await
+        .expect("start A");
+    assert_eq!(started["capturing"], true);
+    assert_eq!(started["session"].as_str(), Some(sa.id.as_str()));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        backend.network_capturing(Some(sa.id.as_str())),
+        "A should be capturing"
+    );
+
+    // Stopping B must NOT stop A (this was the process-global bug).
+    let stopped_b = backend
+        .network_capture(false, Some(sb.id.as_str()))
+        .await
+        .expect("stop B");
+    assert_eq!(stopped_b["capturing"], false);
+    assert!(
+        backend.network_capturing(Some(sa.id.as_str())),
+        "stop(B) must not stop A's capture"
+    );
+    assert!(!backend.network_capturing(Some(sb.id.as_str())));
+    assert!(
+        backend.network_log(Some(sb.id.as_str())).is_empty(),
+        "B must not see A's capture buffer"
+    );
+    backend
+        .network_capture(false, Some(sa.id.as_str()))
+        .await
+        .expect("stop A");
+
+    // --- Cookies are shared (same browser context) ---
+    backend
+        .evaluate(
+            "document.cookie = 'lbshared=1; path=/'",
+            Some(sa.id.as_str()),
+        )
+        .await
+        .expect("set cookie on A");
+    let has_shared = |v: &Value| -> bool {
+        v.as_array()
+            .map(|a| {
+                a.iter()
+                    .any(|c| c.get("name").and_then(|n| n.as_str()) == Some("lbshared"))
+            })
+            .unwrap_or(false)
+    };
+    let ca = backend
+        .cookies(Some(sa.id.as_str()))
+        .await
+        .expect("cookies A");
+    let cb = backend
+        .cookies(Some(sb.id.as_str()))
+        .await
+        .expect("cookies B");
+    assert!(has_shared(&ca), "A should see the cookie it just set");
+    assert!(
+        has_shared(&cb),
+        "tabs are expected to SHARE the browser cookie jar; if this fails, \
+         per-session cookies exist and the README/contract must be updated"
+    );
+
+    backend.reset_browser().await;
 }
 
 /// Live proof that a secret runbook step takes its value from a variable and
