@@ -276,6 +276,15 @@ impl CdpBackend {
                 tracing::warn!("cdp: Chromium process was already dead — cleaned up");
             }
         }
+        {
+            let mut caps = self
+                .network_captures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for (_, c) in caps.drain() {
+                c.token.cancel();
+            }
+        }
         self.tabs.lock().await.clear();
     }
 
@@ -368,6 +377,16 @@ impl CdpBackend {
     /// Close the tab of one session (manual eviction). Returns an error when
     /// the session has no open tab.
     pub async fn close_tab(&self, session_id: &str) -> Result<()> {
+        // Drop any network capture owned by this session so a later start is
+        // not blocked by a stale entry.
+        if let Some(c) = self
+            .network_captures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(session_id)
+        {
+            c.token.cancel();
+        }
         let page = {
             let mut tabs = self.tabs.lock().await;
             match tabs.remove(session_id) {
@@ -811,6 +830,15 @@ impl CdpBackend {
         filename: Option<&str>,
         session: Option<&str>,
     ) -> Result<Value> {
+        // A requested filename must stay inside the download directory.
+        let filename = match filename {
+            Some(f) => Some(safe_download_name(f).ok_or_else(|| {
+                Error::Transport(format!(
+                    "unsafe download filename '{f}' — path separators, '..' and absolute paths are rejected"
+                ))
+            })?),
+            None => None,
+        };
         let (sid, active) = self.active_page(session).await?;
         let dir = self
             .config
@@ -855,7 +883,7 @@ impl CdpBackend {
                      a.dispatchEvent(new MouseEvent('click', {{bubbles: true, cancelable: true, view: window}})); \
                      return 'triggered'; }})()",
                     url_json = serde_json::to_string(url).unwrap_or_default(),
-                    file_json = serde_json::to_string(filename.unwrap_or("")).unwrap_or_default()
+                    file_json = serde_json::to_string(filename.as_deref().unwrap_or("")).unwrap_or_default()
                 ),
                 "returnByValue": true,
                 "awaitPromise": true
@@ -908,7 +936,7 @@ impl CdpBackend {
                 // Honor the requested filename by renaming after the download
                 // completes — the `download` attribute is only a hint and is
                 // ignored on cross-origin URLs, so renaming is deterministic.
-                let final_path = match filename {
+                let final_path = match filename.as_deref() {
                     Some(name)
                         if !name.is_empty()
                             && name
@@ -920,12 +948,10 @@ impl CdpBackend {
                         let target = dir.join(name);
                         let target = if target.exists() {
                             // avoid overwriting an existing file with a (N) suffix
-                            let stem = name.rsplit('.').next().unwrap_or(name);
-                            let ext = name
-                                .rsplit('.')
-                                .nth(1)
-                                .map(|e| format!(".{e}"))
-                                .unwrap_or_default();
+                            let (stem, ext) = match name.rsplit_once('.') {
+                                Some((s, e)) => (s.to_string(), format!(".{e}")),
+                                None => (name.to_string(), String::new()),
+                            };
                             let mut n = 1usize;
                             loop {
                                 let cand = dir.join(format!("{stem} ({n}){ext}"));
@@ -1008,17 +1034,25 @@ impl CdpBackend {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             if !enable {
-                Plan::Stopped(match caps.remove(&sid) {
+                // Stop keeps the entry (and its log) for inspection; a later
+                // start replaces it.
+                Plan::Stopped(match caps.get(&sid) {
                     Some(c) => {
                         c.token.cancel();
+                        c.active.store(false, Ordering::Relaxed);
                         c.log.lock().unwrap_or_else(|e| e.into_inner()).len()
                     }
                     None => 0,
                 })
-            } else if let Some(c) = caps.get(&sid) {
-                let n = c.log.lock().unwrap_or_else(|e| e.into_inner()).len();
-                Plan::Already(c.active.load(Ordering::Relaxed), n)
+            } else if let Some(_c) = caps.get(&sid).filter(|c| c.active.load(Ordering::Relaxed)) {
+                let n = _c.log.lock().unwrap_or_else(|e| e.into_inner()).len();
+                Plan::Already(true, n)
             } else {
+                // No entry, or a stale one whose loop already ended: (re)create
+                // so capture can restart and stale events are not returned.
+                if let Some(old) = caps.remove(&sid) {
+                    old.token.cancel();
+                }
                 let token = CancellationToken::new();
                 let log: Arc<Mutex<VecDeque<Value>>> = Arc::new(Mutex::new(VecDeque::new()));
                 let active_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -3232,6 +3266,23 @@ enum ProfileProcKind {
     Orphan,
 }
 
+/// Sanitize a caller-supplied download filename so it cannot escape the
+/// download directory. Returns `None` for path separators, `..`/`.`, absolute
+/// paths, drive/ADS colons, and empty names.
+fn safe_download_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    if name.contains('/') || name.contains('\\') || name.contains(':') {
+        return None;
+    }
+    if std::path::Path::new(name).is_absolute() {
+        return None;
+    }
+    Some(name.to_string())
+}
+
 /// True when `cmd` carries `--user-data-dir=<needle>` as an exact argument
 /// (boundary-checked), so a profile path that is merely a prefix of a longer
 /// one (`/tmp/p` vs `/tmp/profile`) can never match.
@@ -4015,6 +4066,33 @@ mod tests {
         assert_eq!(parse_ps_tree("garbage\n\n").len(), 0);
     }
 
+    #[test]
+    fn rejects_unsafe_download_filenames() {
+        assert_eq!(
+            safe_download_name("report.pdf").as_deref(),
+            Some("report.pdf")
+        );
+        assert_eq!(
+            safe_download_name("  name.csv  ").as_deref(),
+            Some("name.csv")
+        );
+        for bad in [
+            "../evil",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            "..",
+            ".",
+            "C:evil",
+            "",
+        ] {
+            assert!(
+                safe_download_name(bad).is_none(),
+                "{bad:?} must be rejected as an unsafe download filename"
+            );
+        }
+    }
+
     /// Tool results must never echo a secret back to the caller — the storage
     /// fix alone is insufficient because the response is what the LLM sees.
     #[test]
@@ -4229,6 +4307,71 @@ async fn two_tabs_isolate_capture_and_share_cookies() {
         "tabs are expected to SHARE the browser cookie jar; if this fails, \
          per-session cookies exist and the README/contract must be updated"
     );
+
+    backend.reset_browser().await;
+}
+
+/// A stopped/finished capture must not block a restart, and close_tab must
+/// drop the session's capture entry (stale-lifecycle regression, round 10).
+#[tokio::test]
+#[ignore = "requires Chrome + network"]
+#[cfg_attr(windows, ignore = "requires Chrome + network")]
+async fn capture_restarts_after_stop_and_close() {
+    let config = lightbrowse_core::config::Config {
+        memory_budget_mb: 8192,
+        max_tabs: 8,
+        ..Default::default()
+    };
+    let backend = CdpBackend::new(config);
+    let s = Session::new();
+    backend.navigate(&s, "https://example.com/").await.unwrap();
+
+    let started = backend
+        .network_capture(true, Some(s.id.as_str()))
+        .await
+        .unwrap();
+    assert_eq!(started["capturing"], true);
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Stop retains the log for inspection but must allow a restart with a
+    // fresh buffer.
+    backend
+        .network_capture(false, Some(s.id.as_str()))
+        .await
+        .unwrap();
+    assert!(!backend.network_capturing(Some(s.id.as_str())));
+    let again = backend
+        .network_capture(true, Some(s.id.as_str()))
+        .await
+        .unwrap();
+    assert_eq!(again["capturing"], true, "restart after stop must work");
+    assert_eq!(again["events"], 0, "restart must not return stale events");
+    backend
+        .network_capture(false, Some(s.id.as_str()))
+        .await
+        .unwrap();
+
+    // close_tab drops the capture entry → capturing false. A later start needs
+    // a tab again (active_page never creates one implicitly), so re-navigate
+    // the same session, then capture must restart cleanly.
+    backend.close_tab(s.id.as_str()).await.unwrap();
+    assert!(!backend.network_capturing(Some(s.id.as_str())));
+    backend
+        .navigate(&s, "https://example.com/again")
+        .await
+        .unwrap();
+    let after_close = backend
+        .network_capture(true, Some(s.id.as_str()))
+        .await
+        .unwrap();
+    assert_eq!(
+        after_close["capturing"], true,
+        "restart after close_tab must work"
+    );
+    backend
+        .network_capture(false, Some(s.id.as_str()))
+        .await
+        .unwrap();
 
     backend.reset_browser().await;
 }

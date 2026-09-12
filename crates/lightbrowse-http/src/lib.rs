@@ -36,7 +36,9 @@ pub struct AppState {
     pub cdp: Option<Arc<dyn BrowserBackend>>,
     pub session: Arc<Mutex<Session>>,
     /// Named sessions created on demand via `?session=<id>` — each gets its
-    /// own cookies + CDP tab, so concurrent clients never share state.
+    /// own CDP tab (page state, navigation, network capture). NOTE: cookies
+    /// are shared by the underlying browser profile across tabs, so sessions
+    /// isolate tabs, not logins.
     pub sessions: Arc<Mutex<std::collections::HashMap<String, Session>>>,
     pub engine: Engine,
     pub config: Arc<Config>,
@@ -246,8 +248,9 @@ async fn proxy_set(State(state): State<AppState>, Json(body): Json<ProxyBody>) -
 struct UrlQuery {
     url: String,
     engine: Option<String>,
-    /// Optional named session: its own cookies + CDP tab (isolation between
-    /// concurrent clients). Omit to use the shared default session.
+    /// Optional named session: its own CDP tab (isolation between concurrent
+    /// clients). Cookies are shared by the browser profile. Omit to use the
+    /// shared default session.
     session: Option<String>,
 }
 
@@ -570,11 +573,16 @@ async fn downloads(State(state): State<AppState>) -> Result<Json<Value>, ApiErro
 }
 
 /// GET /v1/network/log — captured network events + capture status.
-async fn network_log(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn network_log(
+    State(state): State<AppState>,
+    Query(q): Query<NetworkCaptureQuery>,
+) -> Result<Json<Value>, ApiError> {
     let cdp = require_cdp(&state)?;
-    let events = cdp.network_log(None);
+    let session = q.session.as_deref();
+    let events = cdp.network_log(session);
     Ok(Json(json!({
-        "capturing": cdp.network_capturing(None),
+        "capturing": cdp.network_capturing(session),
+        "session": q.session,
         "count": events.len(),
         "events": events
     })))
@@ -588,16 +596,16 @@ async fn network_capture_action(
     let cdp = require_cdp(&state)?;
     let v = match q.action.as_deref().unwrap_or("log") {
         "start" => cdp
-            .network_capture(true, None)
+            .network_capture(true, q.session.as_deref())
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?,
         "stop" => cdp
-            .network_capture(false, None)
+            .network_capture(false, q.session.as_deref())
             .await
             .map_err(|e| ApiError::internal(e.to_string()))?,
         "flush" => {
-            cdp.network_log_clear(None);
-            json!({ "cleared": true })
+            cdp.network_log_clear(q.session.as_deref());
+            json!({ "cleared": true, "session": q.session })
         }
         other => {
             return Err(ApiError::bad_request(format!(
@@ -611,6 +619,9 @@ async fn network_capture_action(
 #[derive(Deserialize)]
 struct NetworkCaptureQuery {
     action: Option<String>,
+    /// Optional tab session. Restricts capture/log/flush to that session; omit
+    /// for the aggregate (process-wide) view.
+    session: Option<String>,
 }
 
 /// GET /docs — human-readable route reference rendered from the OpenAPI

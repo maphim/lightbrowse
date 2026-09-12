@@ -380,7 +380,7 @@ work). Concurrent agents get separate tabs, not separate logins.
 curl 'localhost:8787/v1/page?url=https://gmail.com&engine=cdp&session=alice'
 curl 'localhost:8787/v1/click?selector=%23identifierId&session=alice'  # tab của alice
 
-# agent B — tab riêng, cookies riêng, không đụng alice
+# agent B — tab riêng, KHÔNG đụng alice (cookie jar dùng chung giữa các tab)
 curl 'localhost:8787/v1/page?url=https://outlook.com&engine=cdp&session=bob'
 curl 'localhost:8787/v1/current?session=bob'
 ```
