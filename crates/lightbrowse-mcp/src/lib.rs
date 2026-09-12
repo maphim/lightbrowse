@@ -1659,6 +1659,7 @@ fn tools_schema() -> Vec<Value> {
         ("submit", "[Act]"),
         ("press", "[Act]"),
         ("evaluate", "[Act]"),
+        ("wait", "[Act]"),
         ("screenshot", "[Act]"),
         ("page/current", "[Act]"),
         // [Research] — multi-page / memory recall.

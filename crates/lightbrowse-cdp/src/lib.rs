@@ -1691,6 +1691,31 @@ impl CdpBackend {
         Ok((user_sel, pass_sel))
     }
 
+    /// Poll `detect_login_fields` until a password field is visible, bounded by
+    /// `timeout`. Returns `(Some(selector), waited_ms)` as soon as it appears,
+    /// or `(None, elapsed)` on timeout. Iframe-aware (detection is
+    /// depth-independent), so it also covers fields inside embedded login
+    /// frames — which a main-frame CSS selector could not reach.
+    async fn wait_for_password_field(
+        &self,
+        session: Option<&str>,
+        timeout: Duration,
+    ) -> Result<(Option<String>, u64)> {
+        let started = Instant::now();
+        loop {
+            let (_, pass) = self.detect_login_fields(session).await?;
+            if pass.is_some() {
+                return Ok((pass, started.elapsed().as_millis() as u64));
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= timeout {
+                return Ok((None, elapsed.as_millis() as u64));
+            }
+            let remaining = timeout.saturating_sub(elapsed);
+            tokio::time::sleep(Duration::from_millis(200).min(remaining)).await;
+        }
+    }
+
     /// One-call login: detect the visible username + password fields on the
     /// CURRENT page, fill them and submit. Single-step when both fields are
     /// visible; otherwise submit the username first and wait for the password
@@ -1701,6 +1726,22 @@ impl CdpBackend {
         username: &str,
         password: &str,
         session: Option<&str>,
+    ) -> Result<Value> {
+        self.fill_login_with_timeout(username, password, session, 8000)
+            .await
+    }
+
+    /// `fill_login` with an explicit bound (ms) for the multi-step password
+    /// step. That transition is a composable condition, not a fixed sleep: the
+    /// password field is polled (iframe-aware) until it appears or the bound
+    /// expires, and a timeout returns a structured `ok:false` result. Exposed
+    /// for tests. The public path uses 8000ms.
+    async fn fill_login_with_timeout(
+        &self,
+        username: &str,
+        password: &str,
+        session: Option<&str>,
+        password_step_timeout_ms: u64,
     ) -> Result<Value> {
         let (user_sel, pass_sel) = self.detect_login_fields(session).await?;
         let Some(user_sel) = user_sel else {
@@ -1730,8 +1771,26 @@ impl CdpBackend {
             Some(p) => (false, Some(p)),
             None => {
                 self.press_key("Enter", session).await?;
-                tokio::time::sleep(Duration::from_millis(1200)).await;
-                let (_, p) = self.detect_login_fields(session).await?;
+                // Bounded wait for the password step instead of a fixed 1.2s
+                // sleep: detect the field as soon as it renders, but never
+                // block forever if the flow is broken.
+                let (p, waited_ms) = self
+                    .wait_for_password_field(
+                        session,
+                        Duration::from_millis(password_step_timeout_ms),
+                    )
+                    .await?;
+                if p.is_none() {
+                    return Ok(json!({
+                        "ok": false,
+                        "reason": "password field did not appear after username submit",
+                        "filled": filled,
+                        "multi_step": true,
+                        "timed_out": true,
+                        "waited_ms": waited_ms,
+                        "timeout_ms": password_step_timeout_ms,
+                    }));
+                }
                 (true, p)
             }
         };
@@ -4457,6 +4516,94 @@ async fn secret_type_result_never_echoes_password() {
 
     let trail = serde_json::to_string(&backend.trail()).unwrap();
     assert!(!trail.contains(MARKER), "trail leaked: {trail}");
+
+    backend.reset_browser().await;
+    let _ = std::fs::remove_file(&page);
+}
+
+/// Multi-step login must WAIT (bounded) for the password step, not sleep a
+/// fixed 1.2s: the field is revealed ~900ms after Enter. Regression for the
+/// round-14 blocker.
+#[tokio::test]
+#[ignore = "requires Chrome"]
+#[cfg_attr(windows, ignore = "uses a file:// fixture (unix paths)")]
+async fn fill_login_waits_for_delayed_password_step() {
+    let dir = std::env::temp_dir().join(format!("lb-login-delay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let page = dir.join("delayed-step.html");
+    std::fs::write(
+        &page,
+        "<html><body>\
+         <input id=\"u\" name=\"username\" type=\"text\" placeholder=\"Username\">\
+         <input id=\"p\" name=\"password\" type=\"password\" style=\"display:none\">\
+         <script>document.getElementById('u').addEventListener('keydown', function(e){\
+           if (e.key === 'Enter') setTimeout(function(){document.getElementById('p').style.display='block';}, 900);         });</script>\
+         </body></html>",
+    )
+    .unwrap();
+    let url = format!("file://{}", page.display());
+
+    let backend = CdpBackend::new(lightbrowse_core::config::Config::default());
+    let session = Session::new();
+    backend.navigate(&session, &url).await.expect("navigate");
+
+    let started = Instant::now();
+    let res = backend
+        .fill_login_with_timeout("alice", "hunter2", Some(session.id.as_str()), 5000)
+        .await
+        .expect("fill_login");
+    let elapsed = started.elapsed();
+
+    assert_eq!(res["ok"], true, "login must succeed: {res}");
+    assert_eq!(
+        res["multi_step"], true,
+        "password appeared late → multi-step"
+    );
+    assert!(
+        elapsed >= Duration::from_millis(700),
+        "must have waited for the delayed field, took {elapsed:?}"
+    );
+    assert!(
+        !res.to_string().contains("hunter2"),
+        "password leaked: {res}"
+    );
+
+    backend.reset_browser().await;
+    let _ = std::fs::remove_file(&page);
+}
+
+/// If the password step never appears, fill_login returns a structured timeout
+/// (ok:false, timed_out:true) instead of hanging.
+#[tokio::test]
+#[ignore = "requires Chrome"]
+#[cfg_attr(windows, ignore = "uses a file:// fixture (unix paths)")]
+async fn fill_login_times_out_when_password_step_never_appears() {
+    let dir = std::env::temp_dir().join(format!("lb-login-nostep-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let page = dir.join("no-step.html");
+    std::fs::write(
+        &page,
+        "<html><body><input id=\"u\" name=\"username\" type=\"text\" placeholder=\"Username\"></body></html>",
+    )
+    .unwrap();
+    let url = format!("file://{}", page.display());
+
+    let backend = CdpBackend::new(lightbrowse_core::config::Config::default());
+    let session = Session::new();
+    backend.navigate(&session, &url).await.expect("navigate");
+
+    let res = backend
+        .fill_login_with_timeout("alice", "hunter2", Some(session.id.as_str()), 700)
+        .await
+        .expect("fill_login");
+    assert_eq!(res["ok"], false, "no password step → not ok: {res}");
+    assert_eq!(res["timed_out"], true);
+    assert_eq!(res["multi_step"], true);
+    assert!(
+        res["waited_ms"].as_u64().unwrap_or(0) >= 600,
+        "should have waited the bound: {res}"
+    );
+    assert!(res["filled"].is_array(), "structured partial result: {res}");
 
     backend.reset_browser().await;
     let _ = std::fs::remove_file(&page);
