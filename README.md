@@ -282,10 +282,11 @@ Store website credentials **encrypted at rest** (AES-256-GCM) and let the
 agent use them for logins:
 
 ```bash
-# CLI
-lightbrowse vault set outlook https://outlook.live.com me@corp.com 'P@ssw0rd'
-lightbrowse vault list          # names + urls only — never secrets
-lightbrowse vault get outlook   # full entry (for the agent to fill forms)
+# CLI — pass the password on stdin so it never reaches argv/`ps`/shell history
+printf '%s\n' "$PASS" | lightbrowse vault set outlook https://outlook.live.com me@corp.com --password-stdin
+lightbrowse vault list                   # names + urls only — never secrets
+lightbrowse vault get outlook            # password REDACTED by default
+lightbrowse vault get outlook --reveal   # print the secret (opt-in)
 lightbrowse vault delete outlook
 ```
 
@@ -294,7 +295,9 @@ agent stores credentials you give it, then fetches them when a login form
 appears. **Two safety levels:**
 
 1. `vault/get` returns the entry so the agent can type it (secret passes
-   through the LLM context — inherent to typed logins).
+   through the LLM context — inherent to typed logins). The **CLI** redacts
+   the password by default: `lightbrowse vault get <name>` prints a null
+   password, and `--reveal` is required to print the secret.
 2. **Recommended:** reference the vault from a runbook **server-side** —
    `runbook/run {"variables": {"PASSWORD": "vault:outlook.password"}}`
    resolves the secret inside lightbrowse, so the LLM never sees it.
@@ -304,6 +307,11 @@ Security model:
 - Key: `~/.config/lightbrowse/vault.key` (auto-generated, `0600`) or
   `LIGHTBROWSE_VAULT_KEY` (64 hex chars). Vault file: `vault.enc`, `0600`.
 - `vault/list` and the `help` catalog never expose secrets; secrets are
+  redacted in every tool result unless explicitly requested
+  (`include_values:true` for cookies, `--reveal` for `vault get`).
+- CLI secrets never have to touch argv: `vault set` and `login` read the
+  password from stdin with `--password-stdin` (the positional argument still
+  works for old scripts but emits a `ps`/shell-history warning).
   redacted from logs.
 - Key + secrets are `zeroize`d (wiped from RAM) on drop; tampered vault
   files fail to open (GCM auth tag).
