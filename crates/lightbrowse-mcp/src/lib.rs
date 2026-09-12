@@ -540,8 +540,9 @@ impl McpServer {
                 let m = s.memory.as_ref().ok_or("browsing memory disabled")?;
                 match m.get_runbook(&name).map_err(|e| e.to_string())? {
                     Some((_, url, steps, cnt)) => {
-                        let parsed: Value =
+                        let mut parsed: Value =
                             serde_json::from_str(&steps).map_err(|e| e.to_string())?;
+                        redact_secret_steps(&mut parsed);
                         Ok(pretty(
                             &json!({ "name": name, "url": url, "success_count": cnt, "steps": parsed }),
                         ))
@@ -1582,6 +1583,25 @@ fn tools_schema() -> Vec<Value> {
     tools
 }
 
+/// Defense in depth for `runbook/get`: a step flagged `secret` never returns a
+/// literal, even if an older or imported runbook somehow still carries one.
+fn redact_secret_steps(steps: &mut Value) {
+    let Some(arr) = steps.as_array_mut() else {
+        return;
+    };
+    for step in arr.iter_mut() {
+        let is_secret = step
+            .get("secret")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if is_secret {
+            if let Some(obj) = step.as_object_mut() {
+                obj.insert("text".into(), Value::Null);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1596,5 +1616,18 @@ mod tests {
     fn urlencode() {
         assert_eq!(urlencoding("a b&c"), "a%20b%26c");
         assert_eq!(urlencoding("hello"), "hello");
+    }
+
+    #[test]
+    fn runbook_get_redacts_secret_steps() {
+        let mut steps = serde_json::json!([
+            {"action": "type", "selector": "input.user", "text": "alice", "secret": false},
+            {"action": "type", "selector": "input.pass", "text": "leaked-pw", "secret": true,
+             "secret_ref": "{{PASSWORD}}"}
+        ]);
+        redact_secret_steps(&mut steps);
+        assert_eq!(steps[0]["text"], "alice");
+        assert_eq!(steps[1]["text"], serde_json::Value::Null);
+        assert_eq!(steps[1]["secret_ref"], "{{PASSWORD}}");
     }
 }

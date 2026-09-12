@@ -66,6 +66,13 @@ pub struct TrailStep {
     pub text: Option<String>,
     pub key: Option<String>,
     pub ms: Option<u64>,
+    /// True when `text` carried a secret and was deliberately withheld.
+    #[serde(default)]
+    pub secret: bool,
+    /// Variable template resolved at replay time (e.g. `{{PASSWORD}}`).
+    /// Never contains the secret itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
 }
 
 /// A replayable runbook step.
@@ -78,6 +85,43 @@ pub struct RunbookStep {
     pub text: Option<String>,
     pub key: Option<String>,
     pub ms: Option<u64>,
+    /// See [`TrailStep::secret`].
+    #[serde(default)]
+    pub secret: bool,
+    /// See [`TrailStep::secret_ref`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_ref: Option<String>,
+}
+
+/// Default variable name for a withheld secret when no `secret_ref` is set.
+const DEFAULT_SECRET_VAR: &str = "PASSWORD";
+
+/// Build the trail step for a `type` action. When `secret` is set the literal
+/// `text` is dropped and only a `{{PASSWORD}}` template is kept, so a password
+/// can never be persisted in a runbook or returned by `runbook/get`.
+fn type_trail_step(selector: &str, fallbacks: Vec<String>, text: &str, secret: bool) -> TrailStep {
+    TrailStep {
+        action: "type".into(),
+        selector: Some(selector.to_string()),
+        fallbacks,
+        text: if secret { None } else { Some(text.to_string()) },
+        key: None,
+        ms: None,
+        secret,
+        secret_ref: if secret {
+            Some(format!("{{{{{DEFAULT_SECRET_VAR}}}}}"))
+        } else {
+            None
+        },
+    }
+}
+
+/// Extract the variable name from a secret template like `{{PASSWORD}}`.
+fn secret_var_name(secret_ref: Option<&str>) -> &str {
+    let raw = secret_ref.unwrap_or(DEFAULT_SECRET_VAR).trim();
+    raw.strip_prefix("{{")
+        .and_then(|s| s.strip_suffix("}}"))
+        .unwrap_or(raw)
 }
 
 /// CDP backend with lazy Chromium spawn + idle suspension.
@@ -239,14 +283,14 @@ impl CdpBackend {
         self.inner.lock().await.is_some()
     }
 
-    /// Current RAM usage of the Chromium process tree (MB).
-    pub async fn memory_usage_mb(&self) -> usize {
-        self.inner
-            .lock()
-            .await
-            .as_ref()
-            .map(|b| b.memory_usage_mb())
-            .unwrap_or(0)
+    /// Current RAM usage of the Chromium process tree (MB), or `None` when it
+    /// cannot be measured (attached browser, unsupported platform) — callers
+    /// must treat `None` as unknown, never as 0 MB.
+    pub async fn memory_usage_mb(&self) -> Option<usize> {
+        match self.inner.lock().await.as_ref() {
+            Some(b) => b.memory_usage_mb(),
+            None => None,
+        }
     }
 
     /// Peak Chromium RAM observed (MB).
@@ -340,12 +384,15 @@ impl CdpBackend {
     /// only the kept tab remains.
     async fn enforce_ram_budget(&self, keep: &str) {
         let mut rounds = 0;
-        while self.memory_usage_mb().await > self.config.memory_budget_mb
-            && self.tab_count().await > 1
-            && rounds < 8
-        {
+        loop {
+            let Some(ram) = self.memory_usage_mb().await else {
+                tracing::debug!("cdp: RAM unknown — skipping budget enforcement");
+                break;
+            };
+            if ram <= self.config.memory_budget_mb || self.tab_count().await <= 1 || rounds >= 8 {
+                break;
+            }
             rounds += 1;
-            let ram = self.memory_usage_mb().await;
             match self.evict_lru_tab(Some(keep)).await {
                 Some(victim) => tracing::warn!(
                     "cdp: RAM {ram} MB > budget {} MB — evicted LRU tab (session {victim})",
@@ -530,21 +577,23 @@ impl CdpBackend {
         )
         .await;
         if result.is_ok() {
-            let ram = self.memory_usage_mb().await;
-            if ram > self.config.memory_budget_mb {
-                tracing::warn!(
-                    "cdp: actual Chromium RAM {ram} MB exceeds budget {} MB — evicting idle tabs",
-                    self.config.memory_budget_mb
-                );
-                self.enforce_ram_budget(&session.id).await;
+            if let Some(ram) = self.memory_usage_mb().await {
+                if ram > self.config.memory_budget_mb {
+                    tracing::warn!(
+                        "cdp: actual Chromium RAM {ram} MB exceeds budget {} MB — evicting idle tabs",
+                        self.config.memory_budget_mb
+                    );
+                    self.enforce_ram_budget(&session.id).await;
+                }
             }
         }
         let (html, title, final_url) = result?;
         self.navigations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let ram = self.memory_usage_mb().await;
-        self.peak_ram
-            .fetch_max(ram as u64, std::sync::atomic::Ordering::Relaxed);
+        if let Some(ram) = self.memory_usage_mb().await {
+            self.peak_ram
+                .fetch_max(ram as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         self.touch();
         self.touch_tab(&session.id).await;
         Ok(Page {
@@ -1058,6 +1107,8 @@ impl CdpBackend {
             text: None,
             key: None,
             ms: None,
+            secret: false,
+            secret_ref: None,
         });
         Ok(json!({ "ok": true, "tag": tag, "x": x.round() as u64, "y": y.round() as u64 }))
     }
@@ -1144,6 +1195,29 @@ impl CdpBackend {
         text: &str,
         session: Option<&str>,
     ) -> Result<Value> {
+        self.type_text_impl(selector, text, None, session).await
+    }
+
+    /// Type a value that is known to be sensitive (e.g. a password). The
+    /// session trail records only a redacted marker — never the literal text —
+    /// so the secret cannot leak into a saved runbook.
+    pub async fn type_text_secret(
+        &self,
+        selector: &str,
+        text: &str,
+        session: Option<&str>,
+    ) -> Result<Value> {
+        self.type_text_impl(selector, text, Some(true), session)
+            .await
+    }
+
+    async fn type_text_impl(
+        &self,
+        selector: &str,
+        text: &str,
+        secret: Option<bool>,
+        session: Option<&str>,
+    ) -> Result<Value> {
         // Focus the field first with a real click.
         let clicked = self.click(selector, session).await?;
         if clicked.get("ok").and_then(|v| v.as_bool()) != Some(true) {
@@ -1167,15 +1241,24 @@ impl CdpBackend {
             ),
         )
         .await?;
+        // Classify the value as secret: an explicit caller hint, or a password
+        // input (so a manual `type` into a password field is redacted too).
+        let is_secret = match secret {
+            Some(s) => s,
+            None => eval_across_frames_value(
+                active.port,
+                &active.ws_url,
+                &format!(
+                    "(() => {{ const el = document.querySelector({sel}); return el ? (el.type || '').toLowerCase() === 'password' : false; }})()"
+                ),
+            )
+            .await
+            .ok()
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        };
         let fallbacks = self.collect_fallbacks(selector, session).await;
-        self.record_step(TrailStep {
-            action: "type".into(),
-            selector: Some(selector.to_string()),
-            fallbacks,
-            text: Some(text.to_string()),
-            key: None,
-            ms: None,
-        });
+        self.record_step(type_trail_step(selector, fallbacks, text, is_secret));
         Ok(json!({ "ok": true, "value": value }))
     }
 
@@ -1219,6 +1302,8 @@ impl CdpBackend {
             text: None,
             key: Some(key.to_string()),
             ms: None,
+            secret: false,
+            secret_ref: None,
         });
         Ok(json!({ "ok": true, "key": key }))
     }
@@ -1333,7 +1418,7 @@ impl CdpBackend {
         };
 
         // ── Step 3: fill the password and submit.
-        let p = self.type_text(&pass_sel, password, session).await?;
+        let p = self.type_text_secret(&pass_sel, password, session).await?;
         filled.push(json!({ "field": "password", "selector": pass_sel, "ok": p.get("ok") }));
         if p.get("ok").and_then(|v| v.as_bool()) != Some(true) {
             return Ok(json!({
@@ -2044,29 +2129,76 @@ impl CdpBrowser {
         }
     }
 
-    fn memory_usage_mb(&self) -> usize {
-        let Some(pid) = self.child.as_ref().map(|c| c.id()) else {
-            return 0; // attached: external process RAM is not ours to measure
-        };
-        let children = std::process::Command::new("ps")
-            .args(["--ppid", &pid.to_string(), "-o", "rss="])
+    /// RAM of the whole Chromium process tree (MB). `None` when the platform
+    /// cannot measure it — never a misleading 0.
+    fn memory_usage_mb(&self) -> Option<usize> {
+        // Attached: the external browser's memory is not ours to measure.
+        let pid = self.child.as_ref().map(|c| c.id())?;
+        process_tree_rss_kb(pid).map(|kb| kb / 1024)
+    }
+}
+
+/// Parse `ps -eo pid=,ppid=,rss=` output into `(pid, ppid, rss_kb)` rows.
+/// Works on Linux and macOS (BSD `ps` rejects the GNU-only `--ppid`, which
+/// previously made macOS report Chromium's children as 0 MB).
+#[cfg(any(unix, test))]
+fn parse_ps_tree(text: &str) -> Vec<(u32, u32, usize)> {
+    text.lines()
+        .filter_map(|l| {
+            let mut f = l.split_whitespace();
+            let pid = f.next()?.parse::<u32>().ok()?;
+            let ppid = f.next()?.parse::<u32>().ok()?;
+            let rss = f.next()?.parse::<usize>().ok()?;
+            Some((pid, ppid, rss))
+        })
+        .collect()
+}
+
+/// Sum RSS (KB) of `root` plus every descendant. `None` when the root is
+/// absent from the snapshot (inspection failed) — unknown, not zero.
+#[cfg(any(unix, test))]
+fn sum_tree_rss(root: u32, rows: &[(u32, u32, usize)]) -> Option<usize> {
+    if !rows.iter().any(|(pid, _, _)| *pid == root) {
+        return None;
+    }
+    let mut children: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
+    let mut rss_of: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for (pid, ppid, rss) in rows {
+        children.entry(*ppid).or_default().push(*pid);
+        rss_of.insert(*pid, *rss);
+    }
+    let mut total = 0usize;
+    let mut stack = vec![root];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        total += rss_of.get(&pid).copied().unwrap_or(0);
+        if let Some(kids) = children.get(&pid) {
+            stack.extend(kids.iter().copied());
+        }
+    }
+    Some(total)
+}
+
+/// Total RSS (KB) of a process and its descendants via one `ps -eo` call.
+/// `None` where no supported measurement exists (e.g. Windows) — callers must
+/// surface that as unknown rather than 0 MB.
+fn process_tree_rss_kb(pid: u32) -> Option<usize> {
+    #[cfg(unix)]
+    {
+        let out = std::process::Command::new("ps")
+            .args(["-eo", "pid=,ppid=,rss="])
             .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| {
-                s.lines()
-                    .filter_map(|l| l.trim().parse::<usize>().ok())
-                    .sum()
-            })
-            .unwrap_or(0);
-        let main = std::process::Command::new("ps")
-            .args(["-o", "rss=", "-p", &pid.to_string()])
-            .output()
-            .ok()
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .unwrap_or(0);
-        (main + children) / 1024
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        sum_tree_rss(pid, &parse_ps_tree(&text))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
     }
 }
 
@@ -2984,10 +3116,35 @@ enum ProfileProcKind {
     Orphan,
 }
 
-/// Classify a profile-holding process from its parent's command line.
-/// Matching is case-insensitive because macOS reports the binary as
-/// `Google Chrome` (capital C), while Linux uses lowercase `chrome`.
-fn classify_profile_proc(parent_cmd: Option<&str>) -> ProfileProcKind {
+/// True when `cmd` carries `--user-data-dir=<needle>` as an exact argument
+/// (boundary-checked), so a profile path that is merely a prefix of a longer
+/// one (`/tmp/p` vs `/tmp/profile`) can never match.
+fn holds_profile(cmd: &str, needle: &str) -> bool {
+    let want = format!("--user-data-dir={needle}");
+    let bytes = cmd.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = cmd[from..].find(&want) {
+        let start = from + rel;
+        let end = start + want.len();
+        let before_ok = start == 0 || bytes[start - 1] == b' ';
+        let after_ok = end == bytes.len() || bytes[end] == b' ';
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Classify a profile-holding process from its parent. A process parented to
+/// *this* server is the authoritative live owner (robust even if the binary was
+/// renamed or wrapped); otherwise fall back to the parent's command line,
+/// matched case-insensitively because macOS reports `Google Chrome` (capital C)
+/// while Linux uses lowercase `chrome`.
+fn classify_profile_proc(ppid: u32, parent_cmd: Option<&str>) -> ProfileProcKind {
+    if ppid == std::process::id() {
+        return ProfileProcKind::LiveOwner;
+    }
     let parent = parent_cmd.unwrap_or("").to_ascii_lowercase();
     if parent.contains("lightbrowse") {
         ProfileProcKind::LiveOwner
@@ -3037,10 +3194,16 @@ fn clean_stale_profile_locks(user_data: &std::path::Path) {
 
     // Snapshot (pid, ppid, command) for every live process.
     let mut all: Vec<(u32, u32, String)> = Vec::new();
+    // Whether we could actually enumerate processes on this platform. Lock
+    // removal requires a successful scan — "unsupported" or "inspection
+    // failed" must never be treated as "no live owner" (which would delete
+    // locks a running browser still holds, e.g. on Windows).
+    let mut scanned = false;
 
     #[cfg(target_os = "linux")]
     {
         if let Ok(rd) = std::fs::read_dir("/proc") {
+            scanned = true;
             for e in rd.flatten() {
                 let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else {
                     continue;
@@ -3069,6 +3232,7 @@ fn clean_stale_profile_locks(user_data: &std::path::Path) {
             .args(["-axo", "pid=,ppid=,command="])
             .output()
         {
+            scanned = true;
             for line in String::from_utf8_lossy(&out.stdout).lines() {
                 if let Some((pid, ppid, cmd)) = parse_ps_line(line) {
                     all.push((pid, ppid, cmd));
@@ -3084,13 +3248,13 @@ fn clean_stale_profile_locks(user_data: &std::path::Path) {
     let mut found = 0usize;
     let mut killed = 0usize;
     for (pid, ppid, cmd) in &all {
-        if !cmd.contains(&format!("--user-data-dir={needle}")) {
+        if !holds_profile(cmd, &needle) {
             continue;
         }
         // Decide ownership: the browser MAIN process is directly parented to
         // the lightbrowse server; its children (renderers, zygotes — same
         // cmdline profile) are parented to another browser process.
-        match classify_profile_proc(by_pid.get(ppid).copied()) {
+        match classify_profile_proc(*ppid, by_pid.get(ppid).copied()) {
             ProfileProcKind::LiveOwner => live_owner = true,
             ProfileProcKind::BrowserChild => found += 1,
             ProfileProcKind::Orphan => {
@@ -3109,7 +3273,7 @@ fn clean_stale_profile_locks(user_data: &std::path::Path) {
     tracing::debug!(
         "cdp: profile-lock scan for {needle}: {found} chrome procs, {killed} orphaned killed, live_owner={live_owner}"
     );
-    if !live_owner {
+    if scanned && !live_owner {
         for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
             let p = user_data.join(name);
             if p.exists() {
@@ -3435,7 +3599,29 @@ pub async fn run_runbook(
                 }
             }
             "type" => {
-                let text = fill_vars(step.text.as_deref().unwrap_or(""), vars);
+                // Secret steps get their value from a variable (e.g. PASSWORD
+                // bound to `vault:<name>.password`) — the literal is never
+                // stored in the runbook, only a `{{PASSWORD}}` template.
+                let text = if step.secret {
+                    let var = secret_var_name(step.secret_ref.as_deref());
+                    match vars.get(var) {
+                        Some(v) => v.clone(),
+                        None => {
+                            ok_all = false;
+                            outcomes.push(StepOutcome {
+                                step: i,
+                                action: "type".into(),
+                                ok: false,
+                                detail: format!(
+                                    "secret value missing — pass variable {var} (e.g. vault:<name>.password)"
+                                ),
+                            });
+                            continue;
+                        }
+                    }
+                } else {
+                    fill_vars(step.text.as_deref().unwrap_or(""), vars)
+                };
                 let mut detail = String::new();
                 let mut done = false;
                 for sel in &candidates {
@@ -3586,28 +3772,116 @@ mod tests {
         // Noise is rejected rather than mis-parsed.
         assert_eq!(parse_ps_line("   "), None);
         assert_eq!(parse_ps_line("not-a-pid 1 cmd"), None);
+    }
 
-        // Ownership classification drives kill-vs-keep decisions.
+    #[test]
+    fn profile_match_requires_exact_argument() {
+        // Exact match, alone and followed by other flags.
+        assert!(holds_profile(
+            "/x/chrome --user-data-dir=/tmp/p --headless=new",
+            "/tmp/p"
+        ));
+        assert!(holds_profile("chrome --user-data-dir=/tmp/p", "/tmp/p"));
+        // A longer profile path sharing our prefix must NOT match, otherwise a
+        // user's own Chrome could be reaped as an "orphan".
+        assert!(!holds_profile(
+            "chrome --user-data-dir=/tmp/profile",
+            "/tmp/p"
+        ));
+        assert!(!holds_profile(
+            "chrome --user-data-dir=/tmp/p-old",
+            "/tmp/p"
+        ));
+        // Paths containing spaces still match on the flag boundary.
+        assert!(holds_profile(
+            "chrome --user-data-dir=/tmp/my profile next",
+            "/tmp/my profile"
+        ));
+        assert!(!holds_profile("chrome --no-profile", "/tmp/p"));
+    }
+
+    #[test]
+    fn classifies_owner_and_browser_parents() {
+        let not_us = 4_000_000u32; // above any realistic live PID
         assert_eq!(
-            classify_profile_proc(Some("/usr/local/bin/lightbrowse serve")),
+            classify_profile_proc(std::process::id(), None),
+            ProfileProcKind::LiveOwner
+        );
+        assert_eq!(
+            classify_profile_proc(not_us, Some("/usr/local/bin/lightbrowse serve")),
             ProfileProcKind::LiveOwner
         );
         // macOS reports the binary as `Google Chrome` (capital C).
         assert_eq!(
-            classify_profile_proc(Some(
-                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-            )),
+            classify_profile_proc(
+                not_us,
+                Some("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+            ),
             ProfileProcKind::BrowserChild
         );
         assert_eq!(
-            classify_profile_proc(Some("/usr/lib/chromium/chromium")),
+            classify_profile_proc(not_us, Some("/usr/lib/chromium/chromium")),
             ProfileProcKind::BrowserChild
         );
         assert_eq!(
-            classify_profile_proc(Some("/sbin/launchd")),
+            classify_profile_proc(not_us, Some("/sbin/launchd")),
             ProfileProcKind::Orphan
         );
-        assert_eq!(classify_profile_proc(None), ProfileProcKind::Orphan);
+        assert_eq!(classify_profile_proc(not_us, None), ProfileProcKind::Orphan);
+    }
+
+    /// Trails must never carry a secret literal, and the marker must survive
+    /// the trail→runbook round trip (this is exactly what `runbook/save`
+    /// persists and `runbook/get` returns).
+    #[test]
+    fn secret_type_step_never_persists_literal_text() {
+        let step = type_trail_step(
+            "#pass",
+            vec!["input[name=password]".into()],
+            "s3cret-pw",
+            true,
+        );
+        assert!(step.secret);
+        assert_eq!(step.text, None);
+        assert_eq!(step.secret_ref.as_deref(), Some("{{PASSWORD}}"));
+        let json = serde_json::to_string(&step).unwrap();
+        assert!(
+            !json.contains("s3cret-pw"),
+            "trail JSON leaked the secret: {json}"
+        );
+
+        let back: RunbookStep = serde_json::from_str(&json).unwrap();
+        assert!(back.secret);
+        assert_eq!(back.text, None);
+        assert_eq!(secret_var_name(back.secret_ref.as_deref()), "PASSWORD");
+
+        // Non-secret values are still recorded verbatim.
+        let plain = type_trail_step("#user", vec![], "alice", false);
+        assert!(!plain.secret);
+        assert_eq!(plain.text.as_deref(), Some("alice"));
+        assert!(plain.secret_ref.is_none());
+
+        // Legacy runbook steps (written before `secret` existed) default to
+        // non-secret and still parse.
+        let legacy: RunbookStep =
+            serde_json::from_str(r#"{"action":"type","selector":"input.user","text":"alice"}"#)
+                .unwrap();
+        assert!(!legacy.secret);
+        assert_eq!(legacy.text.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn sums_process_tree_rss() {
+        // `ps -eo pid=,ppid=,rss=` (KB): root 100 with two children + a grandchild.
+        let rows = parse_ps_tree(
+            "  100    1  1000\n  200  100  2000\n  300  100   500\n  400  200   300\n",
+        );
+        assert_eq!(rows.len(), 4);
+        assert_eq!(sum_tree_rss(100, &rows), Some(1000 + 2000 + 500 + 300));
+        assert_eq!(sum_tree_rss(200, &rows), Some(2000 + 300));
+        // Missing root → unknown, not a misleading zero.
+        assert_eq!(sum_tree_rss(999, &rows), None);
+        assert_eq!(parse_ps_tree("garbage\n\n").len(), 0);
     }
 }
 

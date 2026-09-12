@@ -102,10 +102,10 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
             .and_then(|b| b.downcast_ref::<lightbrowse_cdp::CdpBackend>());
         match cdp {
             Some(c) => (c.is_running().await, c.memory_usage_mb().await),
-            None => (false, 0),
+            None => (false, None),
         }
     } else {
-        (false, 0)
+        (false, None)
     };
     // Own process RSS (the featherweight engine's real footprint).
     let self_ram_mb = std::fs::read_to_string("/proc/self/status")

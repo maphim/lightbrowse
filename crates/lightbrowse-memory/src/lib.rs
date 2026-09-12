@@ -119,6 +119,26 @@ impl MemoryStore {
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| Error::Parse(format!("memory schema: {e}")))?;
+        // ONE-TIME migration (gated by PRAGMA user_version): `login-*`
+        // runbooks auto-saved before secret redaction existed may hold a
+        // plaintext password in the (unencrypted) steps JSON. They are
+        // regenerated on the next successful login. This must NOT run on every
+        // open — otherwise freshly saved (already redacted) login runbooks
+        // would be wiped before they could ever replay.
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap_or(0);
+        if version < 1 {
+            let removed = conn
+                .execute("DELETE FROM runbooks WHERE name LIKE 'login-%'", [])
+                .unwrap_or(0);
+            if removed > 0 {
+                tracing::warn!(
+                    "memory: removed {removed} legacy login-* runbook(s) that may have stored plaintext secrets"
+                );
+            }
+            let _ = conn.execute_batch("PRAGMA user_version = 1");
+        }
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -416,6 +436,22 @@ impl MemoryStore {
         Ok(())
     }
 
+    /// Delete one runbook by name. Returns the number of rows removed.
+    pub fn delete_runbook(&self, name: &str) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM runbooks WHERE name = ?1", params![name])
+            .map_err(|e| Error::Parse(e.to_string()))
+    }
+
+    /// Remove auto-generated `login-*` runbooks, which may predate secret
+    /// redaction and thus contain a plaintext password. They are recreated on
+    /// the next successful login. Returns the number of rows removed.
+    pub fn scrub_legacy_login_runbooks(&self) -> Result<usize> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM runbooks WHERE name LIKE 'login-%'", [])
+            .map_err(|e| Error::Parse(e.to_string()))
+    }
+
     /// Count stored pages (for stats/health).
     pub fn page_count(&self) -> Result<i64> {
         let conn = self.conn.lock().unwrap();
@@ -544,6 +580,68 @@ mod tests {
         assert!(steps.contains("press"));
         assert_eq!(cnt, 1);
         assert_eq!(m.list_runbooks().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scrub_removes_legacy_login_runbooks_only() {
+        let m = MemoryStore::open(None).unwrap();
+        m.save_runbook(
+            "login-outlook",
+            "https://o.test/login",
+            r#"[{"action":"type","text":"plaintext-pw"}]"#,
+        )
+        .unwrap();
+        m.save_runbook("checkout", "https://s.test", r#"[{"action":"click"}]"#)
+            .unwrap();
+        assert_eq!(m.scrub_legacy_login_runbooks().unwrap(), 1);
+        assert!(m.get_runbook("login-outlook").unwrap().is_none());
+        assert!(m.get_runbook("checkout").unwrap().is_some());
+        assert_eq!(m.delete_runbook("checkout").unwrap(), 1);
+        assert!(m.get_runbook("checkout").unwrap().is_none());
+    }
+
+    #[test]
+    fn open_scrubs_legacy_login_runbooks() {
+        let path =
+            std::env::temp_dir().join(format!("lb-scrub-{}-{}.db", std::process::id(), now_secs()));
+        let p = path.to_str().unwrap();
+        let _ = std::fs::remove_file(&path);
+        // Simulate a PRE-migration DB: schema present, user_version = 0, and a
+        // secret-bearing login runbook already stored.
+        {
+            let raw = rusqlite::Connection::open(p).unwrap();
+            raw.execute_batch(SCHEMA).unwrap();
+            raw.execute(
+                "INSERT INTO runbooks (name, url, steps, created_at, last_used_at) VALUES (?1, ?2, ?3, 0, 0)",
+                rusqlite::params!["login-legacy", "https://o.test", r#"[{"action":"type","text":"plaintext-pw"}]"#],
+            )
+            .unwrap();
+            let v: i64 = raw
+                .query_row("PRAGMA user_version", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(v, 0, "simulated legacy DB must be pre-migration");
+        }
+        // First open runs the one-time migration and scrubs it.
+        let m = MemoryStore::open(Some(p)).unwrap();
+        assert!(
+            m.get_runbook("login-legacy").unwrap().is_none(),
+            "open() must scrub legacy login-* runbooks"
+        );
+        // A redacted runbook saved now must survive later opens (migration is
+        // one-time, otherwise auto-saved login runbooks could never replay).
+        m.save_runbook(
+            "login-fresh",
+            "https://o.test",
+            r#"[{"action":"type","secret":true,"text":null,"secret_ref":"{{PASSWORD}}"}]"#,
+        )
+        .unwrap();
+        drop(m);
+        let after = MemoryStore::open(Some(p)).unwrap();
+        assert!(
+            after.get_runbook("login-fresh").unwrap().is_some(),
+            "one-time migration must not wipe redacted runbooks on later opens"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
