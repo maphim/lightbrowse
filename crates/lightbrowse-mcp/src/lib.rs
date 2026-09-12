@@ -263,28 +263,34 @@ impl McpServer {
             }
             "cookies" => {
                 let cdp = require_cdp(&s)?;
-                let v = cdp.cookies(None).await.map_err(|e| e.to_string())?;
+                let session = require_session(cdp, args).await?;
+                // A cookie value is a session secret: redact by default and
+                // reveal it only when the caller explicitly opts in.
+                let include_values = args
+                    .get("include_values")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let v = cdp
+                    .cookies(session.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let arr = v.as_array().cloned().unwrap_or_default();
+                let cookies: Vec<Value> =
+                    arr.iter().map(|c| cookie_view(c, include_values)).collect();
                 Ok(pretty(&json!({
-                    "count": arr.len(),
-                    "cookies": arr.iter().map(|c| json!({
-                        "name": c.get("name"),
-                        "value": c.get("value"),
-                        "domain": c.get("domain"),
-                        "path": c.get("path"),
-                        "httpOnly": c.get("httpOnly"),
-                        "secure": c.get("secure"),
-                        "sameSite": c.get("sameSite"),
-                        "expires": c.get("expires")
-                    })).collect::<Vec<_>>()
+                    "count": cookies.len(),
+                    "include_values": include_values,
+                    "session": session,
+                    "cookies": cookies
                 })))
             }
             "download" => {
                 let cdp = require_cdp(&s)?;
+                let session = require_session(cdp, args).await?;
                 let url = req_str(args, "url")?;
                 let filename = opt_str(args, "filename");
                 let v = cdp
-                    .download(&url, filename.as_deref(), None)
+                    .download(&url, filename.as_deref(), session.as_deref())
                     .await
                     .map_err(|e| e.to_string())?;
                 Ok(pretty(&v))
@@ -300,16 +306,24 @@ impl McpServer {
                 let cdp = require_cdp(&s)?;
                 let action = args.get("action").and_then(|a| a.as_str()).unwrap_or("log");
                 match action {
-                    "start" => Ok(pretty(
-                        &cdp.network_capture(true, None)
-                            .await
-                            .map_err(|e| e.to_string())?,
-                    )),
-                    "stop" => Ok(pretty(
-                        &cdp.network_capture(false, None)
-                            .await
-                            .map_err(|e| e.to_string())?,
-                    )),
+                    // start/stop attach capture to a specific tab, so they
+                    // follow the same >1-tab rule as cookies/download.
+                    "start" => {
+                        let session = require_session(cdp, args).await?;
+                        Ok(pretty(
+                            &cdp.network_capture(true, session.as_deref())
+                                .await
+                                .map_err(|e| e.to_string())?,
+                        ))
+                    }
+                    "stop" => {
+                        let session = require_session(cdp, args).await?;
+                        Ok(pretty(
+                            &cdp.network_capture(false, session.as_deref())
+                                .await
+                                .map_err(|e| e.to_string())?,
+                        ))
+                    }
                     "flush" => {
                         cdp.network_log_clear();
                         Ok(pretty(&json!({ "cleared": true })))
@@ -1063,6 +1077,47 @@ fn opt_str(args: &Map<String, Value>, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Resolve the session for a stateful, tab-scoped tool. With more than one tab
+/// open an explicit session is REQUIRED, so a call can never silently act on
+/// the most-recently-used tab (e.g. leaking another tab's cookies).
+fn resolve_session(explicit: Option<String>, tab_count: usize) -> Result<Option<String>, String> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    if tab_count > 1 {
+        return Err(format!(
+            "{tab_count} tabs are open — pass an explicit \"session\" (see tabs/list) so this call cannot act on the wrong tab"
+        ));
+    }
+    Ok(None)
+}
+
+async fn require_session(
+    cdp: &lightbrowse_cdp::CdpBackend,
+    args: &Map<String, Value>,
+) -> Result<Option<String>, String> {
+    resolve_session(opt_str(args, "session"), cdp.tab_count().await)
+}
+
+/// A cookie view for tool output. Cookie values are session secrets and are
+/// `null` unless the caller explicitly opts in with `include_values: true`.
+fn cookie_view(c: &Value, include_values: bool) -> Value {
+    json!({
+        "name": c.get("name"),
+        "value": if include_values {
+            c.get("value").cloned().unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        },
+        "domain": c.get("domain"),
+        "path": c.get("path"),
+        "httpOnly": c.get("httpOnly"),
+        "secure": c.get("secure"),
+        "sameSite": c.get("sameSite"),
+        "expires": c.get("expires")
+    })
+}
+
 fn parse_mode(m: &str) -> Result<ExtractMode, String> {
     match m {
         "text" => Ok(ExtractMode::Text),
@@ -1439,8 +1494,14 @@ fn tools_schema() -> Vec<Value> {
         }),
         json!({
             "name": "cookies",
-            "description": "All cookies visible to the browser session (including httpOnly and SameSite) via CDP Network.getAllCookies on the active tab. Export a session to replay it with curl or another tool. Requires a live engine=cdp tab.",
-            "inputSchema": { "type": "object", "properties": {} }
+            "description": "Cookies visible to the browser session (including httpOnly and SameSite) via CDP Network.getAllCookies on the active tab. Values are REDACTED (null) by default — pass include_values:true only when the secrets are actually needed. When more than one tab is open, 'session' is required. Requires a live engine=cdp tab.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "session": { "type": "string", "description": "Tab session id from tabs/list (required when >1 tab is open)" },
+                    "include_values": { "type": "boolean", "default": false, "description": "Reveal cookie values (secrets). Default false." }
+                }
+            }
         }),
         json!({
             "name": "download",
@@ -1449,7 +1510,8 @@ fn tools_schema() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "url": { "type": "string", "description": "Absolute http(s) URL of the file to download" },
-                    "filename": { "type": "string", "description": "Optional output filename" }
+                    "filename": { "type": "string", "description": "Optional output filename" },
+                    "session": { "type": "string", "description": "Tab session id from tabs/list (required when >1 tab is open)" }
                 },
                 "required": ["url"]
             }
@@ -1468,7 +1530,8 @@ fn tools_schema() -> Vec<Value> {
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "action": { "type": "string", "enum": ["start", "stop", "flush", "log"], "description": "start | stop | flush | log (default log)" }
+                    "action": { "type": "string", "enum": ["start", "stop", "flush", "log"], "description": "start | stop | flush | log (default log)" },
+                    "session": { "type": "string", "description": "Tab session id from tabs/list (required for start/stop when >1 tab is open)" }
                 }
             }
         }),
@@ -1629,5 +1692,35 @@ mod tests {
         assert_eq!(steps[0]["text"], "alice");
         assert_eq!(steps[1]["text"], serde_json::Value::Null);
         assert_eq!(steps[1]["secret_ref"], "{{PASSWORD}}");
+    }
+
+    #[test]
+    fn session_required_with_multiple_tabs() {
+        // 0/1 tab → the implicit active tab is unambiguous.
+        assert_eq!(resolve_session(None, 0).unwrap(), None);
+        assert_eq!(resolve_session(None, 1).unwrap(), None);
+        // >1 tab → an explicit session is required.
+        let err = resolve_session(None, 3).unwrap_err();
+        assert!(err.contains("3 tabs"), "{err}");
+        assert!(err.contains("session"), "{err}");
+        // An explicit session always wins.
+        assert_eq!(
+            resolve_session(Some("t2".into()), 5).unwrap().as_deref(),
+            Some("t2")
+        );
+    }
+
+    #[test]
+    fn cookie_values_are_redacted_by_default() {
+        let c = serde_json::json!({
+            "name": "SESSIONID", "value": "super-secret", "domain": "x.test",
+            "path": "/", "httpOnly": true, "secure": true, "sameSite": "Lax", "expires": 123.0
+        });
+        let redacted = cookie_view(&c, false);
+        assert_eq!(redacted["name"], "SESSIONID");
+        assert_eq!(redacted["value"], Value::Null);
+        assert!(!redacted.to_string().contains("super-secret"));
+        let revealed = cookie_view(&c, true);
+        assert_eq!(revealed["value"], "super-secret");
     }
 }

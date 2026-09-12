@@ -383,7 +383,11 @@ curl 'localhost:8787/v1/current?session=bob'
 ```
 
 MCP: mỗi process là một session riêng; tools `click/type/submit/press/…`
-nhận thêm `session` (optional) để nhắm đúng tab.
+nhận thêm `session` (optional) để nhắm đúng tab. `cookies`, `download` và
+`network/capture` (start/stop) cũng nhận `session`; khi có **nhiều hơn 1 tab**
+thì `session` là **bắt buộc**, để một lệnh không thể vô tình tác động lên tab
+đang active. `cookies` mặc định **che giá trị** (`value = null`) — chỉ trả về
+secret khi truyền `include_values: true`.
 
 ## Resource manager
 
