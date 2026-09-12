@@ -1223,23 +1223,27 @@ impl CdpBackend {
         Ok(json!({ "ok": true, "key": key }))
     }
 
-    /// One-call login: detect username + password fields on the CURRENT page
-    /// (direct JS pass — depth-independent, unlike the snapshot tree), fill
-    /// both, and submit (Enter on the password field). Returns what was
-    /// filled and where.
-    pub async fn fill_login(
+    /// Detect the visible, enabled, non-readonly username/password fields on
+    /// the current page (direct JS pass — depth-independent, unlike the
+    /// snapshot tree). Returns `(username, password)` selectors; `None` means
+    /// the field is absent from view.
+    async fn detect_login_fields(
         &self,
-        username: &str,
-        password: &str,
         session: Option<&str>,
-    ) -> Result<Value> {
+    ) -> Result<(Option<String>, Option<String>)> {
         let expr = r#"(() => {
   const inputs = Array.from(document.querySelectorAll('input'));
+  const visible = (el) => {
+    if (!el || el.getClientRects().length === 0) return false;
+    const s = getComputedStyle(el);
+    return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+  };
   const editable = (i) => {
+    if (!visible(i) || i.disabled || i.readOnly) return false;
     const t = (i.type || 'text').toLowerCase();
     return !['hidden','checkbox','radio','submit','button','image','reset','file'].includes(t);
   };
-  const pass = inputs.find(i => (i.type || '').toLowerCase() === 'password');
+  const pass = inputs.find(i => editable(i) && (i.type || '').toLowerCase() === 'password');
   const hint = (i) => (i.name || '') + ' ' + (i.placeholder || '') + ' ' + (i.id || '');
   const user = inputs.find(i => editable(i) && i !== pass
       && /(user|login|email|mail|account|username|t\u00ean|t\u00e0i kho\u1ea3n|\u0111\u0103ng nh\u1eadp)/i.test(hint(i)))
@@ -1264,42 +1268,87 @@ impl CdpBackend {
         let raw = v.as_str().unwrap_or("{}");
         let parsed: Value = serde_json::from_str(raw)
             .map_err(|e| Error::Parse(format!("fill_login detect parse: {e}")))?;
-        let pass_sel = parsed
-            .get("pass")
-            .and_then(|s| s.as_str())
-            .map(|s| s.to_string());
         let user_sel = parsed
             .get("user")
             .and_then(|s| s.as_str())
             .map(|s| s.to_string());
+        let pass_sel = parsed
+            .get("pass")
+            .and_then(|s| s.as_str())
+            .map(|s| s.to_string());
+        Ok((user_sel, pass_sel))
+    }
 
-        let Some(pass_sel) = pass_sel else {
-            return Ok(
-                json!({ "ok": false, "reason": "no password field found (input[type=password])" }),
-            );
-        };
+    /// One-call login: detect the visible username + password fields on the
+    /// CURRENT page, fill them and submit. Single-step when both fields are
+    /// visible; otherwise submit the username first and wait for the password
+    /// step to render (Google/Slack style two-step login). Returns what was
+    /// filled, how many steps were needed, and where.
+    pub async fn fill_login(
+        &self,
+        username: &str,
+        password: &str,
+        session: Option<&str>,
+    ) -> Result<Value> {
+        let (user_sel, pass_sel) = self.detect_login_fields(session).await?;
         let Some(user_sel) = user_sel else {
-            return Ok(json!({ "ok": false, "reason": "no username field found" }));
+            return Ok(json!({
+                "ok": false,
+                "reason": "no visible username field found",
+                "multi_step": false,
+            }));
         };
 
+        // ── Step 1: fill the username.
         let mut filled = Vec::new();
         let u = self.type_text(&user_sel, username, session).await?;
         filled.push(json!({ "field": "username", "selector": user_sel, "ok": u.get("ok") }));
         if u.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            return Ok(json!({ "ok": false, "reason": "username fill failed", "filled": filled }));
+            return Ok(json!({
+                "ok": false,
+                "reason": "username fill failed",
+                "filled": filled,
+                "multi_step": false,
+            }));
         }
+
+        // ── Step 2: password on the same page, or submit the username and
+        // wait for the password step to appear (multi-step login flow).
+        let (multi_step, pass_sel) = match pass_sel {
+            Some(p) => (false, Some(p)),
+            None => {
+                self.press_key("Enter", session).await?;
+                tokio::time::sleep(Duration::from_millis(1200)).await;
+                let (_, p) = self.detect_login_fields(session).await?;
+                (true, p)
+            }
+        };
+        let Some(pass_sel) = pass_sel else {
+            return Ok(json!({
+                "ok": false,
+                "reason": "password field did not appear after username submit",
+                "filled": filled,
+                "multi_step": multi_step,
+            }));
+        };
+
+        // ── Step 3: fill the password and submit.
         let p = self.type_text(&pass_sel, password, session).await?;
         filled.push(json!({ "field": "password", "selector": pass_sel, "ok": p.get("ok") }));
         if p.get("ok").and_then(|v| v.as_bool()) != Some(true) {
-            return Ok(json!({ "ok": false, "reason": "password fill failed", "filled": filled }));
+            return Ok(json!({
+                "ok": false,
+                "reason": "password fill failed",
+                "filled": filled,
+                "multi_step": multi_step,
+            }));
         }
-
-        // Submit: Enter on the (focused) password field.
         let submitted = self.press_key("Enter", session).await?;
         Ok(json!({
             "ok": true,
             "filled": filled,
             "submitted": submitted,
+            "multi_step": multi_step,
             "note": "credentials are handled by the caller; consider vault:<name>.field to keep secrets out of context",
         }))
     }
@@ -2018,6 +2067,27 @@ impl CdpBrowser {
             .and_then(|s| s.trim().parse::<usize>().ok())
             .unwrap_or(0);
         (main + children) / 1024
+    }
+}
+
+/// Last-resort orphan prevention. `close_gracefully` (which flushes cookies)
+/// is the normal path; this only fires when a `CdpBrowser` is dropped on an
+/// early return or panic. Attached browsers are never touched — they belong
+/// to the user.
+impl Drop for CdpBrowser {
+    fn drop(&mut self) {
+        if self.attached {
+            return;
+        }
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        if child.try_wait().ok().flatten().is_some() {
+            return; // already exited
+        }
+        tracing::warn!("cdp: CdpBrowser dropped without close — killing Chromium child");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -2906,76 +2976,103 @@ async fn rpc_expect(ws: &mut CdpWs, method: &str, params: Value) -> Result<Value
 /// their stale profile locks, so a fresh spawn never hangs on a
 /// SingletonLock left by a hard-killed previous server.
 ///
-/// Unix-only via /proc. A Chrome whose parent is NOT a live lightbrowse
-/// server (parent died → reparented to init or a subreaper, PPID may be
-/// anything) is safe to SIGKILL; a live owner is left untouched, and locks
-/// are only removed when no live owner remains.
+/// Linux inspects `/proc`; macOS parses `ps -axo pid=,ppid=,command=` (there
+/// is no /proc). A browser whose parent is NOT a live lightbrowse server and
+/// NOT another browser process (i.e. it was reparented to init/a subreaper
+/// after its parent died) is safe to SIGKILL; a live owner is left untouched,
+/// and locks are only removed when no live owner remains.
 fn clean_stale_profile_locks(user_data: &std::path::Path) {
-    #[cfg(unix)]
+    let needle = user_data.display().to_string();
+
+    // Snapshot (pid, ppid, command) for every live process.
+    let mut all: Vec<(u32, u32, String)> = Vec::new();
+
+    #[cfg(target_os = "linux")]
     {
-        let needle = user_data.display().to_string();
-        let mut live_owner = false;
-        let mut found = 0usize;
-        let mut killed = 0usize;
         if let Ok(rd) = std::fs::read_dir("/proc") {
             for e in rd.flatten() {
-                let pid = e.file_name().to_string_lossy().to_string();
-                if !pid.chars().all(|c| c.is_ascii_digit()) {
+                let Ok(pid) = e.file_name().to_string_lossy().parse::<u32>() else {
                     continue;
-                }
+                };
                 let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-                let args: Vec<&str> = std::str::from_utf8(&cmdline)
+                let cmd = std::str::from_utf8(&cmdline)
                     .unwrap_or("")
                     .split('\0')
-                    .collect();
-                if !args
-                    .iter()
-                    .any(|a| a.starts_with("--user-data-dir=") && a.contains(&needle))
-                {
-                    continue;
-                }
-                // Decide ownership: the browser MAIN process is directly
-                // parented to the lightbrowse server; its children (renderers,
-                // zygotes — same cmdline profile) are parented to chrome.
-                let ppid: i32 = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let ppid = std::fs::read_to_string(format!("/proc/{pid}/stat"))
                     .unwrap_or_default()
                     .split_whitespace()
                     .nth(3)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or(-1);
-                let parent_cmd = std::fs::read(format!("/proc/{ppid}/cmdline"))
-                    .map(|c| String::from_utf8_lossy(&c).to_string())
-                    .unwrap_or_default();
-                let parent_is_lightbrowse = parent_cmd.contains("lightbrowse");
-                let parent_is_chrome = parent_cmd.contains("chrome");
-                if parent_is_lightbrowse {
-                    live_owner = true;
-                } else if !parent_is_chrome {
-                    // Parent is init, a subreaper, or dead — an orphaned
-                    // browser main. Kill it; children die with it.
-                    killed += 1;
-                    tracing::warn!(
-                        "cdp: killing orphaned Chromium (pid {pid}) holding profile {needle}"
-                    );
-                    let _ = std::process::Command::new("kill")
-                        .arg("-9")
-                        .arg(&pid)
-                        .status();
-                } else {
-                    found += 1;
-                }
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0);
+                all.push((pid, ppid, cmd));
             }
         }
-        tracing::debug!(
-            "cdp: profile-lock scan for {needle}: {found} chrome procs, {killed} orphaned killed, live_owner={live_owner}"
-        );
-        if !live_owner {
-            for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
-                let p = user_data.join(name);
-                if p.exists() {
-                    tracing::info!("cdp: removing stale profile lock {}", p.display());
-                    let _ = std::fs::remove_file(&p);
-                }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("ps")
+            .args(["-axo", "pid=,ppid=,command="])
+            .output()
+        {
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let mut parts = line.trim_start().splitn(3, char::is_whitespace);
+                let (Some(pid), Some(ppid), Some(cmd)) = (parts.next(), parts.next(), parts.next())
+                else {
+                    continue;
+                };
+                let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
+                    continue;
+                };
+                all.push((pid, ppid, cmd.trim().to_string()));
+            }
+        }
+    }
+
+    let by_pid: std::collections::HashMap<u32, &str> =
+        all.iter().map(|(p, _, c)| (*p, c.as_str())).collect();
+
+    let mut live_owner = false;
+    let mut found = 0usize;
+    let mut killed = 0usize;
+    for (pid, ppid, cmd) in &all {
+        if !cmd.contains(&format!("--user-data-dir={needle}")) {
+            continue;
+        }
+        // Decide ownership: the browser MAIN process is directly parented to
+        // the lightbrowse server; its children (renderers, zygotes — same
+        // cmdline profile) are parented to another browser process.
+        let parent_cmd = by_pid.get(ppid).copied().unwrap_or("");
+        let parent_is_lightbrowse = parent_cmd.contains("lightbrowse");
+        let parent_is_browser = ["chrome", "chromium", "msedge"]
+            .iter()
+            .any(|b| parent_cmd.contains(b));
+        if parent_is_lightbrowse {
+            live_owner = true;
+        } else if !parent_is_browser {
+            // Parent is init, a subreaper, or dead — an orphaned browser main.
+            // Kill it; children die with it.
+            killed += 1;
+            tracing::warn!("cdp: killing orphaned Chromium (pid {pid}) holding profile {needle}");
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
+        } else {
+            found += 1;
+        }
+    }
+    tracing::debug!(
+        "cdp: profile-lock scan for {needle}: {found} chrome procs, {killed} orphaned killed, live_owner={live_owner}"
+    );
+    if !live_owner {
+        for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+            let p = user_data.join(name);
+            if p.exists() {
+                tracing::info!("cdp: removing stale profile lock {}", p.display());
+                let _ = std::fs::remove_file(&p);
             }
         }
     }
