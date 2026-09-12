@@ -372,7 +372,7 @@ impl McpServer {
                     {
                         "tag": "[Act]",
                         "when": "operate on a live engine=cdp tab (login forms, buttons, JS state)",
-                        "tools": ["click", "click_at", "visual_snapshot", "type", "login", "fill_form", "submit", "press", "evaluate", "screenshot", "page/current"]
+                        "tools": ["click", "click_at", "visual_snapshot", "type", "login", "fill_form", "submit", "press", "evaluate", "wait", "screenshot", "page/current"]
                     },
                     {
                         "tag": "[Research]",
@@ -676,6 +676,23 @@ impl McpServer {
                     .map_err(|e| e.to_string())?;
                 Ok(pretty(&json!({ "result": res })))
             }
+            "wait" => {
+                let cdp = require_cdp(&s)?;
+                let session = opt_str(args, "session");
+                let opts = lightbrowse_cdp::WaitOptions {
+                    selector: opt_str(args, "selector"),
+                    url_contains: opt_str(args, "url_contains"),
+                    expression: opt_str(args, "expression"),
+                    network_idle_ms: args.get("network_idle_ms").and_then(|v| v.as_u64()),
+                    timeout_ms: args.get("timeout_ms").and_then(|v| v.as_u64()),
+                    poll_ms: args.get("poll_ms").and_then(|v| v.as_u64()),
+                };
+                let report = cdp
+                    .wait_for(opts, session.as_deref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                Ok(pretty(&report))
+            }
             "page/current" => {
                 let cdp = require_cdp(&s)?;
                 let session = opt_str(args, "session");
@@ -847,7 +864,7 @@ impl McpServer {
                 let mut runbook_saved = json!(null);
                 let mut probe = json!(null);
                 if save_vault {
-                    tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+                    let _ = cdp.idle_settle(600, 4000, session.as_deref()).await;
                     probe = cdp
                         .login_success_probe(session.as_deref())
                         .await
@@ -1367,6 +1384,22 @@ fn tools_schema() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "wait",
+            "description": "Wait until conditions hold before acting (composable): selector (visible element), url_contains, expression (truthy JS) and network_idle_ms (no request in flight for N ms). All set conditions must hold at the same time. Returns {ok, timed_out, elapsed_ms, conditions, url, in_flight_requests} — a timeout is a normal result, not an error. Prefer this over fixed sleeps after navigate/click/submit.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "selector": { "type": "string", "description": "CSS selector that must match a visible, non-zero-size element" },
+                    "url_contains": { "type": "string", "description": "substring that location.href must contain" },
+                    "expression": { "type": "string", "description": "JS expression that must evaluate truthy" },
+                    "network_idle_ms": { "type": "integer", "description": "require no network request in flight for this many ms" },
+                    "timeout_ms": { "type": "integer", "default": 10000 },
+                    "poll_ms": { "type": "integer", "default": 150 },
+                    "session": { "type": "string", "description": "optional session id (from navigate) to target its tab" }
+                }
+            }
+        }),
+        json!({
             "name": "page/current",
             "description": "Read the targeted CDP tab: url, title, rendered text preview. Use after click/type/submit to see the result.",
             "inputSchema": {
@@ -1805,6 +1838,55 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["session"].as_str(), Some(sa.id.as_str()));
         assert_eq!(v["include_values"], false);
+
+        backend.reset_browser().await;
+    }
+
+    /// The `wait` tool is exposed over MCP and returns a verified report —
+    /// timeouts are `ok:false`, not errors.
+    #[tokio::test]
+    #[ignore = "requires Chrome + network"]
+    #[cfg_attr(windows, ignore = "requires Chrome + network")]
+    async fn wait_tool_reports_conditions_and_timeout() {
+        let config = lightbrowse_core::config::Config {
+            memory_budget_mb: 8192,
+            max_tabs: 8,
+            ..Default::default()
+        };
+        let backend = Arc::new(lightbrowse_cdp::CdpBackend::new(config));
+        let s = Session::new();
+        backend.navigate(&s, "https://example.com/").await.unwrap();
+        let server = McpServer {
+            state: McpState {
+                backend: backend.clone(),
+                cdp: Some(backend.clone()),
+                session: Arc::new(Mutex::new(Session::new())),
+                engine: Engine::Cdp,
+                memory: None,
+                vault: None,
+            },
+        };
+
+        let mut args = Map::new();
+        args.insert("selector".into(), json!("h1"));
+        args.insert("session".into(), json!(s.id));
+        args.insert("timeout_ms".into(), json!(5000));
+        let out = server.call_tool("wait", &args).await.unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["ok"], true, "h1 must be found: {out}");
+
+        let mut args = Map::new();
+        args.insert("selector".into(), json!("#definitely-not-on-this-page"));
+        args.insert("timeout_ms".into(), json!(500));
+        args.insert("poll_ms".into(), json!(100));
+        let out = server.call_tool("wait", &args).await.unwrap();
+        let v: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["ok"], false);
+        assert_eq!(v["timed_out"], true);
+
+        // No condition is a programming error.
+        let err = server.call_tool("wait", &Map::new()).await.unwrap_err();
+        assert!(err.contains("at least one of"), "{err}");
 
         backend.reset_browser().await;
     }

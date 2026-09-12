@@ -10,7 +10,7 @@
 //! 3. **Zero magic deps** — the CDP client is ~250 lines over a websocket;
 //!    no chromiumoxide, no browser driver.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -180,6 +180,38 @@ struct NetworkCapture {
     token: CancellationToken,
     log: Arc<Mutex<VecDeque<Value>>>,
     active: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Composable wait conditions for `CdpBackend::wait_for`. At least one
+/// condition must be set; all *set* conditions must hold at the same instant
+/// before the wait succeeds. A timeout is a normal result (`ok:false`), not an
+/// error, so callers can branch on it.
+#[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
+pub struct WaitOptions {
+    /// CSS selector that must match at least one *visible*, non-zero-size
+    /// element (querySelector, main frame).
+    pub selector: Option<String>,
+    /// Substring that `location.href` must contain.
+    pub url_contains: Option<String>,
+    /// JavaScript expression that must evaluate truthy.
+    pub expression: Option<String>,
+    /// Require zero network requests in flight for this many ms (tracked from
+    /// CDP `Network` events on one persistent socket).
+    pub network_idle_ms: Option<u64>,
+    /// Overall timeout in ms (default 10000).
+    pub timeout_ms: Option<u64>,
+    /// Poll interval in ms (default 150, clamped to 30..=5000).
+    pub poll_ms: Option<u64>,
+}
+
+impl WaitOptions {
+    /// True when no condition is set (nothing to wait for).
+    pub fn is_empty(&self) -> bool {
+        self.selector.is_none()
+            && self.url_contains.is_none()
+            && self.expression.is_none()
+            && self.network_idle_ms.is_none()
+    }
 }
 
 impl CdpBackend {
@@ -802,6 +834,156 @@ impl CdpBackend {
             self.touch_tab(&sid).await;
         }
         Ok(v)
+    }
+
+    /// Wait for a combination of conditions before acting. Conditions are
+    /// re-checked on ONE persistent websocket: `selector` (visible element),
+    /// `url_contains`, `expression` (truthy JS) and `network_idle_ms` (no
+    /// request in flight for N ms, from CDP `Network` events). All set
+    /// conditions must hold at the same time. Returns a verified report either
+    /// way — `{ok, timed_out, elapsed_ms, conditions:{...}, url, in_flight}` —
+    /// so a timeout is not an error and the caller can branch on `ok`.
+    pub async fn wait_for(&self, opts: WaitOptions, session: Option<&str>) -> Result<Value> {
+        if opts.is_empty() {
+            return Err(Error::Unsupported(
+                "wait: set at least one of selector, url_contains, expression, network_idle_ms"
+                    .into(),
+            ));
+        }
+        let (sid, active) = self.active_page(session).await?;
+        let ws_url = active.ws_url.clone();
+        let timeout = Duration::from_millis(opts.timeout_ms.unwrap_or(10_000));
+        let poll = Duration::from_millis(opts.poll_ms.unwrap_or(150).clamp(30, 5_000));
+        let idle_target = opts.network_idle_ms.map(Duration::from_millis);
+        let started = Instant::now();
+        let deadline = started + timeout;
+
+        let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
+            .await
+            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+        rpc_expect(&mut ws, "Network.enable", json!({})).await?;
+
+        let probe = wait_probe_js(&opts);
+        let mut in_flight: HashSet<String> = HashSet::new();
+        let mut last_activity = Instant::now();
+        let mut last: Value = json!(null);
+
+        let met = loop {
+            let eval_id = next_id();
+            ws.send(WsMessage::Text(
+                json!({
+                    "id": eval_id,
+                    "method": "Runtime.evaluate",
+                    "params": { "expression": probe, "returnByValue": true }
+                })
+                .to_string(),
+            ))
+            .await
+            .map_err(|e| Error::Transport(format!("cdp send wait: {e}")))?;
+
+            // Read until our evaluate response arrives, folding in Network
+            // events seen along the way (rpc_expect would discard them).
+            let js = loop {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                match tokio::time::timeout(remaining.max(Duration::from_millis(1)), ws.next()).await
+                {
+                    // Budget exhausted mid-poll — keep the previous snapshot.
+                    Err(_) => break Value::Null,
+                    Ok(None) => return Err(Error::Transport("cdp: wait connection closed".into())),
+                    Ok(Some(Err(e))) => {
+                        return Err(Error::Transport(format!("cdp wait recv: {e}")))
+                    }
+                    Ok(Some(Ok(WsMessage::Text(t)))) => {
+                        let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
+                        if let Some(m) = v.get("method").and_then(|m| m.as_str()) {
+                            if let Some(rid) =
+                                v.pointer("/params/requestId").and_then(|r| r.as_str())
+                            {
+                                match m {
+                                    "Network.requestWillBeSent" => {
+                                        in_flight.insert(rid.to_string());
+                                        last_activity = Instant::now();
+                                    }
+                                    "Network.loadingFinished" | "Network.loadingFailed" => {
+                                        in_flight.remove(rid);
+                                        last_activity = Instant::now();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        if v.get("id").and_then(|i| i.as_u64()) == Some(eval_id) {
+                            break v
+                                .pointer("/result/result/value")
+                                .cloned()
+                                .unwrap_or(Value::Null);
+                        }
+                    }
+                    Ok(Some(Ok(WsMessage::Ping(p)))) => {
+                        let _ = ws.send(WsMessage::Pong(p)).await;
+                    }
+                    Ok(Some(Ok(_))) => {}
+                }
+            };
+            if !js.is_null() {
+                last = js;
+            }
+
+            let net_idle = match idle_target {
+                Some(t) => in_flight.is_empty() && last_activity.elapsed() >= t,
+                None => true,
+            };
+            let js_ok = last.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
+            let done = js_ok && net_idle;
+            if done || Instant::now() >= deadline {
+                break done;
+            }
+            let sleep = poll.min(deadline.saturating_duration_since(Instant::now()));
+            if !sleep.is_zero() {
+                tokio::time::sleep(sleep).await;
+            }
+        };
+
+        let _ = ws.close(None).await;
+        self.touch();
+        self.touch_tab(&sid).await;
+
+        let mut conditions = last;
+        if let Some(o) = conditions.as_object_mut() {
+            o.insert("network_idle".into(), json!(met || in_flight.is_empty()));
+        }
+        Ok(json!({
+            "ok": met,
+            "timed_out": !met,
+            "elapsed_ms": started.elapsed().as_millis() as u64,
+            "timeout_ms": timeout.as_millis() as u64,
+            "network_idle_ms": opts.network_idle_ms,
+            "in_flight_requests": in_flight.len(),
+            "session": sid,
+            "conditions": conditions
+        }))
+    }
+
+    /// Best-effort settle used where a fixed sleep used to be: block until the
+    /// tab has had no network request in flight for `idle_ms`, capped at
+    /// `cap_ms`. Never errors on timeout (returns `ok:false` in the report);
+    /// only a missing/broken tab errors. Replaces blind `sleep()`s before
+    /// probing post-login state.
+    pub async fn idle_settle(
+        &self,
+        idle_ms: u64,
+        cap_ms: u64,
+        session: Option<&str>,
+    ) -> Result<Value> {
+        self.wait_for(
+            WaitOptions {
+                network_idle_ms: Some(idle_ms),
+                timeout_ms: Some(cap_ms),
+                ..Default::default()
+            },
+            session,
+        )
+        .await
     }
 
     /// All cookies visible to the browser session (including httpOnly and
@@ -2897,6 +3079,45 @@ fn rand_suffix() -> String {
     out
 }
 
+fn wait_probe_js(opts: &WaitOptions) -> String {
+    let sel = json_str_opt(opts.selector.as_deref());
+    let urls = json_str_opt(opts.url_contains.as_deref());
+    let expr = json_str_opt(opts.expression.as_deref());
+    format!(
+        r#"(() => {{
+  const SEL = {sel}, URLS = {urls}, EXPR = {expr};
+  const visible = (el) => {{
+    if (!el || el.getClientRects().length === 0) return false;
+    const r = el.getBoundingClientRect();
+    if (r.width <= 0 || r.height <= 0) return false;
+    const s = getComputedStyle(el);
+    return s.visibility !== 'hidden' && s.display !== 'none' && s.opacity !== '0';
+  }};
+  let selOk = null;
+  if (SEL) {{
+    let el = null;
+    try {{ el = document.querySelector(SEL); }} catch (e) {{ el = null; }}
+    selOk = !!el && visible(el);
+  }}
+  let urlOk = null;
+  if (URLS) urlOk = location.href.indexOf(URLS) !== -1;
+  let exprOk = null;
+  if (EXPR) {{ try {{ exprOk = !!(0, eval)(EXPR); }} catch (e) {{ exprOk = false; }} }}
+  const ok = (selOk === null || selOk) && (urlOk === null || urlOk) && (exprOk === null || exprOk);
+  return {{ ok: ok, selector: selOk, url_contains: urlOk, expression: exprOk, url: location.href }};
+}})()"#
+    )
+}
+
+/// JSON-encode an optional string for embedding in generated JS (`null` when
+/// absent or blank).
+fn json_str_opt(v: Option<&str>) -> String {
+    match v.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) => serde_json::to_string(s).unwrap_or_else(|_| "null".into()),
+        None => "null".into(),
+    }
+}
+
 async fn evaluate_js(ws_url: &str, expression: &str) -> Result<Value> {
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
         .await
@@ -4093,6 +4314,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn wait_options_require_a_condition_and_escape_strings() {
+        assert!(WaitOptions::default().is_empty());
+        assert!(!WaitOptions {
+            network_idle_ms: Some(1),
+            ..Default::default()
+        }
+        .is_empty());
+
+        assert_eq!(json_str_opt(None), "null");
+        assert_eq!(json_str_opt(Some("   ")), "null");
+        assert_eq!(json_str_opt(Some("h1")), "\"h1\"");
+        // Quotes/newlines must be escaped, never break out of the JS literal.
+        assert_eq!(json_str_opt(Some("a\"b")), "\"a\\\"b\"");
+        let js = wait_probe_js(&WaitOptions {
+            selector: Some("a\"; alert(1); //".into()),
+            url_contains: Some("x\ny".into()),
+            expression: Some("1===1".into()),
+            ..Default::default()
+        });
+        assert!(js.contains(r#"const SEL = "a\"; alert(1); //""#));
+        assert!(js.contains("URLS = \"x\\ny\""));
+        assert!(js.contains("EXPR = \"1===1\""));
+    }
+
     /// Tool results must never echo a secret back to the caller — the storage
     /// fix alone is insufficient because the response is what the LLM sees.
     #[test]
@@ -4372,6 +4618,91 @@ async fn capture_restarts_after_stop_and_close() {
         .network_capture(false, Some(s.id.as_str()))
         .await
         .unwrap();
+
+    backend.reset_browser().await;
+}
+
+/// Composable waits: a visible selector, a URL substring, network idle, and a
+/// timeout that returns ok:false rather than an error.
+#[tokio::test]
+#[ignore = "requires Chrome + network"]
+#[cfg_attr(windows, ignore = "requires Chrome + network")]
+async fn wait_for_selector_url_idle_and_timeout() {
+    let config = lightbrowse_core::config::Config {
+        memory_budget_mb: 8192,
+        max_tabs: 8,
+        ..Default::default()
+    };
+    let backend = CdpBackend::new(config);
+    let s = Session::new();
+    backend.navigate(&s, "https://example.com/").await.unwrap();
+    let sid = s.id.as_str();
+
+    // Visible selector.
+    let r = backend
+        .wait_for(
+            WaitOptions {
+                selector: Some("h1".into()),
+                timeout_ms: Some(5000),
+                ..Default::default()
+            },
+            Some(sid),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true, "h1 must be found: {r}");
+    assert_eq!(r["conditions"]["selector"], true);
+
+    // URL substring.
+    let r = backend
+        .wait_for(
+            WaitOptions {
+                url_contains: Some("example.com".into()),
+                timeout_ms: Some(3000),
+                ..Default::default()
+            },
+            Some(sid),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+
+    // Network quiescence after load.
+    let r = backend
+        .wait_for(
+            WaitOptions {
+                network_idle_ms: Some(300),
+                timeout_ms: Some(6000),
+                ..Default::default()
+            },
+            Some(sid),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true, "network must settle: {r}");
+
+    // Impossible selector → timeout is a normal result, not an error.
+    let r = backend
+        .wait_for(
+            WaitOptions {
+                selector: Some("#definitely-not-on-this-page".into()),
+                timeout_ms: Some(600),
+                poll_ms: Some(100),
+                ..Default::default()
+            },
+            Some(sid),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], false);
+    assert_eq!(r["timed_out"], true);
+    assert_eq!(r["conditions"]["selector"], false);
+
+    // No conditions is a programming error.
+    assert!(backend
+        .wait_for(WaitOptions::default(), Some(sid))
+        .await
+        .is_err());
 
     backend.reset_browser().await;
 }

@@ -145,6 +145,32 @@ enum Cmd {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Wait until composable conditions hold on a CDP tab — selector (visible
+    /// element), --url-contains, --expression, --network-idle. All set
+    /// conditions must hold at once. Replaces fixed sleeps after navigate /
+    /// click / submit. A timeout prints ok:false (exit code stays 0).
+    Wait {
+        /// Optional URL to navigate to first (engine=cdp).
+        url: Option<String>,
+        /// CSS selector that must match a visible element.
+        #[arg(long)]
+        selector: Option<String>,
+        /// Substring that location.href must contain.
+        #[arg(long = "url-contains")]
+        url_contains: Option<String>,
+        /// JS expression that must evaluate truthy.
+        #[arg(long)]
+        expression: Option<String>,
+        /// Require no network request in flight for this many ms.
+        #[arg(long)]
+        network_idle: Option<u64>,
+        #[arg(long, default_value_t = 10000)]
+        timeout: u64,
+        #[arg(long, default_value_t = 150)]
+        poll: u64,
+        #[arg(long = "session")]
+        session_id: Option<String>,
+    },
     /// One-call login: navigate to URL, auto-detect username+password
     /// fields, fill both, submit. Auto-saves to the vault on detected success.
     Login {
@@ -495,6 +521,37 @@ async fn main() -> lightbrowse_core::Result<()> {
             let res = cdp.click_at(x, y, session.as_deref()).await?;
             print_json(&res);
         }
+        Cmd::Wait {
+            url,
+            selector,
+            url_contains,
+            expression,
+            network_idle,
+            timeout,
+            poll,
+            session_id,
+        } => {
+            if let Some(url) = url {
+                lightbrowse_core::service::navigate(
+                    &*fetch,
+                    Some(&*cdp_trait),
+                    &session,
+                    &url,
+                    Engine::Cdp,
+                )
+                .await?;
+            }
+            let opts = lightbrowse_cdp::WaitOptions {
+                selector,
+                url_contains,
+                expression,
+                network_idle_ms: network_idle,
+                timeout_ms: Some(timeout),
+                poll_ms: Some(poll),
+            };
+            let report = cdp.wait_for(opts, session_id.as_deref()).await?;
+            print_json(&report);
+        }
         Cmd::Login {
             url,
             username,
@@ -512,11 +569,15 @@ async fn main() -> lightbrowse_core::Result<()> {
             )
             .await?;
             if settle_ms > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(settle_ms)).await;
+                // Wait for the page to go quiet instead of a blind sleep; the
+                // cap keeps the previous worst-case latency.
+                let _ = cdp.idle_settle(400, settle_ms, None).await;
             }
             let res = cdp.fill_login(&username, &password, None).await?;
             if res.get("ok").and_then(|v| v.as_bool()) == Some(true) && !no_save {
-                tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+                // Adaptive settle before probing success: return as soon as the
+                // post-submit navigation is quiet, capped at 4s.
+                let _ = cdp.idle_settle(600, 4000, None).await;
                 let probe = cdp.login_success_probe(None).await?;
                 if probe
                     .get("detected")

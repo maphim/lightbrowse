@@ -59,6 +59,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/memory/recent", get(memory_recent))
         .route("/v1/current", get(current_page))
         .route("/v1/evaluate", get(evaluate))
+        .route("/v1/wait", axum::routing::post(wait_action))
         .route("/v1/screenshot", get(screenshot))
         .route("/v1/runbook/list", get(runbook_list))
         .route("/v1/runbook/get", get(runbook_get))
@@ -706,6 +707,7 @@ fn openapi_spec() -> Value {
             "/v1/memory/search": { "get": { "summary": "BM25 over previously read pages", "parameters": [{"name": "query", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "hits"} } } },
             "/v1/current": { "get": { "summary": "Current CDP tab: url, title, text preview", "responses": { "200": {"description": "current page"} } } },
             "/v1/evaluate": { "get": { "summary": "Run JS on the active CDP tab", "parameters": [{"name": "expression", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "JS result"} } } },
+            "/v1/wait": { "post": { "summary": "Wait until composable conditions hold (selector / url_contains / expression / network idle); a timeout returns ok:false, not an HTTP error", "requestBody": { "content": { "application/json": { "schema": { "type": "object", "properties": { "selector": {"type": "string"}, "url_contains": {"type": "string"}, "expression": {"type": "string"}, "network_idle_ms": {"type": "integer"}, "timeout_ms": {"type": "integer"}, "poll_ms": {"type": "integer"}, "session": {"type": "string"} } } } } }, "responses": { "200": {"description": "wait report"} } } },
             "/v1/screenshot": { "get": { "summary": "Screenshot the active CDP tab", "responses": { "200": {"description": "PNG"} } } },
             "/v1/click": { "get": { "summary": "Click a CSS selector on the active tab", "parameters": [{"name": "selector", "in": "query", "required": true, "schema": {"type": "string"}}], "responses": { "200": {"description": "click result"} } } },
             "/v1/click_at": { "get": { "summary": "Click at viewport coordinates (CSS px) — the human-pointing action for SoM/vision", "parameters": [{"name": "x", "in": "query", "required": true, "schema": {"type": "number"}}, {"name": "y", "in": "query", "required": true, "schema": {"type": "number"}}], "responses": { "200": {"description": "click result"} } } },
@@ -751,6 +753,47 @@ async fn evaluate(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "result": res })).into_response())
+}
+
+#[derive(Deserialize)]
+struct WaitBody {
+    #[serde(default)]
+    selector: Option<String>,
+    #[serde(default)]
+    url_contains: Option<String>,
+    #[serde(default)]
+    expression: Option<String>,
+    #[serde(default)]
+    network_idle_ms: Option<u64>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    #[serde(default)]
+    poll_ms: Option<u64>,
+    #[serde(default)]
+    session: Option<String>,
+}
+
+/// POST /v1/wait — block until composable conditions hold (selector /
+/// url_contains / expression / network idle). Returns a verified report; a
+/// timeout is `ok:false`, not an HTTP error.
+async fn wait_action(
+    State(state): State<AppState>,
+    Json(body): Json<WaitBody>,
+) -> Result<Response, ApiError> {
+    let cdp_session = resolve_cdp_session(&state, body.session.as_deref())?;
+    let opts = lightbrowse_cdp::WaitOptions {
+        selector: body.selector,
+        url_contains: body.url_contains,
+        expression: body.expression,
+        network_idle_ms: body.network_idle_ms,
+        timeout_ms: body.timeout_ms,
+        poll_ms: body.poll_ms,
+    };
+    let report = require_cdp(&state)?
+        .wait_for(opts, cdp_session.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(report).into_response())
 }
 
 async fn runbook_list(State(state): State<AppState>) -> Result<Response, ApiError> {
@@ -913,7 +956,7 @@ async fn login_action(
     let mut runbook_saved = serde_json::Value::Null;
     let mut probe = serde_json::Value::Null;
     if res.get("ok").and_then(|v| v.as_bool()) == Some(true) && q.save_vault {
-        tokio::time::sleep(std::time::Duration::from_millis(2500)).await;
+        let _ = cdp.idle_settle(600, 4000, cdp_session.as_deref()).await;
         probe = cdp
             .login_success_probe(cdp_session.as_deref())
             .await

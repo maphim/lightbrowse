@@ -119,6 +119,10 @@ lightbrowse search   "rust async runtime"
 lightbrowse fetch    https://spa.example --engine cdp
 lightbrowse fetch    https://spa.example --engine auto   # auto-fallback
 
+# wait for readiness instead of sleeping (selector / url-contains /
+# expression / network-idle; a timeout prints ok:false)
+lightbrowse wait https://spa.example --selector "#app-ready" --network-idle 500
+
 # HTTP API
 lightbrowse serve --port 8787 --engine auto --idle-timeout 30
 curl 'http://127.0.0.1:8787/v1/extract?url=https://example.com&mode=meta'
@@ -155,14 +159,23 @@ Available tools:
 | `click(selector)` / `type(selector, text)` / `submit(selector)` / `press(key)` | real input events on the active CDP tab |
 | `screenshot(path?, full_page?)` | capture the active tab as PNG |
 | `evaluate(expression)` | run JS on the active tab |
+| `wait(selector?, url_contains?, expression?, network_idle_ms?, timeout_ms?)` | block until all set conditions hold (AND); returns `{ok, timed_out, elapsed_ms, conditions}` |
 | `page/current` | read the active CDP tab after actions |
 | `runbook/save` \| `run` \| `get` \| `list` | record & replay action recipes (login flows) |
 | `memory/search(query)` / `memory/recent(limit?)` | BM25 search over everything read |
 | `search(query, max_results?)` | DuckDuckGo results (title/url/snippet) |
 
-**Agent interaction loop:** `navigate(url, engine="cdp")` → `snapshot()` → act
-(`click`/`type`/`submit` with a snapshot `selector`) → `page/current` to see
+**Agent interaction loop:** `navigate(url, engine="cdp")` → `wait(selector="…")` → `snapshot()` → act
+(`click`/`type`/`submit` with a snapshot `selector`) → `wait(network_idle_ms=500)` → `page/current` to see
 the result. `engine="cdp"` keeps the tab open; cached pages are read-only.
+
+**Waits, not sleeps.** `wait` composes conditions — a visible `selector`, a
+`url_contains` substring, a truthy `expression`, and `network_idle_ms` (no
+request in flight for N ms, tracked from real `Network` events). All set
+conditions must hold *at the same time*. A timeout is a normal result
+(`ok:false`) so the agent can branch or retry, and the login flow now settles
+on network idle instead of blind `sleep()`s (MCP `wait` / `POST /v1/wait` /
+CLI `wait <url> --selector …`).
 
 `engine` is `auto` by default: fetch first, headless Chromium fallback for
 JS-rendered pages.`
@@ -186,6 +199,7 @@ JS-rendered pages.`
 | `GET /v1/extract` | `url`, `mode` |
 | `GET /v1/snapshot` | `url`, `max_nodes` |
 | `GET /v1/search` | `q`, `max_results` |
+| `POST /v1/wait` | JSON body: `selector`, `url_contains`, `expression`, `network_idle_ms`, `timeout_ms`, `poll_ms`, `session` |
 
 ## Architecture
 

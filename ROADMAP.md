@@ -142,7 +142,11 @@
       (never closes/kills it); `--preload` injects JS before app scripts
 - [x] **navigate hardening** — errors only surface when the final retry
       fails; `Page.getFrameTree` retried with backoff; SPA settle wait
-- [ ] **waits** — wait-for-selector / network-idle helpers
+- [x] **Composable waits** — `wait` with a visible `selector`, `url_contains`,
+      truthy `expression` and `network-idle` (real CDP `Network` events); all
+      set conditions AND-ed on one persistent socket. A timeout is `ok:false`,
+      not an error. MCP `wait` / `POST /v1/wait` / CLI `wait <url> --selector`.
+      Login auto-save now settles on network idle instead of fixed sleeps.
 
 ## Interfaces
 
