@@ -2972,6 +2972,57 @@ async fn rpc_expect(ws: &mut CdpWs, method: &str, params: Value) -> Result<Value
     }
 }
 
+/// How a profile-holding process relates to a live browser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileProcKind {
+    /// Parented to a live lightbrowse server — leave it alone.
+    LiveOwner,
+    /// Parented to another browser process (renderer/zygote) — part of a
+    /// running browser tree, not an orphan.
+    BrowserChild,
+    /// Parent is init/a subreaper/dead — an orphaned browser main.
+    Orphan,
+}
+
+/// Classify a profile-holding process from its parent's command line.
+/// Matching is case-insensitive because macOS reports the binary as
+/// `Google Chrome` (capital C), while Linux uses lowercase `chrome`.
+fn classify_profile_proc(parent_cmd: Option<&str>) -> ProfileProcKind {
+    let parent = parent_cmd.unwrap_or("").to_ascii_lowercase();
+    if parent.contains("lightbrowse") {
+        ProfileProcKind::LiveOwner
+    } else if ["chrome", "chromium", "msedge"]
+        .iter()
+        .any(|b| parent.contains(b))
+    {
+        ProfileProcKind::BrowserChild
+    } else {
+        ProfileProcKind::Orphan
+    }
+}
+
+/// Parse one `ps -axo pid=,ppid=,command=` line into `(pid, ppid, command)`.
+///
+/// macOS right-aligns PID/PPID, so fields are separated by runs of spaces.
+/// `splitn(3, char::is_whitespace)` does *not* skip repeated separators and
+/// yields an empty PPID for a padded line (silently skipping the process), so
+/// tokenize the two leading fields explicitly and keep the remaining command
+/// text verbatim (preserving any spaces inside `--user-data-dir=...`).
+#[cfg(any(target_os = "macos", test))]
+fn parse_ps_line(line: &str) -> Option<(u32, u32, String)> {
+    let line = line.trim_start();
+    let pid_end = line.find(char::is_whitespace).unwrap_or(line.len());
+    let rest = line[pid_end..].trim_start();
+    if rest.is_empty() {
+        return None;
+    }
+    let ppid_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    let cmd = rest[ppid_end..].trim_start();
+    let pid = line[..pid_end].parse::<u32>().ok()?;
+    let ppid = rest[..ppid_end].parse::<u32>().ok()?;
+    Some((pid, ppid, cmd.to_string()))
+}
+
 /// Reap orphaned Chromium processes that hold OUR profile dir and clear
 /// their stale profile locks, so a fresh spawn never hangs on a
 /// SingletonLock left by a hard-killed previous server.
@@ -3019,15 +3070,9 @@ fn clean_stale_profile_locks(user_data: &std::path::Path) {
             .output()
         {
             for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let mut parts = line.trim_start().splitn(3, char::is_whitespace);
-                let (Some(pid), Some(ppid), Some(cmd)) = (parts.next(), parts.next(), parts.next())
-                else {
-                    continue;
-                };
-                let (Ok(pid), Ok(ppid)) = (pid.parse::<u32>(), ppid.parse::<u32>()) else {
-                    continue;
-                };
-                all.push((pid, ppid, cmd.trim().to_string()));
+                if let Some((pid, ppid, cmd)) = parse_ps_line(line) {
+                    all.push((pid, ppid, cmd));
+                }
             }
         }
     }
@@ -3045,23 +3090,20 @@ fn clean_stale_profile_locks(user_data: &std::path::Path) {
         // Decide ownership: the browser MAIN process is directly parented to
         // the lightbrowse server; its children (renderers, zygotes — same
         // cmdline profile) are parented to another browser process.
-        let parent_cmd = by_pid.get(ppid).copied().unwrap_or("");
-        let parent_is_lightbrowse = parent_cmd.contains("lightbrowse");
-        let parent_is_browser = ["chrome", "chromium", "msedge"]
-            .iter()
-            .any(|b| parent_cmd.contains(b));
-        if parent_is_lightbrowse {
-            live_owner = true;
-        } else if !parent_is_browser {
-            // Parent is init, a subreaper, or dead — an orphaned browser main.
-            // Kill it; children die with it.
-            killed += 1;
-            tracing::warn!("cdp: killing orphaned Chromium (pid {pid}) holding profile {needle}");
-            let _ = std::process::Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .status();
-        } else {
-            found += 1;
+        match classify_profile_proc(by_pid.get(ppid).copied()) {
+            ProfileProcKind::LiveOwner => live_owner = true,
+            ProfileProcKind::BrowserChild => found += 1,
+            ProfileProcKind::Orphan => {
+                // Parent is init, a subreaper, or dead — an orphaned browser
+                // main. Kill it; children die with it.
+                killed += 1;
+                tracing::warn!(
+                    "cdp: killing orphaned Chromium (pid {pid}) holding profile {needle}"
+                );
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status();
+            }
         }
     }
     tracing::debug!(
@@ -3519,6 +3561,53 @@ mod tests {
             urlencoding("https://a.com/?x=1&y=2"),
             "https%3A%2F%2Fa.com%2F%3Fx%3D1%26y%3D2"
         );
+    }
+
+    /// macOS `ps -axo pid=,ppid=,command=` right-aligns PID/PPID, so fields
+    /// are separated by runs of spaces. Regression guard for a parser that
+    /// used `splitn(3, char::is_whitespace)` and silently dropped every padded
+    /// process, so orphaned Chromium was never reaped on macOS.
+    #[test]
+    fn parses_padded_macos_ps_output() {
+        let line = "  4321    987 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --user-data-dir=/tmp/lb-profile --headless=new";
+        let (pid, ppid, cmd) = parse_ps_line(line).expect("padded ps line must parse");
+        assert_eq!(pid, 4321);
+        assert_eq!(ppid, 987);
+        assert!(
+            cmd.contains("--user-data-dir=/tmp/lb-profile"),
+            "command must retain the user-data-dir flag: {cmd}"
+        );
+
+        // Single-space lines keep working.
+        assert_eq!(
+            parse_ps_line("12345 67890 /usr/bin/foo"),
+            Some((12345, 67890, "/usr/bin/foo".to_string()))
+        );
+        // Noise is rejected rather than mis-parsed.
+        assert_eq!(parse_ps_line("   "), None);
+        assert_eq!(parse_ps_line("not-a-pid 1 cmd"), None);
+
+        // Ownership classification drives kill-vs-keep decisions.
+        assert_eq!(
+            classify_profile_proc(Some("/usr/local/bin/lightbrowse serve")),
+            ProfileProcKind::LiveOwner
+        );
+        // macOS reports the binary as `Google Chrome` (capital C).
+        assert_eq!(
+            classify_profile_proc(Some(
+                "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            )),
+            ProfileProcKind::BrowserChild
+        );
+        assert_eq!(
+            classify_profile_proc(Some("/usr/lib/chromium/chromium")),
+            ProfileProcKind::BrowserChild
+        );
+        assert_eq!(
+            classify_profile_proc(Some("/sbin/launchd")),
+            ProfileProcKind::Orphan
+        );
+        assert_eq!(classify_profile_proc(None), ProfileProcKind::Orphan);
     }
 }
 
