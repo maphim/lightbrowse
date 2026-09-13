@@ -82,12 +82,24 @@ enum VaultCmd {
         name: String,
         url: String,
         username: String,
-        password: String,
+        /// Password. Omit and pipe it on stdin (recommended) — a command-line
+        /// argument is visible to other processes (`ps`) and shell history.
+        password: Option<String>,
+        /// Read the password from stdin (recommended). Takes precedence over
+        /// the positional password.
+        #[arg(long)]
+        password_stdin: bool,
     },
     /// List entry names + urls (never secrets).
     List,
-    /// Print a full entry (username + password).
-    Get { name: String },
+    /// Print an entry. The password is REDACTED unless `--reveal` is passed.
+    Get {
+        name: String,
+        /// Print the stored password. Off by default so secrets cannot leak
+        /// into logs or CI transcripts.
+        #[arg(long)]
+        reveal: bool,
+    },
     /// Delete an entry.
     Delete { name: String },
 }
@@ -150,7 +162,13 @@ enum Cmd {
     Login {
         url: String,
         username: String,
-        password: String,
+        /// Password. Omit and pipe it on stdin (recommended) — a command-line
+        /// argument is visible to other processes (`ps`) and shell history.
+        password: Option<String>,
+        /// Read the password from stdin (recommended). Takes precedence over
+        /// the positional password.
+        #[arg(long)]
+        password_stdin: bool,
         /// Settle wait (ms) after navigate (bot challenges / heavy JS).
         #[arg(long, default_value_t = 3000)]
         settle_ms: u64,
@@ -499,10 +517,12 @@ async fn main() -> lightbrowse_core::Result<()> {
             url,
             username,
             password,
+            password_stdin,
             settle_ms,
             no_save,
             vault_name,
         } => {
+            let password = resolve_password(password, password_stdin, "password")?;
             lightbrowse_core::service::navigate(
                 &*fetch,
                 Some(&*cdp_trait),
@@ -798,7 +818,9 @@ async fn main() -> lightbrowse_core::Result<()> {
                     url,
                     username,
                     password,
+                    password_stdin,
                 } => {
+                    let password = resolve_password(password, password_stdin, "password")?;
                     vault
                         .set(
                             &name,
@@ -824,13 +846,17 @@ async fn main() -> lightbrowse_core::Result<()> {
                         .collect();
                     print_json(&json!({"count": items.len(), "entries": items}));
                 }
-                VaultCmd::Get { name } => {
+                VaultCmd::Get { name, reveal } => {
                     let e = vault.get(&name).ok_or_else(|| {
                         lightbrowse_core::Error::Parse(format!("vault entry '{name}' not found"))
                     })?;
-                    print_json(
-                        &json!({"name": name, "url": e.url, "username": e.username, "password": e.password}),
-                    );
+                    print_json(&json!({
+                        "name": name,
+                        "url": e.url,
+                        "username": e.username,
+                        "password": if reveal { json!(e.password) } else { Value::Null },
+                        "password_redacted": !reveal,
+                    }));
                 }
                 VaultCmd::Delete { name } => {
                     if !vault
@@ -969,6 +995,61 @@ fn print_json(v: &Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap());
 }
 
+/// Resolve a password that may arrive on argv (visible in `ps` / shell history)
+/// or on stdin. Stdin is preferred; argv keeps old scripts working but emits a
+/// warning so callers migrate.
+fn resolve_password(
+    arg: Option<String>,
+    from_stdin: bool,
+    label: &str,
+) -> lightbrowse_core::Result<String> {
+    if from_stdin {
+        return read_secret_stdin(label);
+    }
+    match arg {
+        Some(p) => {
+            eprintln!(
+                "warning: {label} passed as a command-line argument is visible to \
+                 other processes (ps) and shell history — prefer --password-stdin"
+            );
+            Ok(p)
+        }
+        None => read_secret_stdin(label),
+    }
+}
+
+/// Read a secret from stdin (first line, trailing CR/LF stripped). Prompts on
+/// stderr when stdin is a terminal. Note: the terminal still echoes the input —
+/// use a pipe (`printf '%s' "$PASS" | lightbrowse ... --password-stdin`) when
+/// scrolling/shoulder-surfing matters.
+fn read_secret_stdin(label: &str) -> lightbrowse_core::Result<String> {
+    use std::io::{IsTerminal, Write};
+    let stdin = std::io::stdin();
+    if stdin.is_terminal() {
+        eprint!("{label}: ");
+        let _ = std::io::stderr().flush();
+    }
+    read_secret_line(stdin.lock(), label)
+}
+
+/// Read the first line from `reader`, stripping a trailing CR/LF. Separated
+/// from the terminal plumbing so it can be unit-tested with a byte slice.
+fn read_secret_line<R: std::io::BufRead>(
+    mut reader: R,
+    label: &str,
+) -> lightbrowse_core::Result<String> {
+    let mut line = String::new();
+    reader.read_line(&mut line)?;
+    let value = line.trim_end_matches(['\n', '\r']).to_string();
+    if value.is_empty() {
+        return Err(lightbrowse_core::Error::Parse(format!(
+            "no {label} provided — pipe it on stdin, e.g. \
+             `printf '%s\\n' \"$PASS\" | lightbrowse ... --password-stdin`"
+        )));
+    }
+    Ok(value)
+}
+
 fn urlencoding(s: &str) -> String {
     s.chars()
         .flat_map(|c| {
@@ -985,4 +1066,41 @@ fn urlencoding(s: &str) -> String {
                 .collect::<Vec<_>>()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdin_password_strips_trailing_newline() {
+        assert_eq!(
+            read_secret_line(b"hunter2\n".as_slice(), "password").unwrap(),
+            "hunter2"
+        );
+    }
+
+    #[test]
+    fn stdin_password_strips_crlf_and_keeps_inner_spaces() {
+        assert_eq!(
+            read_secret_line(b"pa ss word\r\nrest\n".as_slice(), "password").unwrap(),
+            "pa ss word"
+        );
+    }
+
+    #[test]
+    fn stdin_password_rejects_empty() {
+        assert!(read_secret_line(b"\n".as_slice(), "password").is_err());
+        assert!(read_secret_line(b"".as_slice(), "password").is_err());
+    }
+
+    #[test]
+    fn argv_password_is_still_accepted() {
+        // Backward compatibility: old scripts keep working (a warning goes to
+        // stderr, which we cannot assert on here).
+        assert_eq!(
+            resolve_password(Some("old-script".into()), false, "password").unwrap(),
+            "old-script"
+        );
+    }
 }
