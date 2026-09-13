@@ -1,6 +1,6 @@
 # Context Surface Plan — token-bounded tool output for lightbrowse
 
-Status: **P0 + P1 implemented** — `lightbrowse-core::reduce`, CLI `--max-tokens`, artifact store in `lightbrowse-memory::artifacts`, MCP interception + `artifact/*` tools (see §9 and §10); P2 (snapshot delta, lazy schemas) still proposal
+Status: **P0 + P1 + P2 implemented** — reducer (`lightbrowse-core::reduce`), CLI `--max-tokens`, artifact store + MCP interception + `artifact/*` tools, snapshot fingerprint delta, compact `tools/list` + `tool/inspect` (see §9–§11)
 Source of the mechanism: `codelocal-cloud/codelocal` (Go, Apache-2.0, v1.5.64) — `internal/contextsurface/*`, `internal/projectbrain/compiler.go`, `internal/mcphub/*`
 Target: lightbrowse v0.5.2 (Rust workspace, ~12.6k LOC)
 
@@ -354,3 +354,54 @@ artifact id returns a clean tool error (`isError: true`, "not found or expired")
 - Lazy `tools/list`: 37 tool schemas (~470 lines) ship at session start today; names + one-line
   summaries with full schema behind `tool/inspect` would cut startup context by ~50%.
 - Array marker as a non-string element if a host rejects mixed arrays.
+
+## 11. P2 results (implemented, measured)
+
+### Snapshot fingerprint delta
+
+`snapshot` keeps a fingerprint of the last tree per URL (state in the MCP server) and answers with a
+~30-token delta when the page is unchanged, storing the tree as an artifact so the delta is never a
+dead end:
+
+```json
+{ "url": "...", "unchanged": true, "fingerprint": "3f9c…",
+  "artifact": "obs_…", "node_count": 900,
+  "note": "page unchanged since the previous snapshot for this URL — pass force:true for the tree, or artifact/read for the stored copy" }
+```
+
+Rules: only fires when the tree is bigger than the budget (a small tree is simply re-sent), only when
+a previous fingerprint exists for that URL, and a changed page always returns the full tree.
+`force: true` bypasses it; `--max-tokens 0` disables it.
+
+Measured over MCP stdio against a deterministic local page (900-node tree):
+
+| Call | Tokens |
+|---|---|
+| `snapshot` with `--max-tokens 0` (raw tree) | 79,885 |
+| `snapshot` 1st call, budget 1000 (bounded + artifact) | 172 |
+| `snapshot` 2nd call, page unchanged (delta) | **70** |
+| `snapshot` 3rd call, `force: true` | 172 |
+
+### Compact `tools/list` + `tool/inspect`
+
+`tools/list` now returns names, a one-line description, an `args(name, other?)` signature and the
+argument names/types (enums kept when short) — no parameter prose. `tool/inspect` returns the
+complete definition on demand (all of them when `name` is omitted).
+
+| Payload | Full | Compact | Saved |
+|---|---|---|---|
+| `tools/list` (41 tools) | 17,967 chars / 4,491 tok | 8,504 chars / 2,126 tok | **53%** |
+
+Everything is still callable from the compact schema (arg names, types and required-ness — encoded as
+`name?` — are preserved, and a test asserts no argument is lost for any of the 41 tools).
+`lightbrowse mcp --full-tools` / `$LIGHTBROWSE_FULL_TOOLS=1` restores the old behaviour.
+
+### Bug fixed along the way: cache hits lost the page structure
+
+`html_cache` was created but never written or read, so `find_cached` rebuilt the "HTML" from the
+`blocks` text index. A cache hit therefore produced a page with **no elements**: `snapshot` returned
+`node_count: 0` and `extract --mode links|forms|meta` returned empty — reproducibly, on the second
+read of any page (`1` HTTP request in the server log, then empty results). `store_page` now writes
+the raw HTML and `find_cached` prefers it, with the text-block path kept as a documented fallback for
+rows written before this change. Covered by two tests (`cache_hit_keeps_html_structure_for_snapshot_and_links`,
+`legacy_cache_rows_without_html_fall_back_to_text`).

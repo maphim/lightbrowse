@@ -167,6 +167,7 @@ Available tools:
 | `artifact/read(id, offset?, max_chars?)` | the **complete** payload behind a reduced response |
 | `artifact/ask(id, question, limit?)` | ranked passages from a stored artifact (no re-fetch) |
 | `artifact/list(limit?, tool?)` | what is still expandable + store totals |
+| `tool/inspect(name?)` | full JSON Schema of one tool, or the compact index of all |
 
 **Agent interaction loop:** `navigate(url, engine="cdp")` → `snapshot()` → act
 (`click`/`type`/`submit` with a snapshot `selector`) → `page/current` to see
@@ -199,6 +200,19 @@ object with the exact numbers and an artifact handle:
   (`0` disables). Artifacts live in the same SQLite file as browsing memory
   (`--memory`), expire after 24h, are evicted LRU-style past 512 MB, and never
   store a payload over 10 MB.
+- **Unchanged snapshots cost ~30 tokens**: `snapshot` remembers the fingerprint
+  of the last tree per URL and answers with `{"unchanged": true, "fingerprint",
+  "artifact"}` instead of the tree. Pass `force: true` for the tree anyway.
+
+### Compact tool index (on by default)
+
+`tools/list` ships **names + one-line descriptions + arg names/types** instead of
+full JSON Schema: 17,967 → 8,504 characters (**53% less context at session
+start**) for all 41 tools. Nothing is lost — `tool/inspect(name)` returns the
+complete schema, and `tool/inspect()` (no name) returns the compact index.
+
+Use `lightbrowse mcp --full-tools` (or `$LIGHTBROWSE_FULL_TOOLS=1`) to send the
+full schemas in `tools/list` instead.
 
 Measured with `--max-tokens 1000` (tokens ≈ output bytes / 4):
 
