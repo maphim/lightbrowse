@@ -6,13 +6,14 @@
 //!
 //! Protocol version: 2025-06-18 (stable MCP revision).
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use lightbrowse_core::backend::BrowserBackend;
 use lightbrowse_core::config::Engine;
 use lightbrowse_core::extract::{self, ExtractMode};
 use lightbrowse_core::reduce::{
-    estimate_tokens, prune_snapshot, reduce_text, ObservationKind, ReduceConfig,
+    estimate_tokens, fingerprint, prune_snapshot, reduce_text, ObservationKind, ReduceConfig,
 };
 use lightbrowse_core::session::Session;
 use lightbrowse_core::snapshot::{self, SnapshotOptions, SnapshotTree};
@@ -95,6 +96,11 @@ pub struct McpState {
     /// a store is present, so a bounded projection always has a handle to the
     /// complete response.
     pub artifacts: Option<Arc<ArtifactStore>>,
+    /// `tools/list` sends compact schemas (names + arg names) instead of the
+    /// full JSON Schema; `tool/inspect` returns the complete definition.
+    pub lazy_tools: bool,
+    /// Last snapshot fingerprint per URL, for unchanged-page deltas.
+    pub snapshot_fingerprints: Arc<Mutex<HashMap<String, String>>>,
 }
 
 pub struct McpServer {
@@ -120,8 +126,16 @@ impl McpServer {
                 vault,
                 max_tokens: DEFAULT_MAX_TOKENS,
                 artifacts: None,
+                lazy_tools: true,
+                snapshot_fingerprints: Arc::new(Mutex::new(HashMap::new())),
             },
         }
+    }
+
+    /// Toggle compact `tools/list` schemas (default on).
+    pub fn with_lazy_tools(mut self, lazy: bool) -> Self {
+        self.state.lazy_tools = lazy;
+        self
     }
 
     /// Set the per-response token budget (`0` disables reduction).
@@ -204,11 +218,18 @@ impl McpServer {
             })),
             "notifications/initialized" | "notifications/cancelled" => None,
             "ping" => Some(json!({ "jsonrpc": "2.0", "id": id, "result": {} })),
-            "tools/list" => Some(json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": { "tools": tools_schema() }
-            })),
+            "tools/list" => {
+                let tools = if self.state.lazy_tools {
+                    compact_tools_schema()
+                } else {
+                    tools_schema()
+                };
+                Some(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "result": { "tools": tools }
+                }))
+            }
             "tools/call" => {
                 let params = msg.get("params").and_then(|p| p.as_object());
                 let name = params
@@ -472,6 +493,34 @@ impl McpServer {
                     "stored_bytes": stored_bytes,
                 })))
             }
+            "tool/inspect" => {
+                let full = tools_schema();
+                match opt_str(args, "name") {
+                    Some(name) => {
+                        let tool = full
+                            .into_iter()
+                            .find(|tool| tool["name"].as_str() == Some(name.as_str()))
+                            .ok_or_else(|| format!("unknown tool '{name}'"))?;
+                        Ok(pretty(&json!({ "tool": tool, "lazy_tools": s.lazy_tools })))
+                    }
+                    None => {
+                        let index: Vec<Value> = full
+                            .iter()
+                            .map(|tool| {
+                                json!({
+                                    "name": tool["name"],
+                                    "summary": first_sentence(tool["description"].as_str().unwrap_or("")),
+                                })
+                            })
+                            .collect();
+                        Ok(pretty(&json!({
+                            "count": index.len(),
+                            "tools": index,
+                            "lazy_tools": s.lazy_tools,
+                        })))
+                    }
+                }
+            }
             "help" => Ok(pretty(&json!({
                 "about": "lightbrowse — featherweight browser MCP. 35 tools in 7 groups.",
                 "workflow": [
@@ -573,9 +622,21 @@ impl McpServer {
                     ..SnapshotOptions::default()
                 };
                 let tree = snapshot::snapshot(&page.html, &page.url, &opts);
-                Ok(pretty(
-                    &serde_json::to_value(tree).map_err(|e| e.to_string())?,
-                ))
+                let payload = serde_json::to_value(tree).map_err(|e| e.to_string())?;
+                let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
+                if !force {
+                    let cfg = ReduceConfig::with_max_tokens(s.max_tokens);
+                    if let Some(delta) = snapshot_delta(
+                        &s.snapshot_fingerprints,
+                        &page.url,
+                        &payload,
+                        cfg.max_tokens,
+                        s.artifacts.as_deref(),
+                    ) {
+                        return Ok(pretty(&delta));
+                    }
+                }
+                Ok(pretty(&payload))
             }
             "search" => {
                 let query = req_str(args, "query")?;
@@ -1304,6 +1365,171 @@ fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".into())
 }
 
+/// First sentence of a description, capped — used by the compact tool index.
+fn first_sentence(text: &str) -> String {
+    let text = text.trim();
+    let cut = text
+        .find(". ")
+        .map(|index| index + 1)
+        .unwrap_or(text.len())
+        .min(48);
+    let mut sentence: String = text.chars().take(cut).collect();
+    if sentence.chars().count() < text.chars().count() && !sentence.ends_with('.') {
+        sentence.push('…');
+    }
+    sentence
+}
+
+/// `url, engine?, max_nodes?` — enough for an agent to call the tool without
+/// shipping the full JSON Schema.
+fn arg_signature(tool: &Value) -> String {
+    let Some(props) = tool["inputSchema"]["properties"].as_object() else {
+        return String::new();
+    };
+    let required: Vec<&str> = tool["inputSchema"]["required"]
+        .as_array()
+        .map(|items| items.iter().filter_map(|v| v.as_str()).collect())
+        .unwrap_or_default();
+    let mut shown: Vec<String> = Vec::new();
+    for name in &required {
+        if props.contains_key(*name) {
+            shown.push((*name).to_string());
+        }
+    }
+    for name in props.keys() {
+        if !required.contains(&name.as_str()) {
+            shown.push(format!("{name}?"));
+        }
+    }
+    let extra = shown.len().saturating_sub(4);
+    shown.truncate(4);
+    let mut signature = shown.join(", ");
+    if extra > 0 {
+        signature.push_str(&format!(", +{extra} more"));
+    }
+    signature
+}
+
+/// Property names + types (+ short enums) without the prose.
+fn compact_properties(tool: &Value) -> Value {
+    let Some(props) = tool["inputSchema"]["properties"].as_object() else {
+        return json!({});
+    };
+    let mut out = Map::new();
+    for (name, spec) in props {
+        let mut compact = Map::new();
+        if let Some(kind) = spec.get("type").and_then(|v| v.as_str()) {
+            compact.insert("type".to_string(), json!(kind));
+        }
+        match spec.get("enum").and_then(|v| v.as_array()) {
+            Some(values)
+                if values.len() <= 6
+                    && serde_json::to_string(values).is_ok_and(|s| s.len() <= 40) =>
+            {
+                compact.insert("enum".to_string(), json!(values));
+            }
+            _ => {}
+        }
+        if spec.get("type").and_then(|v| v.as_str()) == Some("array") {
+            if let Some(item_type) = spec
+                .get("items")
+                .and_then(|items| items.get("type"))
+                .and_then(|v| v.as_str())
+            {
+                compact.insert("items".to_string(), json!({ "type": item_type }));
+            }
+        }
+        out.insert(name.clone(), Value::Object(compact));
+    }
+    Value::Object(out)
+}
+
+/// `tools/list` payload with descriptions trimmed to one line and schemas
+/// reduced to arg names/types. The full definition stays available through
+/// `tool/inspect`, so nothing is lost — it is just not paid for at session start.
+fn compact_tools_schema() -> Vec<Value> {
+    tools_schema()
+        .iter()
+        .map(|tool| {
+            let signature = arg_signature(tool);
+            // The `[Group] ` prefix is cosmetic in the compact index — the name
+            // already says what the tool does; `tool/inspect` keeps the full text.
+            let raw = tool["description"].as_str().unwrap_or("");
+            let raw = match raw.strip_prefix('[') {
+                Some(rest) => rest.split_once("] ").map(|(_, text)| text).unwrap_or(raw),
+                None => raw,
+            };
+            let description = first_sentence(raw);
+            let description = if signature.is_empty() {
+                description
+            } else {
+                format!("{description} args({signature})")
+            };
+            let properties = compact_properties(tool);
+            let mut schema = Map::new();
+            let has_properties = properties.as_object().is_some_and(|p| !p.is_empty());
+            if has_properties {
+                // `type` is only needed when there is something to describe; a
+                // no-argument tool ships `{}` (still a valid JSON Schema).
+                // `required` is deliberately omitted: required-ness is already in
+                // the `args(name, other?)` signature and in `tool/inspect`.
+                schema.insert("type".to_string(), json!("object"));
+                schema.insert("properties".to_string(), properties);
+            }
+            json!({
+                "name": tool["name"],
+                "description": description,
+                "inputSchema": Value::Object(schema),
+            })
+        })
+        .collect()
+}
+
+/// Tiny response for a snapshot that is unchanged since the previous one for
+/// the same URL. Only kicks in when the tree is big enough to be worth
+/// reducing; a small tree is simply sent again. The tree is stored as an
+/// artifact so the delta is never a dead end.
+fn snapshot_delta(
+    cache: &Mutex<HashMap<String, String>>,
+    url: &str,
+    tree: &Value,
+    max_tokens: usize,
+    artifacts: Option<&ArtifactStore>,
+) -> Option<Value> {
+    if max_tokens == 0 || estimate_tokens(&tree.to_string()) <= max_tokens {
+        return None;
+    }
+    let current = fingerprint(tree.to_string().as_bytes());
+    let previous = cache
+        .lock()
+        .unwrap()
+        .insert(url.to_string(), current.clone());
+    if previous.as_deref() != Some(current.as_str()) {
+        return None;
+    }
+    let mut delta = json!({
+        "url": url,
+        "unchanged": true,
+        "fingerprint": current,
+        "note": "page unchanged since the previous snapshot for this URL — pass force:true for the tree, or artifact/read for the stored copy",
+    });
+    if let Some(store) = artifacts {
+        let record = ArtifactRecord::new(
+            "snapshot",
+            ObservationKind::BrowserTree.as_str(),
+            "application/json",
+            Some(url.to_string()),
+            tree.to_string().into_bytes(),
+            store.config().ttl_secs,
+        );
+        let id = record.id.clone();
+        if matches!(store.put(record), Ok(true)) {
+            delta["artifact"] = json!(id);
+        }
+    }
+    Some(delta)
+}
+
 /// Tools whose output is worth bounding. Deliberately an allow-list: control,
 /// credential and form-filling tools (`vault/*`, `login`, `type`, `fill_form`,
 /// `cookies`, `runbook/*`) must never have their payload rewritten or stored.
@@ -1621,6 +1847,7 @@ fn tools_schema() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "url": { "type": "string" },
+                    "force": { "type": "boolean", "description": "Return the tree even if the page is unchanged since the previous snapshot." },
                     "max_nodes": { "type": "integer", "minimum": 10, "maximum": 2000, "default": 400 },
                     "engine": { "type": "string", "enum": ["auto", "fetch", "cdp"] }
                 },
@@ -2022,6 +2249,17 @@ fn tools_schema() -> Vec<Value> {
                 }
             }
         }),
+        // [Meta] — compact tool index + on-demand schemas.
+        json!({
+            "name": "tool/inspect",
+            "description": "[Meta] Return the full JSON Schema of a tool (or the compact index of every tool when `name` is omitted). Use it when the compact `tools/list` signature is not enough — parameter descriptions, defaults and long enums live here.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "tool name, e.g. navigate" }
+                }
+            }
+        }),
     ];
 
     // Tag each tool with its group (e.g. "[Read] ...") so agents can filter
@@ -2068,6 +2306,7 @@ fn tools_schema() -> Vec<Value> {
         ("artifact/read", "[Artifact]"),
         ("artifact/ask", "[Artifact]"),
         ("artifact/list", "[Artifact]"),
+        ("tool/inspect", "[Meta]"),
     ];
     for t in &mut tools {
         let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -2195,6 +2434,8 @@ mod tests {
                 vault: None,
                 max_tokens: DEFAULT_MAX_TOKENS,
                 artifacts: None,
+                lazy_tools: true,
+                snapshot_fingerprints: Arc::new(Mutex::new(HashMap::new())),
             },
         };
 
@@ -2229,6 +2470,15 @@ mod tests {
         assert_eq!(v["include_values"], false);
 
         backend.reset_browser().await;
+    }
+
+    /// The `args(...)` signature embedded in a compact tool description.
+    fn description_after_args(tool: &Value) -> String {
+        tool["description"]
+            .as_str()
+            .and_then(|text| text.split("args(").nth(1))
+            .map(|text| text.trim_end_matches(')').to_string())
+            .unwrap_or_default()
     }
 
     fn artifact_store(tag: &str) -> (Arc<ArtifactStore>, std::path::PathBuf) {
@@ -2420,5 +2670,148 @@ mod tests {
         assert_eq!(hits[0]["before"], "alpha beta");
         assert!(hits[0]["score"].as_f64().unwrap() >= hits[1]["score"].as_f64().unwrap());
         assert!(ask_passages(text, "", 2).is_empty());
+    }
+    #[test]
+    fn compact_tools_schema_keeps_arg_names_and_shrinks_hard() {
+        let full = tools_schema();
+        let compact = compact_tools_schema();
+        assert_eq!(full.len(), compact.len());
+        for (full_tool, compact_tool) in full.iter().zip(compact.iter()) {
+            assert_eq!(full_tool["name"], compact_tool["name"]);
+            // Every argument name survives — agents must still be able to call.
+            let full_props = full_tool["inputSchema"]["properties"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            let compact_props = compact_tool["inputSchema"]["properties"]
+                .as_object()
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(
+                full_props.keys().collect::<std::collections::BTreeSet<_>>(),
+                compact_props
+                    .keys()
+                    .collect::<std::collections::BTreeSet<_>>(),
+                "{} lost an argument",
+                full_tool["name"]
+            );
+            // `required` is not repeated; the signature marks optional args
+            // with `?` and `tool/inspect` keeps the authoritative list.
+            let signature = description_after_args(compact_tool);
+            for name in full_tool["inputSchema"]["required"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+            {
+                let name = name.as_str().unwrap();
+                assert!(
+                    signature.split(", ").any(|arg| arg == name),
+                    "{name} must appear as required in `{signature}`"
+                );
+            }
+            // Prose is dropped, arg signature is inlined.
+            for spec in compact_props.values() {
+                assert!(
+                    spec.get("description").is_none(),
+                    "compact schema must not carry parameter prose"
+                );
+            }
+            let description = compact_tool["description"].as_str().unwrap();
+            assert!(description.chars().count() <= 140, "{description}");
+            if !full_props.is_empty() {
+                assert!(description.contains("args("), "{description}");
+            }
+        }
+        let full_size = serde_json::to_string(&full).unwrap().len();
+        let compact_size = serde_json::to_string(&compact).unwrap().len();
+        assert!(
+            compact_size * 2 <= full_size,
+            "expected >=50% smaller tools/list: {compact_size} vs {full_size}"
+        );
+    }
+
+    #[test]
+    fn arg_signature_marks_optional_args_and_caps_the_list() {
+        let tool = serde_json::json!({
+            "name": "example",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "engine": {"type": "string"},
+                    "mode": {"type": "string", "enum": ["a", "b"]}
+                },
+                "required": ["url"]
+            }
+        });
+        assert_eq!(arg_signature(&tool), "url, engine?, mode?");
+
+        let wide = serde_json::json!({
+            "name": "wide",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "a": {}, "b": {}, "c": {}, "d": {}, "e": {},
+                    "f": {}, "g": {}, "h": {}, "i": {}, "j": {}
+                }
+            }
+        });
+        let signature = arg_signature(&wide);
+        assert!(signature.ends_with("more"), "{signature}");
+        assert!(signature.matches(',').count() <= 4, "{signature}");
+    }
+
+    #[test]
+    fn snapshot_delta_fires_only_for_an_unchanged_big_tree() {
+        let cache = Mutex::new(HashMap::new());
+        let big = serde_json::json!({
+            "url": "https://example.test/",
+            "nodes": (0..600)
+                .map(|index| serde_json::json!({"uid": index, "role": "text", "text": format!("filler {index}")}))
+                .collect::<Vec<_>>(),
+        });
+        // First call: nothing to compare against.
+        assert!(snapshot_delta(&cache, "https://example.test/", &big, 256, None).is_none());
+        // Second call, identical content: a fingerprint instead of the tree.
+        let delta = snapshot_delta(&cache, "https://example.test/", &big, 256, None)
+            .expect("delta on unchanged page");
+        assert_eq!(delta["unchanged"], true);
+        assert!(delta["fingerprint"].as_str().unwrap().len() == 16);
+        assert!(estimate_tokens(&delta.to_string()) <= 60, "{delta}");
+        assert!(delta["note"].as_str().unwrap().contains("force:true"));
+        // Changed content: back to the full tree.
+        let mut changed = big.clone();
+        changed["nodes"][0]["text"] = serde_json::json!("different");
+        assert!(snapshot_delta(&cache, "https://example.test/", &changed, 256, None).is_none());
+        // Different URL keeps its own fingerprint.
+        assert!(snapshot_delta(&cache, "https://other.test/", &big, 256, None).is_none());
+    }
+
+    #[test]
+    fn snapshot_delta_is_skipped_for_small_trees_and_when_disabled() {
+        let cache = Mutex::new(HashMap::new());
+        let small = serde_json::json!({"url": "https://example.test/", "nodes": [{"uid": 1}]});
+        assert!(snapshot_delta(&cache, "https://example.test/", &small, 1000, None).is_none());
+        assert!(snapshot_delta(&cache, "https://example.test/", &small, 1000, None).is_none());
+        let big =
+            serde_json::json!({"nodes": vec![serde_json::json!({"text": "x".repeat(20_000)})]});
+        assert!(snapshot_delta(&cache, "https://example.test/", &big, 0, None).is_none());
+    }
+
+    #[test]
+    fn snapshot_delta_stores_the_tree_as_an_artifact() {
+        let (store, path) = artifact_store("delta");
+        let cache = Mutex::new(HashMap::new());
+        let big = serde_json::json!({
+            "url": "https://example.test/",
+            "nodes": vec![serde_json::json!({"text": "y".repeat(20_000)})],
+        });
+        assert!(snapshot_delta(&cache, "https://example.test/", &big, 256, Some(&store)).is_none());
+        let delta = snapshot_delta(&cache, "https://example.test/", &big, 256, Some(&store))
+            .expect("delta");
+        let id = delta["artifact"].as_str().expect("artifact id in delta");
+        let stored = store.get(id).expect("read").expect("stored");
+        assert_eq!(stored.text(), big.to_string());
+        let _ = std::fs::remove_file(path);
     }
 }

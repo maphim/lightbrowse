@@ -256,6 +256,10 @@ enum Cmd {
         /// $LIGHTBROWSE_MAX_TOKENS when the flag is not given.
         #[arg(long)]
         max_tokens: Option<usize>,
+        /// Send the full JSON Schema in tools/list instead of the compact
+        /// index (also $LIGHTBROWSE_FULL_TOOLS=1).
+        #[arg(long)]
+        full_tools: bool,
     },
     /// Ask a question about a page — fetch (or reuse cache), then return the
     /// most relevant text blocks with scores (intent-aware reading).
@@ -918,7 +922,11 @@ async fn main() -> lightbrowse_core::Result<()> {
                 }
             }
         }
-        Cmd::Mcp { engine, max_tokens } => {
+        Cmd::Mcp {
+            engine,
+            max_tokens,
+            full_tools,
+        } => {
             let session = Arc::new(Mutex::new(FetchBackend::new_session(Default::default())));
             // Encrypted credential vault (auto-creates key + vault file).
             let vault = match lightbrowse_core::vault::Vault::open(Default::default()) {
@@ -960,7 +968,15 @@ async fn main() -> lightbrowse_core::Result<()> {
                     None
                 }
             };
-            tracing::info!("tool output budget: {max_tokens} tokens (0 = unlimited)");
+            let full_tools = full_tools
+                || matches!(
+                    std::env::var("LIGHTBROWSE_FULL_TOOLS").as_deref(),
+                    Ok("1") | Ok("true")
+                );
+            tracing::info!(
+                "tool output budget: {max_tokens} tokens (0 = unlimited); tools/list schemas: {}",
+                if full_tools { "full" } else { "compact" }
+            );
             let mut server = lightbrowse_mcp::McpServer::new(
                 fetch,
                 Some(cdp_trait),
@@ -969,7 +985,8 @@ async fn main() -> lightbrowse_core::Result<()> {
                 Some(Arc::new(memory)),
                 vault,
             )
-            .with_budget(max_tokens);
+            .with_budget(max_tokens)
+            .with_lazy_tools(!full_tools);
             if let Some(artifacts) = artifacts {
                 server = server.with_artifacts(artifacts);
             }
