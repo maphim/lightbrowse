@@ -338,6 +338,16 @@ file first (asserted by a test that seeds a pre-migration DB).
 tests across the two crates (store roundtrip/read-your-writes/cap/TTL/LRU/reopen/versioning,
 allow-list, tree pruning with ancestors, array collapsing, payload roundtrip, no-op paths).
 
+### Verification notes
+
+Every number above comes from driving the real server over stdio
+(`lightbrowse mcp --memory <tmp db> --max-tokens 1000`, JSON-RPC `tools/call`), then reading the
+artifact back in a second process. Confirmed in the same runs: `artifact/read` returns the exact
+pre-reduction payload (recorded `tokens = 1078` for the `navigate` case), `artifact/ask` returns
+ranked passages with `before`/`after` context, `artifact/list` reports store totals, `--max-tokens 0`
+returns the full 41,947-token `extract` payload while storing **zero** artifacts, and an unknown
+artifact id returns a clean tool error (`isError: true`, "not found or expired").
+
 ### Still open (P2)
 
 - Snapshot fingerprint delta: an unchanged page should return ~15 tokens instead of a projection.
