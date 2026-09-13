@@ -18,7 +18,10 @@ use clap::{Parser, Subcommand};
 use lightbrowse_cdp::CdpBackend;
 use lightbrowse_core::backend::BrowserBackend;
 use lightbrowse_core::config::{Config, Engine};
-use lightbrowse_core::extract::{self, ExtractMode};
+use lightbrowse_core::extract::{self, ExtractMode, ExtractOutput};
+use lightbrowse_core::reduce::{
+    prune_snapshot, reduce_text, ObservationKind, PruneStats, ReduceConfig, Reduction,
+};
 use lightbrowse_core::snapshot::{self, SnapshotOptions};
 use lightbrowse_fetch::FetchBackend;
 use lightbrowse_memory::{navigate_cached, MemoryStore};
@@ -114,6 +117,9 @@ enum Cmd {
         raw: bool,
         #[arg(long, default_value = "auto", value_parser = parse_engine)]
         engine: Engine,
+        /// Token budget for the text preview (0 disables reduction).
+        #[arg(long, default_value_t = DEFAULT_PAGE_BUDGET)]
+        max_tokens: usize,
     },
     /// Extract structured data from a page.
     Extract {
@@ -123,6 +129,9 @@ enum Cmd {
         mode: String,
         #[arg(long, default_value = "auto", value_parser = parse_engine)]
         engine: Engine,
+        /// Token budget for `--mode text` output (0 disables reduction).
+        #[arg(long, default_value_t = DEFAULT_PAGE_BUDGET)]
+        max_tokens: usize,
     },
     /// Produce an accessibility-style snapshot tree for agents.
     Snapshot {
@@ -131,6 +140,9 @@ enum Cmd {
         max_nodes: Option<usize>,
         #[arg(long, default_value = "auto", value_parser = parse_engine)]
         engine: Engine,
+        /// Token budget for the tree (0 disables pruning).
+        #[arg(long, default_value_t = DEFAULT_PAGE_BUDGET)]
+        max_tokens: usize,
     },
     /// Human-like look: screenshot the ACTIVE tab with numbered SoM frames
     /// over interactive elements + a number→uid map. Vision LLMs pick numbers;
@@ -369,7 +381,12 @@ async fn main() -> lightbrowse_core::Result<()> {
     let ttl = cli.cache_ttl;
 
     match cli.cmd {
-        Cmd::Fetch { url, raw, engine } => {
+        Cmd::Fetch {
+            url,
+            raw,
+            engine,
+            max_tokens,
+        } => {
             let (page, cached) = nav_cached(
                 &memory,
                 &*fetch,
@@ -385,7 +402,9 @@ async fn main() -> lightbrowse_core::Result<()> {
                 return Ok(());
             }
             let t = extract::extract_text(&page.html);
-            let out = json!({
+            let cfg = ReduceConfig::with_max_tokens(max_tokens);
+            let reduction = reduce_text(&t.text, ObservationKind::PageText, &cfg);
+            let mut out = json!({
                 "url": page.url,
                 "title": t.title,
                 "status": page.status,
@@ -396,11 +415,17 @@ async fn main() -> lightbrowse_core::Result<()> {
                 "truncated": page.truncated,
                 "word_count": t.word_count,
                 "reading_time_secs": t.reading_time_secs,
-                "text_preview": t.text.chars().take(4000).collect::<String>(),
+                "text_preview": reduction.text,
             });
+            attach_reduction(&mut out, &reduction);
             print_json(&out);
         }
-        Cmd::Extract { url, mode, engine } => {
+        Cmd::Extract {
+            url,
+            mode,
+            engine,
+            max_tokens,
+        } => {
             let (page, _) = nav_cached(
                 &memory,
                 &*fetch,
@@ -412,18 +437,36 @@ async fn main() -> lightbrowse_core::Result<()> {
             )
             .await?;
             let mode = parse_mode(&mode)?;
-            let data = extract::extract(&page.html, &page.url, mode);
-            print_json(&json!({
+            let mut data = extract::extract(&page.html, &page.url, mode);
+            let reduction = if let ExtractOutput::Text(text) = &mut data {
+                let cfg = ReduceConfig::with_max_tokens(max_tokens);
+                let reduction = reduce_text(&text.text, ObservationKind::PageText, &cfg);
+                if reduction.truncated {
+                    // Keep only the blocks whose text survived the projection.
+                    let kept = reduction.text.clone();
+                    text.blocks.retain(|block| kept.contains(block.text.trim()));
+                    text.text = kept;
+                }
+                Some(reduction)
+            } else {
+                None
+            };
+            let mut out = json!({
                 "url": page.url,
                 "engine": engine_name(engine),
                 "mode": mode_str(mode),
                 "data": data
-            }));
+            });
+            if let Some(reduction) = &reduction {
+                attach_reduction(&mut out, reduction);
+            }
+            print_json(&out);
         }
         Cmd::Snapshot {
             url,
             max_nodes,
             engine,
+            max_tokens,
         } => {
             let (page, _) = nav_cached(
                 &memory,
@@ -440,7 +483,7 @@ async fn main() -> lightbrowse_core::Result<()> {
                 ..SnapshotOptions::default()
             };
             let tree = snapshot::snapshot(&page.html, &page.url, &opts);
-            print_json(&serde_json::to_value(tree).unwrap());
+            print_snapshot(tree, max_tokens);
         }
         Cmd::VisualSnapshot {
             url,
@@ -993,6 +1036,62 @@ fn mode_str(m: ExtractMode) -> &'static str {
 
 fn print_json(v: &Value) {
     println!("{}", serde_json::to_string_pretty(v).unwrap());
+}
+
+/// Default per-response token budget for page-level CLI output. Kept close to
+/// the historical 4000-character preview (~1000 tokens) so existing consumers
+/// see no growth, while heavy `extract`/`snapshot` output is bounded.
+const DEFAULT_PAGE_BUDGET: usize = 1000;
+
+/// Attach reduction metadata when a projection actually dropped content, so a
+/// caller can tell a bounded answer from a complete one.
+fn attach_reduction(out: &mut Value, reduction: &Reduction) {
+    if !reduction.truncated {
+        return;
+    }
+    if let Some(map) = out.as_object_mut() {
+        map.insert("reduction".to_string(), reduction_json(reduction));
+    }
+}
+
+fn reduction_json(reduction: &Reduction) -> Value {
+    json!({
+        "strategy": reduction.strategy,
+        "original_tokens": reduction.original_tokens,
+        "reduced_tokens": reduction.reduced_tokens,
+        "saved_tokens": reduction.saved_tokens(),
+        "truncated": reduction.truncated,
+        "id": reduction.id,
+        "marker": reduction.marker(),
+    })
+}
+
+fn prune_stats_json(stats: &PruneStats) -> Value {
+    json!({
+        "strategy": stats.strategy,
+        "original_nodes": stats.original_nodes,
+        "kept_nodes": stats.kept_nodes,
+        "removed_nodes": stats.removed_nodes,
+        "original_tokens": stats.original_tokens,
+        "reduced_tokens": stats.reduced_tokens,
+        "saved_tokens": stats.original_tokens.saturating_sub(stats.reduced_tokens),
+        "truncated": stats.truncated,
+    })
+}
+
+/// Print a snapshot tree, pruning it to the token budget first. The tree keeps
+/// its structure and `uid`/`selector` values; only low-signal nodes are dropped
+/// (never the ancestors of a kept node).
+fn print_snapshot(mut tree: snapshot::SnapshotTree, max_tokens: usize) {
+    let cfg = ReduceConfig::with_max_tokens(max_tokens);
+    let stats = prune_snapshot(&mut tree, &cfg);
+    let mut out = serde_json::to_value(&tree).unwrap();
+    if stats.truncated {
+        if let Some(map) = out.as_object_mut() {
+            map.insert("reduction".to_string(), prune_stats_json(&stats));
+        }
+    }
+    print_json(&out);
 }
 
 /// Resolve a password that may arrive on argv (visible in `ps` / shell history)
