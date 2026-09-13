@@ -216,6 +216,16 @@ impl MemoryStore {
             conn.last_insert_rowid()
         };
 
+        // Keep the raw HTML so a cache hit can still be snapshotted/extracted.
+        // (`blocks` alone are plain text: rebuilding HTML from them loses every
+        // element, which silently broke `snapshot`/`extract links` on cache hits.)
+        conn.execute(
+            "INSERT INTO html_cache (page_id, html) VALUES (?1, ?2)
+             ON CONFLICT(page_id) DO UPDATE SET html = excluded.html",
+            params![page_id, page.html],
+        )
+        .map_err(|e| Error::Parse(e.to_string()))?;
+
         // Replace blocks (delete + insert keeps FTS trigger simple).
         conn.execute("DELETE FROM blocks WHERE page_id=?1", params![page_id])
             .map_err(|e| Error::Parse(e.to_string()))?;
@@ -275,16 +285,51 @@ impl MemoryStore {
             Err(e) => return Err(Error::Parse(e.to_string())),
         };
         drop(conn);
-        // Reopen connection read for the HTML (blocks alone don't hold it).
-        let conn = self.conn.lock().unwrap();
-        let html: String = conn
+        // Prefer the stored raw HTML: rebuilding a page from `blocks` keeps the
+        // text but loses the element structure, so `snapshot` and
+        // `extract --mode links|forms|meta` would return nothing on a cache hit.
+        let html = match self.stored_html(&meta.url)? {
+            Some(html) => html,
+            // Legacy rows written before html_cache existed: fall back to the
+            // text blocks rather than failing the read.
+            None => self.cached_text(&meta.url)?,
+        };
+        Ok(Some(CachedPage { meta, html }))
+    }
+
+    /// Raw HTML stored for `url`, when the page was cached after `html_cache`
+    /// existed (schema v2 behaviour).
+    fn stored_html(&self, url: &str) -> Result<Option<String>> {
+        self.conn
+            .lock()
+            .unwrap()
             .query_row(
-                "SELECT group_concat(text, char(10)) FROM blocks WHERE page_id = (SELECT id FROM pages WHERE url=?1) ORDER BY position",
-                params![meta.url],
+                "SELECT h.html FROM html_cache h
+                 JOIN pages p ON p.id = h.page_id
+                 WHERE p.url = ?1",
+                params![url],
                 |r| r.get(0),
             )
-            .map_err(|e| Error::Parse(e.to_string()))?;
-        Ok(Some(CachedPage { meta, html }))
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(Error::Parse(other.to_string())),
+            })
+    }
+
+    /// Text-only fallback for legacy cache rows (no stored HTML).
+    fn cached_text(&self, url: &str) -> Result<String> {
+        self.conn
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT group_concat(text, char(10)) FROM blocks
+                 WHERE page_id = (SELECT id FROM pages WHERE url=?1)
+                 ORDER BY position",
+                params![url],
+                |r| r.get(0),
+            )
+            .map_err(|e| Error::Parse(e.to_string()))
     }
 
     /// BM25 search over everything we've read. Falls back to a token
@@ -697,5 +742,73 @@ mod tests {
         let recent = m.recent(5).unwrap();
         assert_eq!(recent.len(), 2);
         assert!(recent[0].url.ends_with("/2"));
+    }
+
+    #[test]
+    fn cache_hit_keeps_html_structure_for_snapshot_and_links() {
+        use lightbrowse_core::snapshot::{snapshot, SnapshotOptions};
+        let store = MemoryStore::open(None).unwrap();
+        let html = r#"<html><head><title>Cached</title></head><body>
+            <a href="/one">One</a><a href="/two">Two</a>
+            <form action="/s"><input name="q"></form>
+        </body></html>"#;
+        let page = test_page("https://cache.test/page", html);
+        store.store_page(&page).unwrap();
+        store
+            .set_cache("https://cache.test/page", None, 300)
+            .unwrap();
+
+        let cached = store
+            .find_cached("https://cache.test/page", None)
+            .unwrap()
+            .expect("cache hit");
+        assert!(
+            cached.html.contains("One</a>"),
+            "raw HTML must survive the cache"
+        );
+        assert!(
+            cached.html.contains("<form"),
+            "form markup must survive the cache"
+        );
+        let rebuilt = cached.html_to_page();
+        assert_eq!(rebuilt.title, "Test", "the cached page metadata is reused");
+
+        // Structure-dependent readers must still work from the cache.
+        let tree = snapshot(&rebuilt.html, &rebuilt.url, &SnapshotOptions::default());
+        assert!(
+            tree.node_count > 0,
+            "snapshot from cache must not be empty: {tree:?}"
+        );
+        let links = extract::extract_links(&rebuilt.html, &rebuilt.url);
+        assert_eq!(links.len(), 2, "links must survive a cache hit");
+    }
+
+    #[test]
+    fn legacy_cache_rows_without_html_fall_back_to_text() {
+        let store = MemoryStore::open(None).unwrap();
+        let page = test_page(
+            "https://legacy.test/page",
+            "<html><body><p>only text</p></body></html>",
+        );
+        store.store_page(&page).unwrap();
+        store
+            .set_cache("https://legacy.test/page", None, 300)
+            .unwrap();
+        // Simulate a pre-html_cache row.
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM html_cache", [])
+            .unwrap();
+        let cached = store
+            .find_cached("https://legacy.test/page", None)
+            .unwrap()
+            .expect("cache hit");
+        assert!(
+            cached.html.contains("only text"),
+            "text fallback keeps content readable: {:?}",
+            cached.html
+        );
     }
 }
