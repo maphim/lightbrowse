@@ -15,6 +15,7 @@ pub mod error;
 pub mod extract;
 pub mod page;
 pub mod proxy;
+pub mod reduce;
 pub mod service;
 pub mod session;
 pub mod snapshot;
@@ -28,4 +29,8 @@ pub use config::{Config, Engine};
 pub use error::{Error, Result};
 pub use page::Page;
 pub use proxy::{parse_proxy, ProxyKind, ProxySpec};
+pub use reduce::{
+    estimate_tokens, prune_snapshot, reduce_text, ObservationKind, PruneStats, ReduceConfig,
+    ReduceStrategy, Reduction,
+};
 pub use session::{Session, SessionOptions};

@@ -119,6 +119,11 @@ lightbrowse search   "rust async runtime"
 lightbrowse fetch    https://spa.example --engine cdp
 lightbrowse fetch    https://spa.example --engine auto   # auto-fallback
 
+# CLI — token budget (default 1000 tokens/response, 0 disables)
+lightbrowse extract  https://example.com --max-tokens 500
+lightbrowse snapshot https://example.com --max-tokens 1000
+lightbrowse fetch    https://example.com --max-tokens 0   # complete text
+
 # HTTP API
 lightbrowse serve --port 8787 --engine auto --idle-timeout 30
 curl 'http://127.0.0.1:8787/v1/extract?url=https://example.com&mode=meta'
