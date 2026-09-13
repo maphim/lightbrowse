@@ -1,6 +1,6 @@
 # Context Surface Plan — token-bounded tool output for lightbrowse
 
-Status: **P0 implemented** — `lightbrowse-core::reduce` + CLI `--max-tokens` (see §9 for measured results); P1/P2 still proposal
+Status: **P0 + P1 implemented** — `lightbrowse-core::reduce`, CLI `--max-tokens`, artifact store in `lightbrowse-memory::artifacts`, MCP interception + `artifact/*` tools (see §9 and §10); P2 (snapshot delta, lazy schemas) still proposal
 Source of the mechanism: `codelocal-cloud/codelocal` (Go, Apache-2.0, v1.5.64) — `internal/contextsurface/*`, `internal/projectbrain/compiler.go`, `internal/mcphub/*`
 Target: lightbrowse v0.5.2 (Rust workspace, ~12.6k LOC)
 
@@ -292,3 +292,55 @@ dropped content carries `reduction {strategy, original_tokens, reduced_tokens, s
 
 Not yet done (P1/P2): artifact handles (`artifact/read`, `artifact/ask`) so a reduced projection can be
 expanded again, snapshot fingerprint deltas, MCP-side interception, and lazy `tools/list` schemas.
+
+## 10. P1 results (implemented, measured)
+
+### Artifact store — `lightbrowse-memory::artifacts`
+
+`raw_artifacts` (schema `user_version = 2`, WAL, 5s busy timeout) shared with the page cache in
+the same SQLite file. Writes are **asynchronous**: `put` enqueues to a writer thread that owns its
+own connection, and a pending map serves reads immediately after a write (read-your-writes) until
+the row is durable. Expiry is 24h by default, enforced on open, hourly in the writer, and via
+`purge_expired`; a 512 MB total cap evicts oldest-first (checked on every write against a running
+total); a payload over 10 MB is **refused** (`put` returns `false`) rather than truncated, so a
+caller never hands the model a lossy answer with no handle.
+
+Schema versioning stayed safe: `ensure_schema` is shared by `MemoryStore` and the artifact writer,
+so the `user_version = 1` legacy `login-*` scrub still runs even when the artifact store opens the
+file first (asserted by a test that seeds a pre-migration DB).
+
+### MCP interception
+
+`McpServer::bound_output` wraps the single `tools/call` choke point. Rules:
+
+- **Allow-list only** (`navigate`, `extract`, `ask`, `snapshot`, `visual_snapshot`, `page/current`,
+  `evaluate`, `search`, `research`, `memory/search`). `vault/*`, `login`, `type`, `fill_form`,
+  `cookies`, `runbook/*`, `screenshot` and `artifact/read` are never reduced or stored.
+- **Recoverable-or-nothing**: the full payload is stored as an artifact *before* the reduced
+  response is returned; if storage fails or the payload exceeds the cap, the full response is
+  returned unchanged.
+- Projection keeps **valid JSON**: snapshot trees are pruned structurally (ancestor guard intact),
+  oversized arrays are collapsed to their leading items plus a marker, and long string fields are
+  ranked-projected. The `reduction` object carries strategy, token counts, artifact id and marker.
+- Disabled with `--max-tokens 0` or `$LIGHTBROWSE_MAX_TOKENS=0`; default **1000**.
+
+### Measured end-to-end (MCP over stdio, `--max-tokens 1000`)
+
+| Tool call | Before | After | Saved |
+|---|---|---|---|
+| `extract` (Wikipedia article, mode=text) | 41,947 tok | 1,062 tok | **97%** |
+| `extract --mode links` (rust std index, 900 links) | 11,508 tok | 529 tok | **95%** |
+| `snapshot` (rust std index, 900 nodes) | 81,825 tok | 487 tok | **99%** |
+| `navigate` (Wikipedia article) | 1,078 tok | 929 tok | 13% |
+
+`artifact/read` returned the byte-identical pre-reduction payload (recorded `tokens = 1078`),
+`artifact/ask` returned ranked passages, `artifact/list` reported the store totals. 13 new unit
+tests across the two crates (store roundtrip/read-your-writes/cap/TTL/LRU/reopen/versioning,
+allow-list, tree pruning with ancestors, array collapsing, payload roundtrip, no-op paths).
+
+### Still open (P2)
+
+- Snapshot fingerprint delta: an unchanged page should return ~15 tokens instead of a projection.
+- Lazy `tools/list`: 37 tool schemas (~470 lines) ship at session start today; names + one-line
+  summaries with full schema behind `tool/inspect` would cut startup context by ~50%.
+- Array marker as a non-string element if a host rejects mixed arrays.

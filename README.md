@@ -164,13 +164,50 @@ Available tools:
 | `runbook/save` \| `run` \| `get` \| `list` | record & replay action recipes (login flows) |
 | `memory/search(query)` / `memory/recent(limit?)` | BM25 search over everything read |
 | `search(query, max_results?)` | DuckDuckGo results (title/url/snippet) |
+| `artifact/read(id, offset?, max_chars?)` | the **complete** payload behind a reduced response |
+| `artifact/ask(id, question, limit?)` | ranked passages from a stored artifact (no re-fetch) |
+| `artifact/list(limit?, tool?)` | what is still expandable + store totals |
 
 **Agent interaction loop:** `navigate(url, engine="cdp")` → `snapshot()` → act
 (`click`/`type`/`submit` with a snapshot `selector`) → `page/current` to see
 the result. `engine="cdp"` keeps the tab open; cached pages are read-only.
 
 `engine` is `auto` by default: fetch first, headless Chromium fallback for
-JS-rendered pages.`
+JS-rendered pages.
+
+### Token budget (on by default)
+
+Tool output is bounded to **1000 tokens per response** so a large page cannot
+blow the model's context. Responses that were shortened carry a `reduction`
+object with the exact numbers and an artifact handle:
+
+```json
+"reduction": {
+  "strategy": "ranked", "original_tokens": 41947, "reduced_tokens": 1062,
+  "saved_tokens": 40885, "artifact": "obs_232fa4c8f2527962",
+  "marker": "[reduced 41947→1062 tokens · full response: artifact/read id=obs_…]"
+}
+```
+
+- `artifact/read id=obs_…` returns the exact original JSON; `artifact/ask` pulls
+  passages out of it without re-fetching the page.
+- Reduction is **only** applied when the complete payload has been stored, so a
+  bounded answer is always recoverable. Credential and control-plane tools
+  (`vault/*`, `login`, `type`, `fill_form`, `cookies`, `runbook/*`, `screenshot`)
+  are never reduced or stored.
+- Configure with `lightbrowse mcp --max-tokens <n>` or `$LIGHTBROWSE_MAX_TOKENS`
+  (`0` disables). Artifacts live in the same SQLite file as browsing memory
+  (`--memory`), expire after 24h, are evicted LRU-style past 512 MB, and never
+  store a payload over 10 MB.
+
+Measured with `--max-tokens 1000` (tokens ≈ output bytes / 4):
+
+| Tool call | Before | After | Saved |
+|---|---|---|---|
+| `extract` (article text) | 41,947 | 1,062 | **97%** |
+| `extract --mode links` (900 links) | 11,508 | 529 | **95%** |
+| `snapshot` (900 nodes) | 81,825 | 487 | **99%** |
+| `navigate` | 1,078 | 929 | 13% (preview is already capped) |
 
 ### HTTP API
 
