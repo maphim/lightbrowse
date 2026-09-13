@@ -252,6 +252,10 @@ enum Cmd {
     Mcp {
         #[arg(long, default_value = "auto", value_parser = parse_engine)]
         engine: Engine,
+        /// Token budget for tool output (0 disables). Default 1000, or
+        /// $LIGHTBROWSE_MAX_TOKENS when the flag is not given.
+        #[arg(long)]
+        max_tokens: Option<usize>,
     },
     /// Ask a question about a page — fetch (or reuse cache), then return the
     /// most relevant text blocks with scores (intent-aware reading).
@@ -914,7 +918,7 @@ async fn main() -> lightbrowse_core::Result<()> {
                 }
             }
         }
-        Cmd::Mcp { engine } => {
+        Cmd::Mcp { engine, max_tokens } => {
             let session = Arc::new(Mutex::new(FetchBackend::new_session(Default::default())));
             // Encrypted credential vault (auto-creates key + vault file).
             let vault = match lightbrowse_core::vault::Vault::open(Default::default()) {
@@ -927,14 +931,48 @@ async fn main() -> lightbrowse_core::Result<()> {
                     None
                 }
             };
-            let server = lightbrowse_mcp::McpServer::new(
+            // Per-response token budget: --max-tokens wins over the env var.
+            let max_tokens = max_tokens
+                .or_else(|| {
+                    std::env::var("LIGHTBROWSE_MAX_TOKENS")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                })
+                .unwrap_or(lightbrowse_mcp::DEFAULT_MAX_TOKENS);
+            // Raw-artifact store (same SQLite file as browsing memory). Without
+            // it the server never reduces output — a bounded response must stay
+            // expandable via artifact/read.
+            let artifacts = match lightbrowse_memory::ArtifactStore::open(
+                &memory_db_path(cli.memory.as_deref()),
+                lightbrowse_memory::ArtifactConfig::default(),
+            ) {
+                Ok(store) => {
+                    if let Ok((count, bytes)) = store.stats() {
+                        tracing::info!(
+                            "artifacts: {count} stored ({bytes} bytes), ttl {}s",
+                            store.config().ttl_secs
+                        );
+                    }
+                    Some(Arc::new(store))
+                }
+                Err(e) => {
+                    tracing::warn!("artifacts: unavailable — {e}");
+                    None
+                }
+            };
+            tracing::info!("tool output budget: {max_tokens} tokens (0 = unlimited)");
+            let mut server = lightbrowse_mcp::McpServer::new(
                 fetch,
                 Some(cdp_trait),
                 session,
                 engine,
                 Some(Arc::new(memory)),
                 vault,
-            );
+            )
+            .with_budget(max_tokens);
+            if let Some(artifacts) = artifacts {
+                server = server.with_artifacts(artifacts);
+            }
             server.run().await?;
         }
     }

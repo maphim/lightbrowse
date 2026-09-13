@@ -21,6 +21,10 @@ use lightbrowse_core::page::Page;
 use rusqlite::{params, Connection};
 use serde::Serialize;
 
+pub mod artifacts;
+
+pub use artifacts::{ArtifactConfig, ArtifactMeta, ArtifactRecord, ArtifactStore};
+
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS pages (
     id          INTEGER PRIMARY KEY,
@@ -62,6 +66,21 @@ CREATE TABLE IF NOT EXISTS runbooks (
     last_used_at    INTEGER NOT NULL,
     success_count   INTEGER NOT NULL DEFAULT 0
 );
+-- Content-addressed raw payloads behind reduced tool output (see artifacts.rs).
+CREATE TABLE IF NOT EXISTS raw_artifacts (
+    id           TEXT PRIMARY KEY,
+    tool         TEXT NOT NULL,
+    kind         TEXT NOT NULL,
+    url          TEXT,
+    content_type TEXT NOT NULL,
+    bytes        BLOB NOT NULL,
+    bytes_len    INTEGER NOT NULL,
+    tokens       INTEGER NOT NULL,
+    created_at   INTEGER NOT NULL,
+    expires_at   INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_raw_artifacts_expires ON raw_artifacts(expires_at);
+CREATE INDEX IF NOT EXISTS idx_raw_artifacts_tool ON raw_artifacts(tool, created_at);
 CREATE TRIGGER IF NOT EXISTS blocks_ai AFTER INSERT ON blocks BEGIN
     INSERT INTO blocks_fts(rowid, text) VALUES (new.id, new.text);
 END;
@@ -69,6 +88,40 @@ CREATE TRIGGER IF NOT EXISTS blocks_ad AFTER DELETE ON blocks BEGIN
     INSERT INTO blocks_fts(blocks_fts, rowid, text) VALUES ('delete', old.id, old.text);
 END;
 "#;
+
+/// Apply the schema and run version-gated migrations.
+///
+/// `user_version` history: `1` removed legacy `login-*` runbooks that could
+/// hold plaintext secrets; `2` added the `raw_artifacts` table. Both the
+/// `MemoryStore` and the [`ArtifactStore`] writer call this, so whichever opens
+/// the file first runs the pending migrations — no gate is ever skipped.
+pub(crate) fn ensure_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(SCHEMA)
+        .map_err(|e| Error::Parse(format!("memory schema: {e}")))?;
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    if version < 1 {
+        // ONE-TIME migration: `login-*` runbooks auto-saved before secret
+        // redaction existed may hold a plaintext password in the (unencrypted)
+        // steps JSON. They are regenerated on the next successful login. This
+        // must NOT run on every open — otherwise freshly saved (already
+        // redacted) login runbooks would be wiped before they could replay.
+        let removed = conn
+            .execute("DELETE FROM runbooks WHERE name LIKE 'login-%'", [])
+            .unwrap_or(0);
+        if removed > 0 {
+            tracing::warn!(
+                "memory: removed {removed} legacy login-* runbook(s) that may have stored plaintext secrets"
+            );
+        }
+        let _ = conn.execute_batch("PRAGMA user_version = 1");
+    }
+    if version < 2 {
+        let _ = conn.execute_batch("PRAGMA user_version = 2");
+    }
+    Ok(())
+}
 
 /// Maximum blocks stored per page (protects the index from huge pages).
 const MAX_BLOCKS_PER_PAGE: usize = 300;
@@ -117,28 +170,12 @@ impl MemoryStore {
             None => Connection::open_in_memory(),
         }
         .map_err(|e| Error::Io(std::io::Error::other(e.to_string())))?;
-        conn.execute_batch(SCHEMA)
-            .map_err(|e| Error::Parse(format!("memory schema: {e}")))?;
-        // ONE-TIME migration (gated by PRAGMA user_version): `login-*`
-        // runbooks auto-saved before secret redaction existed may hold a
-        // plaintext password in the (unencrypted) steps JSON. They are
-        // regenerated on the next successful login. This must NOT run on every
-        // open — otherwise freshly saved (already redacted) login runbooks
-        // would be wiped before they could ever replay.
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))
-            .unwrap_or(0);
-        if version < 1 {
-            let removed = conn
-                .execute("DELETE FROM runbooks WHERE name LIKE 'login-%'", [])
-                .unwrap_or(0);
-            if removed > 0 {
-                tracing::warn!(
-                    "memory: removed {removed} legacy login-* runbook(s) that may have stored plaintext secrets"
-                );
-            }
-            let _ = conn.execute_batch("PRAGMA user_version = 1");
-        }
+        // WAL + a busy timeout let the artifact writer (a second connection to
+        // the same file) coexist with page-cache writes.
+        let _ = conn.busy_timeout(Duration::from_secs(5));
+        let _ = conn.pragma_update(None, "journal_mode", "WAL");
+        let _ = conn.pragma_update(None, "synchronous", "NORMAL");
+        ensure_schema(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

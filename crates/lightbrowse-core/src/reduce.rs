@@ -216,6 +216,8 @@ pub enum ReduceStrategy {
     TreeRanked,
     /// Tree: no signal; kept document-order nodes until the budget filled.
     TreeFirstN,
+    /// Oversized JSON arrays were collapsed to their leading items.
+    ArrayCollapsed,
 }
 
 /// A bounded projection of one tool output.
@@ -248,6 +250,7 @@ impl Reduction {
             ReduceStrategy::HeadTail => "head_tail",
             ReduceStrategy::TreeRanked => "tree_ranked",
             ReduceStrategy::TreeFirstN => "tree_first_n",
+            ReduceStrategy::ArrayCollapsed => "array_collapsed",
         };
         format!(
             "[reduced {}→{} tokens · {} · id={}]",
