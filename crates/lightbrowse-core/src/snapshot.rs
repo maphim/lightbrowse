@@ -8,14 +8,14 @@
 use std::collections::HashMap;
 
 use scraper::{ElementRef, Html, Node, Selector};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::extract::is_visible;
 
 /// Viewport-relative bounding box (CSS px, top-left origin) of a snapshot
 /// node. Populated only when a live renderer (CDP) can provide layout info;
 /// the pure-fetch engine omits it.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
 pub struct Bbox {
     pub x: f64,
     pub y: f64,
@@ -41,7 +41,7 @@ impl Default for SnapshotOptions {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SnapshotNode {
     /// Stable, document-scoped id (assigned in traversal order).
     pub uid: u64,
@@ -77,7 +77,7 @@ pub struct SnapshotNode {
     pub children: Vec<SnapshotNode>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SnapshotTree {
     pub url: String,
     pub title: String,

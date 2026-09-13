@@ -11,15 +11,35 @@ use std::sync::{Arc, Mutex};
 use lightbrowse_core::backend::BrowserBackend;
 use lightbrowse_core::config::Engine;
 use lightbrowse_core::extract::{self, ExtractMode};
+use lightbrowse_core::reduce::{
+    estimate_tokens, prune_snapshot, reduce_text, ObservationKind, ReduceConfig,
+};
 use lightbrowse_core::session::Session;
-use lightbrowse_core::snapshot::{self, SnapshotOptions};
+use lightbrowse_core::snapshot::{self, SnapshotOptions, SnapshotTree};
 use lightbrowse_core::vision;
-use lightbrowse_memory::{navigate_cached, MemoryStore};
+use lightbrowse_memory::{navigate_cached, ArtifactRecord, ArtifactStore, MemoryStore};
 use serde_json::{json, Map, Value};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 pub const PROTOCOL_VERSION: &str = "2025-06-18";
 const TEXT_PREVIEW_CHARS: usize = 4000;
+/// Default per-response token budget for tool output (`0` disables).
+pub const DEFAULT_MAX_TOKENS: usize = 1000;
+/// Only responses long enough to matter are reduced.
+const BUDGETABLE_TOOLS: &[&str] = &[
+    "navigate",
+    "extract",
+    "ask",
+    "snapshot",
+    "visual_snapshot",
+    "page/current",
+    "evaluate",
+    "search",
+    "research",
+    "memory/search",
+];
+/// Strings shorter than this are never reduced on their own.
+const MIN_STRING_TOKENS: usize = 128;
 
 /// Server instructions (MCP `instructions://main` resource). Hosts that
 /// support it inject this into the model's system context — it frames the
@@ -69,6 +89,12 @@ pub struct McpState {
     pub memory: Option<Arc<MemoryStore>>,
     /// Encrypted credential vault (None when unavailable).
     pub vault: Option<Arc<lightbrowse_core::vault::Vault>>,
+    /// Token budget for tool output. `0` disables reduction entirely.
+    pub max_tokens: usize,
+    /// Raw-artifact store backing the reduction. Reduction is only applied when
+    /// a store is present, so a bounded projection always has a handle to the
+    /// complete response.
+    pub artifacts: Option<Arc<ArtifactStore>>,
 }
 
 pub struct McpServer {
@@ -92,8 +118,23 @@ impl McpServer {
                 engine,
                 memory,
                 vault,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                artifacts: None,
             },
         }
+    }
+
+    /// Set the per-response token budget (`0` disables reduction).
+    pub fn with_budget(mut self, max_tokens: usize) -> Self {
+        self.state.max_tokens = max_tokens;
+        self
+    }
+
+    /// Attach the raw-artifact store. Without it no output is ever reduced —
+    /// a bounded projection must always be recoverable via `artifact/read`.
+    pub fn with_artifacts(mut self, artifacts: Arc<ArtifactStore>) -> Self {
+        self.state.artifacts = Some(artifacts);
+        self
     }
 
     /// Serve MCP over stdio until stdin closes.
@@ -178,6 +219,7 @@ impl McpServer {
                     .and_then(|p| p.get("arguments").and_then(|a| a.as_object()).cloned())
                     .unwrap_or_default();
                 let result = self.call_tool(&name, &args).await;
+                let result = result.map(|text| self.bound_output(&name, text));
                 Some(match result {
                     Ok(text) => json!({
                         "jsonrpc": "2.0",
@@ -352,6 +394,83 @@ impl McpServer {
                         "network/capture action must be start|stop|flush|log, got {other}"
                     )),
                 }
+            }
+            "artifact/read" => {
+                let store = s.artifacts.as_ref().ok_or("artifact store disabled")?;
+                let id = req_str(args, "id")?;
+                let record = store
+                    .get(&id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("artifact '{id}' not found or expired"))?;
+                let text = record.text();
+                let total_chars = text.chars().count();
+                let offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                let max_chars = args
+                    .get("max_chars")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| (v as usize).clamp(1, 5_000_000));
+                let body: String = match (offset, max_chars) {
+                    (0, None) => text.clone(),
+                    (offset, max) => text
+                        .chars()
+                        .skip(offset)
+                        .take(max.unwrap_or_else(|| total_chars.saturating_sub(offset)))
+                        .collect(),
+                };
+                Ok(pretty(&json!({
+                    "id": record.id,
+                    "tool": record.tool,
+                    "kind": record.kind,
+                    "content_type": record.content_type,
+                    "url": record.url,
+                    "tokens": record.tokens,
+                    "created_at": record.created_at,
+                    "expires_at": record.expires_at,
+                    "offset": offset,
+                    "returned_chars": body.chars().count(),
+                    "total_chars": total_chars,
+                    "text": body,
+                })))
+            }
+            "artifact/ask" => {
+                let store = s.artifacts.as_ref().ok_or("artifact store disabled")?;
+                let id = req_str(args, "id")?;
+                let question = req_str(args, "question")?;
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(8)
+                    .clamp(1, 50) as usize;
+                let record = store
+                    .get(&id)
+                    .map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("artifact '{id}' not found or expired"))?;
+                let hits = ask_passages(&record.text(), &question, limit);
+                Ok(pretty(&json!({
+                    "id": id,
+                    "question": question,
+                    "hits": hits,
+                    "note": "passages ranked from the stored artifact text (no model call)",
+                })))
+            }
+            "artifact/list" => {
+                let store = s.artifacts.as_ref().ok_or("artifact store disabled")?;
+                let limit = args
+                    .get("limit")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(20)
+                    .clamp(1, 200) as usize;
+                let tool = opt_str(args, "tool");
+                let items = store
+                    .list(limit, tool.as_deref())
+                    .map_err(|e| e.to_string())?;
+                let (stored_count, stored_bytes) = store.stats().map_err(|e| e.to_string())?;
+                Ok(pretty(&json!({
+                    "artifacts": items,
+                    "count": items.len(),
+                    "stored_count": stored_count,
+                    "stored_bytes": stored_bytes,
+                })))
             }
             "help" => Ok(pretty(&json!({
                 "about": "lightbrowse — featherweight browser MCP. 35 tools in 7 groups.",
@@ -1185,6 +1304,266 @@ fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_else(|_| "{}".into())
 }
 
+/// Tools whose output is worth bounding. Deliberately an allow-list: control,
+/// credential and form-filling tools (`vault/*`, `login`, `type`, `fill_form`,
+/// `cookies`, `runbook/*`) must never have their payload rewritten or stored.
+fn is_budgetable(tool: &str) -> bool {
+    BUDGETABLE_TOOLS.contains(&tool)
+}
+
+/// Collect JSON pointers of every long string value (recursively).
+fn collect_long_strings(value: &Value, path: &str, out: &mut Vec<(String, usize)>) {
+    match value {
+        Value::String(text) => {
+            let tokens = estimate_tokens(text);
+            if tokens > MIN_STRING_TOKENS {
+                out.push((path.to_string(), tokens));
+            }
+        }
+        Value::Object(map) => {
+            for (key, child) in map {
+                let escaped = key.replace('~', "~0").replace('/', "~1");
+                collect_long_strings(child, &format!("{path}/{escaped}"), out);
+            }
+        }
+        Value::Array(items) => {
+            for (index, child) in items.iter().enumerate() {
+                collect_long_strings(child, &format!("{path}/{index}"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collapse oversized arrays: keep the leading items that fit a share of the
+/// budget and append a marker, so `extract --mode links` on a 900-link page (or
+/// a 400-block article) cannot blow the context on its own.
+fn collapse_arrays(value: &mut Value, budget: usize) -> bool {
+    let share = (budget / 2).max(128);
+    let mut collapsed = false;
+    collapse_arrays_in(value, share, &mut collapsed);
+    collapsed
+}
+
+fn collapse_arrays_in(value: &mut Value, share: usize, collapsed: &mut bool) {
+    match value {
+        Value::Object(map) => {
+            for child in map.values_mut() {
+                if let Value::Array(items) = child {
+                    let total: usize = items
+                        .iter()
+                        .map(|item| estimate_tokens(&item.to_string()).max(1))
+                        .sum();
+                    if items.len() > 8 && total > share {
+                        let mut used = 0usize;
+                        let mut keep = 0usize;
+                        for item in items.iter() {
+                            let tokens = estimate_tokens(&item.to_string()).max(1);
+                            if used + tokens > share {
+                                break;
+                            }
+                            used += tokens;
+                            keep += 1;
+                        }
+                        let dropped = items.len() - keep;
+                        items.truncate(keep);
+                        items.push(Value::String(format!(
+                            "… {dropped} more items omitted (see reduction.artifact for the complete response)"
+                        )));
+                        *collapsed = true;
+                    }
+                }
+                collapse_arrays_in(child, share, collapsed);
+            }
+        }
+        Value::Array(items) => {
+            for child in items.iter_mut() {
+                collapse_arrays_in(child, share, collapsed);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Reduce a JSON payload in place, keeping it valid JSON.
+///
+/// Trees are pruned structurally (so a kept button keeps its ancestors); other
+/// payloads have their largest long string fields projected. Returns the
+/// strategy that was applied, or `None` when nothing was reduced.
+fn compact_payload(
+    payload: &str,
+    kind: ObservationKind,
+    cfg: &ReduceConfig,
+) -> Option<(Value, lightbrowse_core::reduce::ReduceStrategy)> {
+    let mut value: Value = serde_json::from_str(payload).ok()?;
+
+    if kind == ObservationKind::BrowserTree {
+        if let Ok(mut tree) = serde_json::from_value::<SnapshotTree>(value.clone()) {
+            let stats = prune_snapshot(&mut tree, cfg);
+            if !stats.truncated {
+                return None;
+            }
+            return Some((serde_json::to_value(&tree).ok()?, stats.strategy));
+        }
+    }
+
+    // Structural first: dropping 400 repeated array items saves more than any
+    // string projection, and keeps the remaining items untouched.
+    let arrays_collapsed = collapse_arrays(&mut value, cfg.max_tokens);
+
+    let mut pointers: Vec<(String, usize)> = Vec::new();
+    collect_long_strings(&value, "", &mut pointers);
+    if pointers.is_empty() && !arrays_collapsed {
+        return None;
+    }
+    // Biggest fields first; three is enough to cover the shapes we emit.
+    pointers.sort_by_key(|entry| std::cmp::Reverse(entry.1));
+    pointers.truncate(3);
+    let per_field = (cfg.max_tokens / pointers.len().max(1)).max(256);
+    let field_cfg = ReduceConfig::with_max_tokens(per_field);
+
+    let mut strategy = lightbrowse_core::reduce::ReduceStrategy::ArrayCollapsed;
+    let mut changed = arrays_collapsed;
+    for (pointer, _) in &pointers {
+        let Some(Value::String(text)) = value.pointer_mut(pointer) else {
+            continue;
+        };
+        let reduction = reduce_text(text, kind, &field_cfg);
+        if reduction.truncated {
+            *text = reduction.text.clone();
+            strategy = reduction.strategy;
+            changed = true;
+        }
+    }
+    if !changed {
+        return None;
+    }
+    Some((value, strategy))
+}
+
+/// Rank stored-artifact lines against a question. Deterministic, no model call.
+fn ask_passages(text: &str, question: &str, limit: usize) -> Vec<Value> {
+    let terms: Vec<String> = question
+        .to_lowercase()
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|term| term.len() > 1)
+        .map(|term| term.to_string())
+        .collect();
+    if terms.is_empty() {
+        return Vec::new();
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let mut scored: Vec<(usize, f64)> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let lower = line.to_lowercase();
+        let mut score = 0.0;
+        for term in &terms {
+            if lower.contains(term.as_str()) {
+                score += 1.0;
+            }
+        }
+        // Prefer lines that answer more than one term, and non-trivial lines.
+        if score > 0.0 {
+            score += (lower.matches(char::is_whitespace).count().min(40) as f64) / 40.0;
+            scored.push((index, score));
+        }
+    }
+    scored.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
+    scored.truncate(limit.clamp(1, 50));
+    scored
+        .into_iter()
+        .map(|(index, score)| {
+            json!({
+                "line": index + 1,
+                "score": (score * 100.0).round() / 100.0,
+                "text": lines[index],
+                "before": if index > 0 { lines[index - 1] } else { "" },
+                "after": lines.get(index + 1).copied().unwrap_or(""),
+            })
+        })
+        .collect()
+}
+
+/// Bound a payload to `cfg.max_tokens`, storing the complete version as an
+/// artifact first.
+///
+/// Returns the payload unchanged when: the tool is not allow-listed, the budget
+/// is disabled, the payload already fits, nothing could be reduced, or the
+/// artifact could not be stored. The last case matters — a lossy answer with no
+/// handle is worse than a large answer.
+fn bound_payload(tool: &str, payload: String, cfg: &ReduceConfig, store: &ArtifactStore) -> String {
+    {
+        if cfg.max_tokens == 0 || !is_budgetable(tool) {
+            return payload;
+        }
+        let original_tokens = estimate_tokens(&payload);
+        if original_tokens <= cfg.max_tokens {
+            return payload;
+        }
+        let kind = ObservationKind::classify(tool, "");
+        let Some((mut compacted, strategy)) = compact_payload(&payload, kind, cfg) else {
+            return payload;
+        };
+        let record = ArtifactRecord::new(
+            tool,
+            kind.as_str(),
+            "application/json",
+            None,
+            payload.clone().into_bytes(),
+            store.config().ttl_secs,
+        );
+        let id = record.id.clone();
+        let expires_at = record.expires_at;
+        if !matches!(store.put(record), Ok(true)) {
+            return payload;
+        }
+        let reduced_tokens = estimate_tokens(&compacted.to_string());
+        if reduced_tokens >= original_tokens {
+            return payload;
+        }
+        if let Value::Object(map) = &mut compacted {
+            map.insert(
+                "reduction".to_string(),
+                json!({
+                    "strategy": strategy,
+                    "original_tokens": original_tokens,
+                    "reduced_tokens": reduced_tokens,
+                    "saved_tokens": original_tokens.saturating_sub(reduced_tokens),
+                    "artifact": id,
+                    "expires_at": expires_at,
+                    "marker": format!(
+                        "[reduced {original_tokens}→{reduced_tokens} tokens · full response: artifact/read id={id}]"
+                    ),
+                }),
+            );
+        }
+        compacted.to_string()
+    }
+}
+
+impl McpServer {
+    /// Bound a tool response to `state.max_tokens`.
+    ///
+    /// Only called for allow-listed read tools, and only when an artifact store
+    /// is attached: the complete payload is stored first, so a reduced response
+    /// is always recoverable through `artifact/read`.
+    fn bound_output(&self, tool: &str, payload: String) -> String {
+        match self.state.artifacts.as_ref() {
+            Some(store) => bound_payload(
+                tool,
+                payload,
+                &ReduceConfig::with_max_tokens(self.state.max_tokens),
+                store,
+            ),
+            None => payload,
+        }
+    }
+}
+
 fn error_response(id: Option<Value>, code: i64, message: &str) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -1605,6 +1984,44 @@ fn tools_schema() -> Vec<Value> {
                 "required": ["name"]
             }
         }),
+        // [Artifact] — expand a reduced response again.
+        json!({
+            "name": "artifact/read",
+            "description": "[Artifact] Read the complete payload behind a reduced tool response. Responses carrying a `reduction.artifact` id were bounded to save tokens; call this with that id to get the exact original JSON. Optional `offset`/`max_chars` read a slice.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "artifact id from `reduction.artifact` (obs_...)" },
+                    "offset": { "type": "integer", "description": "character offset to start at", "minimum": 0 },
+                    "max_chars": { "type": "integer", "description": "maximum characters to return", "minimum": 1 }
+                },
+                "required": ["id"]
+            }
+        }),
+        json!({
+            "name": "artifact/ask",
+            "description": "[Artifact] Ask a question about a stored artifact: returns the best-matching passages (line + context) ranked deterministically, without re-fetching the page or calling a model.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "artifact id (obs_...)" },
+                    "question": { "type": "string", "description": "what to look for" },
+                    "limit": { "type": "integer", "description": "max passages (default 8, max 50)", "minimum": 1, "maximum": 50 }
+                },
+                "required": ["id", "question"]
+            }
+        }),
+        json!({
+            "name": "artifact/list",
+            "description": "[Artifact] List stored artifacts (newest first) with tool, kind, tokens and expiry, plus the store totals. Useful to check what is still expandable.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "limit": { "type": "integer", "description": "max entries (default 20, max 200)", "minimum": 1, "maximum": 200 },
+                    "tool": { "type": "string", "description": "only artifacts produced by this tool" }
+                }
+            }
+        }),
     ];
 
     // Tag each tool with its group (e.g. "[Read] ...") so agents can filter
@@ -1648,6 +2065,9 @@ fn tools_schema() -> Vec<Value> {
         ("vault/list", "[Vault]"),
         ("vault/get", "[Vault]"),
         ("vault/delete", "[Vault]"),
+        ("artifact/read", "[Artifact]"),
+        ("artifact/ask", "[Artifact]"),
+        ("artifact/list", "[Artifact]"),
     ];
     for t in &mut tools {
         let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -1773,6 +2193,8 @@ mod tests {
                 engine: Engine::Cdp,
                 memory: None,
                 vault: None,
+                max_tokens: DEFAULT_MAX_TOKENS,
+                artifacts: None,
             },
         };
 
@@ -1807,5 +2229,196 @@ mod tests {
         assert_eq!(v["include_values"], false);
 
         backend.reset_browser().await;
+    }
+
+    fn artifact_store(tag: &str) -> (Arc<ArtifactStore>, std::path::PathBuf) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("lightbrowse-mcp-{tag}-{unique}.db"));
+        let store = ArtifactStore::open(&path, lightbrowse_memory::ArtifactConfig::default())
+            .expect("open artifact store");
+        (Arc::new(store), path)
+    }
+
+    #[test]
+    fn only_read_tools_are_budgetable() {
+        for tool in ["navigate", "extract", "snapshot", "ask", "evaluate"] {
+            assert!(is_budgetable(tool), "{tool} should be budgetable");
+        }
+        // Credential- and control-plane tools must never be rewritten or stored.
+        for tool in [
+            "vault/get",
+            "vault/list",
+            "login",
+            "type",
+            "fill_form",
+            "cookies",
+            "runbook/get",
+            "artifact/read",
+            "screenshot",
+            "help",
+        ] {
+            assert!(!is_budgetable(tool), "{tool} must not be budgetable");
+        }
+    }
+
+    #[test]
+    fn compact_payload_reduces_the_largest_string_field() {
+        let big = (0..600)
+            .map(|index| format!("filler line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let payload = serde_json::json!({
+            "url": "https://example.test/",
+            "data": { "text": format!("{big}\nerror: something failed\n{big}") }
+        })
+        .to_string();
+        let cfg = ReduceConfig::with_max_tokens(256);
+        let (compacted, strategy) =
+            compact_payload(&payload, ObservationKind::PageText, &cfg).expect("reduced");
+        assert!(compacted["data"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("error: something failed"));
+        assert!(estimate_tokens(&compacted.to_string()) < estimate_tokens(&payload));
+        assert_ne!(
+            strategy,
+            lightbrowse_core::reduce::ReduceStrategy::Passthrough
+        );
+        // The projection stays valid JSON with the untouched fields intact.
+        assert_eq!(compacted["url"], "https://example.test/");
+        assert!(serde_json::from_str::<Value>(&compacted.to_string()).is_ok());
+    }
+
+    #[test]
+    fn compact_payload_prunes_snapshot_trees_with_ancestors() {
+        let mut nodes = Vec::new();
+        for index in 0..400 {
+            nodes.push(serde_json::json!({
+                "uid": index + 1, "role": "text", "tag": "div",
+                "text": format!("row {index} filler filler filler")
+            }));
+        }
+        nodes.push(serde_json::json!({
+            "uid": 9000, "role": "form", "tag": "form", "text": "Checkout",
+            "children": [{"uid": 9001, "role": "button", "tag": "button", "text": "Submit"}]
+        }));
+        let payload = serde_json::json!({
+            "url": "https://example.test/", "title": "Shop",
+            "nodes": nodes, "node_count": 401, "truncated": false
+        })
+        .to_string();
+        let cfg = ReduceConfig::with_max_tokens(256);
+        let (compacted, strategy) =
+            compact_payload(&payload, ObservationKind::BrowserTree, &cfg).expect("pruned");
+        assert_eq!(
+            strategy,
+            lightbrowse_core::reduce::ReduceStrategy::TreeRanked
+        );
+        let text = compacted.to_string();
+        assert!(text.contains("Submit"), "kept button must survive");
+        assert!(text.contains("Checkout"), "its form ancestor must survive");
+        assert!(
+            compacted["node_count"].as_u64().unwrap() < 401,
+            "node_count must be updated"
+        );
+    }
+
+    #[test]
+    fn compact_payload_collapses_large_arrays() {
+        let links: Vec<Value> = (0..900)
+            .map(|index| serde_json::json!({"href": format!("/page/{index}"), "text": format!("link {index}")}))
+            .collect();
+        let payload =
+            serde_json::json!({"url": "https://example.test/", "mode": "links", "data": links})
+                .to_string();
+        let cfg = ReduceConfig::with_max_tokens(256);
+        let (compacted, _) =
+            compact_payload(&payload, ObservationKind::PageText, &cfg).expect("collapsed");
+        let items = compacted["data"].as_array().unwrap();
+        assert!(items.len() < 900, "array must shrink, got {}", items.len());
+        assert!(
+            items
+                .last()
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .contains("more items omitted"),
+            "a marker must replace the dropped items"
+        );
+        assert!(compacted["data"][0]["href"]
+            .as_str()
+            .unwrap()
+            .contains("/page/0"));
+        assert!(estimate_tokens(&compacted.to_string()) < estimate_tokens(&payload) / 2);
+    }
+
+    #[test]
+    fn compact_payload_leaves_small_payloads_alone() {
+        let payload = serde_json::json!({"url": "https://example.test/", "text": "short"});
+        let cfg = ReduceConfig::with_max_tokens(256);
+        assert!(compact_payload(&payload.to_string(), ObservationKind::PageText, &cfg).is_none());
+    }
+
+    #[test]
+    fn bound_payload_stores_the_complete_response_as_an_artifact() {
+        let (store, path) = artifact_store("bound");
+        let big = (0..800)
+            .map(|index| format!("filler line {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let payload = serde_json::json!({
+            "url": "https://example.test/", "text": format!("{big}\nerror: boom\n{big}")
+        })
+        .to_string();
+        let cfg = ReduceConfig::with_max_tokens(256);
+        let bounded = bound_payload("navigate", payload.clone(), &cfg, &store);
+
+        assert!(estimate_tokens(&bounded) < estimate_tokens(&payload));
+        let value: Value = serde_json::from_str(&bounded).expect("still valid JSON");
+        let marker = value["reduction"]["marker"].as_str().unwrap();
+        assert!(marker.contains("artifact/read"), "{marker}");
+        let id = value["reduction"]["artifact"].as_str().unwrap();
+        assert_eq!(id, ArtifactStore::id_for(payload.as_bytes()));
+
+        // artifact/read equivalent: the exact original payload comes back.
+        let stored = store.get(id).unwrap().expect("artifact stored");
+        assert_eq!(stored.text(), payload);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bound_payload_is_a_noop_without_an_artifact_store_or_budget() {
+        let (store, path) = artifact_store("noop");
+        let big = "x".repeat(20_000);
+        let payload = serde_json::json!({ "text": big }).to_string();
+
+        // Budget disabled.
+        let cfg = ReduceConfig::with_max_tokens(0);
+        assert_eq!(
+            bound_payload("navigate", payload.clone(), &cfg, &store),
+            payload
+        );
+        // Not an allow-listed tool.
+        let cfg = ReduceConfig::with_max_tokens(256);
+        assert_eq!(
+            bound_payload("cookies", payload.clone(), &cfg, &store),
+            payload
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ask_passages_ranks_matching_lines_with_context() {
+        let text =
+            "alpha beta\nParis is the capital of France\nthe capital city hosts the tour\nzeta";
+        let hits = ask_passages(text, "capital France", 2);
+        assert_eq!(hits.len(), 2);
+        assert!(hits[0]["text"].as_str().unwrap().contains("capital"));
+        assert_eq!(hits[0]["before"], "alpha beta");
+        assert!(hits[0]["score"].as_f64().unwrap() >= hits[1]["score"].as_f64().unwrap());
+        assert!(ask_passages(text, "", 2).is_empty());
     }
 }
