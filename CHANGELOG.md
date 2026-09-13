@@ -4,6 +4,34 @@ All notable changes to lightbrowse are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] — 2026-09-13
+
+Follow-up to 0.6.0: the reported savings now match the bytes on the wire, and `extract --mode text`
+no longer pays for the article twice.
+
+### Fixed
+
+- **Token accounting matched neither the wire nor itself.** The CLI `snapshot` reduction object
+  reported per-node token sums, which overstate the serialized tree by ~2-3x; it now measures the
+  exact pretty-printed payload before and after pruning. In the MCP server, an unchanged snapshot's
+  `artifact` handle is now the **same handle** as the reduced response's (`reduction.artifact`) — the
+  delta previously stored a second copy of the tree under a different id because the fingerprint was
+  taken over the compact serialization while the response was pretty-printed.
+- **`extract --mode text` returned the article twice.** `data.text` and `data.blocks` carry the same
+  content, so a projected `text` still left the full `blocks` array in the response. When the block
+  array alone exceeds the budget it is now dropped and the reduction object says
+  `blocks_omitted: true`; `--max-tokens 0` still returns everything.
+
+### Measured (same pages as 0.6.0)
+
+| Call | 0.5.2 | 0.6.1 |
+|---|---|---|
+| `extract --mode text` (Wikipedia article) | 41,953 | **1,136** (−97%) |
+| `snapshot` (rust std index, 900 nodes) | 81,823 | **817** |
+| `snapshot`, unchanged page (2nd call, MCP) | 81,823 | **69** |
+
+[0.6.1]: https://github.com/maphim/lightbrowse/compare/v0.6.0...v0.6.1
+
 ## [0.6.0] — 2026-09-13
 
 Token-bounded tool output ("context surface"), so a large page can no longer flood an agent's

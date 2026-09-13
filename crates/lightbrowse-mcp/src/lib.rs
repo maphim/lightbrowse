@@ -622,21 +622,25 @@ impl McpServer {
                     ..SnapshotOptions::default()
                 };
                 let tree = snapshot::snapshot(&page.html, &page.url, &opts);
+                // Serialize once and use those exact bytes for the fingerprint and
+                // the artifact id, so `reduction.artifact` and the delta's
+                // `artifact` point at the same handle for the same response.
                 let payload = serde_json::to_value(tree).map_err(|e| e.to_string())?;
+                let body = pretty(&payload);
                 let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
                 if !force {
                     let cfg = ReduceConfig::with_max_tokens(s.max_tokens);
                     if let Some(delta) = snapshot_delta(
                         &s.snapshot_fingerprints,
                         &page.url,
-                        &payload,
+                        &body,
                         cfg.max_tokens,
                         s.artifacts.as_deref(),
                     ) {
                         return Ok(pretty(&delta));
                     }
                 }
-                Ok(pretty(&payload))
+                Ok(body)
             }
             "search" => {
                 let query = req_str(args, "query")?;
@@ -1492,14 +1496,14 @@ fn compact_tools_schema() -> Vec<Value> {
 fn snapshot_delta(
     cache: &Mutex<HashMap<String, String>>,
     url: &str,
-    tree: &Value,
+    payload: &str,
     max_tokens: usize,
     artifacts: Option<&ArtifactStore>,
 ) -> Option<Value> {
-    if max_tokens == 0 || estimate_tokens(&tree.to_string()) <= max_tokens {
+    if max_tokens == 0 || estimate_tokens(payload) <= max_tokens {
         return None;
     }
-    let current = fingerprint(tree.to_string().as_bytes());
+    let current = fingerprint(payload.as_bytes());
     let previous = cache
         .lock()
         .unwrap()
@@ -1511,7 +1515,7 @@ fn snapshot_delta(
         "url": url,
         "unchanged": true,
         "fingerprint": current,
-        "note": "page unchanged since the previous snapshot for this URL — pass force:true for the tree, or artifact/read for the stored copy",
+        "note": "unchanged since the previous snapshot — force:true for the tree, or artifact/read the stored copy",
     });
     if let Some(store) = artifacts {
         let record = ArtifactRecord::new(
@@ -1519,7 +1523,7 @@ fn snapshot_delta(
             ObservationKind::BrowserTree.as_str(),
             "application/json",
             Some(url.to_string()),
-            tree.to_string().into_bytes(),
+            payload.as_bytes().to_vec(),
             store.config().ttl_secs,
         );
         let id = record.id.clone();
@@ -2771,9 +2775,10 @@ mod tests {
                 .collect::<Vec<_>>(),
         });
         // First call: nothing to compare against.
-        assert!(snapshot_delta(&cache, "https://example.test/", &big, 256, None).is_none());
+        let big_text = big.to_string();
+        assert!(snapshot_delta(&cache, "https://example.test/", &big_text, 256, None).is_none());
         // Second call, identical content: a fingerprint instead of the tree.
-        let delta = snapshot_delta(&cache, "https://example.test/", &big, 256, None)
+        let delta = snapshot_delta(&cache, "https://example.test/", &big_text, 256, None)
             .expect("delta on unchanged page");
         assert_eq!(delta["unchanged"], true);
         assert!(delta["fingerprint"].as_str().unwrap().len() == 16);
@@ -2782,20 +2787,76 @@ mod tests {
         // Changed content: back to the full tree.
         let mut changed = big.clone();
         changed["nodes"][0]["text"] = serde_json::json!("different");
-        assert!(snapshot_delta(&cache, "https://example.test/", &changed, 256, None).is_none());
+        assert!(snapshot_delta(
+            &cache,
+            "https://example.test/",
+            &changed.to_string(),
+            256,
+            None
+        )
+        .is_none());
         // Different URL keeps its own fingerprint.
-        assert!(snapshot_delta(&cache, "https://other.test/", &big, 256, None).is_none());
+        assert!(snapshot_delta(&cache, "https://other.test/", &big_text, 256, None).is_none());
+    }
+
+    #[test]
+    fn delta_and_reduced_response_share_one_artifact_handle() {
+        let (store, path) = artifact_store("shared-handle");
+        let cache = Mutex::new(HashMap::new());
+        let tree = serde_json::json!({
+            "url": "https://example.test/",
+            "nodes": (0..400)
+                .map(|index| serde_json::json!({
+                    "uid": index, "role": "link", "tag": "a",
+                    "text": format!("link {index} with a bit of text"), "selector": format!("#l{index}")
+                }))
+                .collect::<Vec<_>>(),
+        });
+        let body = pretty(&tree);
+        let cfg = ReduceConfig::with_max_tokens(256);
+
+        // 1st call: the reduced response stores the tree under a content id.
+        let reduced_id = ArtifactStore::id_for(body.as_bytes());
+        assert!(store
+            .put(ArtifactRecord::new(
+                "snapshot",
+                "browser_tree",
+                "application/json",
+                None,
+                body.clone().into_bytes(),
+                3600
+            ))
+            .unwrap());
+        assert!(
+            snapshot_delta(&cache, "https://example.test/", &body, 256, Some(&store)).is_none()
+        );
+
+        // 2nd call: the delta must point at that same handle, not a new copy.
+        let delta = snapshot_delta(&cache, "https://example.test/", &body, 256, Some(&store))
+            .expect("delta");
+        assert_eq!(delta["artifact"].as_str().unwrap(), reduced_id);
+        assert_eq!(
+            store.list(10, None).unwrap().len(),
+            1,
+            "no duplicate artifact"
+        );
+        assert!(estimate_tokens(&delta.to_string()) <= 75, "{delta}");
+        let _ = cfg;
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn snapshot_delta_is_skipped_for_small_trees_and_when_disabled() {
         let cache = Mutex::new(HashMap::new());
         let small = serde_json::json!({"url": "https://example.test/", "nodes": [{"uid": 1}]});
-        assert!(snapshot_delta(&cache, "https://example.test/", &small, 1000, None).is_none());
-        assert!(snapshot_delta(&cache, "https://example.test/", &small, 1000, None).is_none());
+        let small_text = small.to_string();
+        assert!(snapshot_delta(&cache, "https://example.test/", &small_text, 1000, None).is_none());
+        assert!(snapshot_delta(&cache, "https://example.test/", &small_text, 1000, None).is_none());
         let big =
             serde_json::json!({"nodes": vec![serde_json::json!({"text": "x".repeat(20_000)})]});
-        assert!(snapshot_delta(&cache, "https://example.test/", &big, 0, None).is_none());
+        assert!(
+            snapshot_delta(&cache, "https://example.test/", &big.to_string(), 0, None).is_none()
+        );
     }
 
     #[test]
@@ -2806,12 +2867,26 @@ mod tests {
             "url": "https://example.test/",
             "nodes": vec![serde_json::json!({"text": "y".repeat(20_000)})],
         });
-        assert!(snapshot_delta(&cache, "https://example.test/", &big, 256, Some(&store)).is_none());
-        let delta = snapshot_delta(&cache, "https://example.test/", &big, 256, Some(&store))
-            .expect("delta");
+        let big_text = big.to_string();
+        assert!(snapshot_delta(
+            &cache,
+            "https://example.test/",
+            &big_text,
+            256,
+            Some(&store)
+        )
+        .is_none());
+        let delta = snapshot_delta(
+            &cache,
+            "https://example.test/",
+            &big_text,
+            256,
+            Some(&store),
+        )
+        .expect("delta");
         let id = delta["artifact"].as_str().expect("artifact id in delta");
         let stored = store.get(id).expect("read").expect("stored");
-        assert_eq!(stored.text(), big.to_string());
+        assert_eq!(stored.text(), big_text);
         let _ = std::fs::remove_file(path);
     }
 }
