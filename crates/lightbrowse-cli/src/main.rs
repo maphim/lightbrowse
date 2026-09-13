@@ -425,7 +425,7 @@ async fn main() -> lightbrowse_core::Result<()> {
                 "reading_time_secs": t.reading_time_secs,
                 "text_preview": reduction.text,
             });
-            attach_reduction(&mut out, &reduction);
+            attach_reduction(&mut out, &reduction, false);
             print_json(&out);
         }
         Cmd::Extract {
@@ -446,6 +446,7 @@ async fn main() -> lightbrowse_core::Result<()> {
             .await?;
             let mode = parse_mode(&mode)?;
             let mut data = extract::extract(&page.html, &page.url, mode);
+            let mut blocks_omitted = false;
             let reduction = if let ExtractOutput::Text(text) = &mut data {
                 let cfg = ReduceConfig::with_max_tokens(max_tokens);
                 let reduction = reduce_text(&text.text, ObservationKind::PageText, &cfg);
@@ -453,6 +454,17 @@ async fn main() -> lightbrowse_core::Result<()> {
                     // Keep only the blocks whose text survived the projection.
                     let kept = reduction.text.clone();
                     text.blocks.retain(|block| kept.contains(block.text.trim()));
+                    // `data` carries the same text twice (blocks + text). If the
+                    // block array alone exceeds the budget, drop it rather than
+                    // blow the budget with a duplicate — `--max-tokens 0` still
+                    // returns everything.
+                    let block_tokens = lightbrowse_core::reduce::estimate_tokens(
+                        &serde_json::to_string(&text.blocks).unwrap_or_default(),
+                    );
+                    if block_tokens > cfg.max_tokens {
+                        text.blocks.clear();
+                        blocks_omitted = true;
+                    }
                     text.text = kept;
                 }
                 Some(reduction)
@@ -466,7 +478,7 @@ async fn main() -> lightbrowse_core::Result<()> {
                 "data": data
             });
             if let Some(reduction) = &reduction {
-                attach_reduction(&mut out, reduction);
+                attach_reduction(&mut out, reduction, blocks_omitted);
             }
             print_json(&out);
         }
@@ -1100,12 +1112,18 @@ const DEFAULT_PAGE_BUDGET: usize = 1000;
 
 /// Attach reduction metadata when a projection actually dropped content, so a
 /// caller can tell a bounded answer from a complete one.
-fn attach_reduction(out: &mut Value, reduction: &Reduction) {
+fn attach_reduction(out: &mut Value, reduction: &Reduction, blocks_omitted: bool) {
     if !reduction.truncated {
         return;
     }
     if let Some(map) = out.as_object_mut() {
-        map.insert("reduction".to_string(), reduction_json(reduction));
+        let mut metadata = reduction_json(reduction);
+        if blocks_omitted {
+            if let Some(obj) = metadata.as_object_mut() {
+                obj.insert("blocks_omitted".to_string(), json!(true));
+            }
+        }
+        map.insert("reduction".to_string(), metadata);
     }
 }
 
@@ -1139,11 +1157,29 @@ fn prune_stats_json(stats: &PruneStats) -> Value {
 /// (never the ancestors of a kept node).
 fn print_snapshot(mut tree: snapshot::SnapshotTree, max_tokens: usize) {
     let cfg = ReduceConfig::with_max_tokens(max_tokens);
+    // Measure exactly what the caller receives (`print_json` prints pretty
+    // JSON): per-node estimates add up to more than the serialized payload, and
+    // the reported savings must match the bytes on the wire.
+    let before = lightbrowse_core::reduce::estimate_tokens(
+        &serde_json::to_string_pretty(&tree).unwrap_or_default(),
+    );
     let stats = prune_snapshot(&mut tree, &cfg);
     let mut out = serde_json::to_value(&tree).unwrap();
     if stats.truncated {
+        let mut metadata = prune_stats_json(&stats);
+        let after = lightbrowse_core::reduce::estimate_tokens(
+            &serde_json::to_string_pretty(&tree).unwrap_or_default(),
+        );
+        if let Some(map) = metadata.as_object_mut() {
+            map.insert("original_tokens".to_string(), json!(before));
+            map.insert("reduced_tokens".to_string(), json!(after));
+            map.insert(
+                "saved_tokens".to_string(),
+                json!(before.saturating_sub(after)),
+            );
+        }
         if let Some(map) = out.as_object_mut() {
-            map.insert("reduction".to_string(), prune_stats_json(&stats));
+            map.insert("reduction".to_string(), metadata);
         }
     }
     print_json(&out);
