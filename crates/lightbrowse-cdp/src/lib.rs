@@ -30,6 +30,60 @@ use tokio_util::sync::CancellationToken;
 static RPC_ID: AtomicU64 = AtomicU64::new(1);
 
 // ---------------------------------------------------------------------------
+// Persistent page connections
+// ---------------------------------------------------------------------------
+
+/// obscura-style CDP servers bind page state to the CONNECTION (each
+/// websocket gets its own copy of the browser context, `connection_copy`), so
+/// per-operation connections would each materialize a fresh blank document.
+/// Chrome tolerates connect-per-call; obscura does not. Cache one websocket
+/// per page endpoint and reuse it across navigate/evaluate/screenshot/click.
+static PAGE_CONNS: std::sync::LazyLock<Mutex<HashMap<String, CdpWs>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Take the cached websocket for a page endpoint, opening one when absent.
+async fn take_page_ws(ws_url: &str) -> Result<CdpWs> {
+    if let Some(ws) = PAGE_CONNS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(ws_url)
+    {
+        return Ok(ws);
+    }
+    let (ws, _) = tokio_tungstenite::connect_async(ws_url)
+        .await
+        .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+    Ok(ws)
+}
+
+/// Return a healthy websocket to the cache after a successful operation.
+fn keep_page_ws(ws_url: &str, ws: CdpWs) {
+    let mut map = PAGE_CONNS.lock().unwrap_or_else(|e| e.into_inner());
+    if map.len() >= 8 {
+        // Evict an arbitrary idle connection when over budget; closing the
+        // stream drops the socket.
+        if let Some(key) = map.keys().next().cloned() {
+            map.remove(&key);
+        }
+    }
+    map.insert(ws_url.to_string(), ws);
+}
+
+/// Discard a cached websocket after a failed operation — the next call will
+/// reconnect instead of reusing a broken stream.
+fn drop_page_ws(ws_url: &str) {
+    PAGE_CONNS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(ws_url);
+}
+
+/// Drop every cached page websocket (browser reset / shutdown).
+fn clear_page_ws() {
+    PAGE_CONNS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+// ---------------------------------------------------------------------------
 // Backend
 // ---------------------------------------------------------------------------
 
@@ -286,6 +340,8 @@ impl CdpBackend {
             }
         }
         self.tabs.lock().await.clear();
+        // Page connections point at the dead browser — force reconnects.
+        clear_page_ws();
     }
 
     /// Close Chromium gracefully (cookies flushed to the profile) and
@@ -398,12 +454,25 @@ impl CdpBackend {
                 }
             }
         };
+        // The cached connection for this page is closing — drop it so the
+        // next navigation opens a fresh one.
+        drop_page_ws(&page.ws_url);
         let url = format!(
             "http://127.0.0.1:{}/json/close/{}",
             page.port, page.target_id
         );
         if let Err(e) = reqwest::Client::new().get(&url).send().await {
-            tracing::warn!("cdp: close tab {session_id}: {e}");
+            // Engines without the HTTP /json/close endpoint (obscura serve)
+            // are closed via Target.closeTarget over the browser websocket.
+            if let Err(e2) = browser_target_rpc(
+                page.port,
+                "Target.closeTarget",
+                json!({ "targetId": page.target_id }),
+            )
+            .await
+            {
+                tracing::warn!("cdp: close tab {session_id}: {e}; Target.closeTarget also failed: {e2}");
+            }
         }
         tracing::info!("cdp: closed tab of session {session_id}");
         Ok(())
@@ -634,6 +703,7 @@ impl CdpBackend {
             }
         }
         let (html, title, final_url) = result?;
+    tracing::debug!("TEMP nav ok title={title:?} url={final_url} len={}", html.len());
         self.navigations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Some(ram) = self.memory_usage_mb().await {
@@ -735,17 +805,49 @@ impl CdpBackend {
             guard.as_ref().expect("just spawned").port
         };
         let http = reqwest::Client::new();
-        let target = http
+        // Prefer the DevTools HTTP endpoint (`/json/new`, Chrome-style); fall
+        // back to `Target.createTarget` over the browser websocket for engines
+        // that do not implement it (e.g. obscura's CDP serve).
+        let target = match http
             .put(format!(
                 "http://127.0.0.1:{port}/json/new?{}",
                 urlencoding(url)
             ))
             .send()
             .await
-            .map_err(|e| Error::Transport(format!("cdp create tab: {e}")))?
-            .json::<Value>()
-            .await
-            .map_err(|e| Error::Transport(format!("cdp create tab json: {e}")))?;
+        {
+            Ok(resp) => match resp.json::<Value>().await {
+                Ok(v) if v.get("webSocketDebuggerUrl").is_some() => v,
+                other => {
+                    tracing::debug!(
+                        "cdp: /json/new unusable ({:?}) — falling back to Target.createTarget",
+                        other.as_ref().map(|_| ()).err()
+                    );
+                    // Create a BLANK target: navigate_and_render issues the real
+                // Page.navigate right after. Creating with the final URL makes
+                // obscura-style engines start their own navigation inline,
+                // and the spawned re-navigation then resets the document
+                // under us (blank flash after load — DOM read races it).
+                browser_target_rpc(
+                    port,
+                    "Target.createTarget",
+                    json!({ "url": "about:blank" }),
+                )
+                .await?
+                }
+            },
+            Err(e) => {
+                tracing::debug!(
+                    "cdp: /json/new unreachable ({e}) — falling back to Target.createTarget"
+                );
+                browser_target_rpc(
+                    port,
+                    "Target.createTarget",
+                    json!({ "url": "about:blank" }),
+                )
+                .await?
+            }
+        };
         let page_ws = target
             .get("webSocketDebuggerUrl")
             .and_then(|v| v.as_str())
@@ -810,15 +912,20 @@ impl CdpBackend {
     /// `document.cookie` only exposes non-httpOnly cookies.
     pub async fn cookies(&self, session: Option<&str>) -> Result<Value> {
         let (sid, active) = self.active_page(session).await?;
-        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
-            .await
-            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
-        let result = rpc_expect(&mut ws, "Network.getAllCookies", json!({})).await;
-        let _ = ws.close(None).await;
+        let mut ws = take_page_ws(&active.ws_url).await?;
+        let result: Result<Value> = async {
+            let v = rpc_expect(&mut ws, "Network.getAllCookies", json!({})).await?;
+            Ok(v.get("cookies").cloned().unwrap_or(Value::Null))
+        }
+        .await;
+        match &result {
+            Ok(_) => keep_page_ws(&active.ws_url, ws),
+            Err(_) => drop_page_ws(&active.ws_url),
+        }
         let v = result?;
         self.touch();
         self.touch_tab(&sid).await;
-        Ok(v.get("cookies").cloned().unwrap_or(Value::Null))
+        Ok(v)
     }
 
     /// Trigger a programmatic download of `url` on the active tab and wait
@@ -851,15 +958,15 @@ impl CdpBackend {
         let before: std::collections::HashSet<std::path::PathBuf> = std::fs::read_dir(&dir)
             .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
             .unwrap_or_default();
-        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
-            .await
-            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+        let mut ws = take_page_ws(&active.ws_url).await?;
         // Set the download behavior on THIS connection, right before the
         // click — and KEEP the connection open until the file lands. Chrome
         // decides the save path asynchronously after the click; if the
         // connection that called setDownloadBehavior closes first, the
         // behavior reverts and the file silently lands in ~/Downloads
-        // instead (verified live on Chrome 149).
+        // instead (verified live on Chrome 149). With the page-connection
+        // cache the same connection is reused, which keeps the behavior
+        // active for obscura-style servers too.
         match rpc_expect(
             &mut ws,
             "Browser.setDownloadBehavior",
@@ -983,7 +1090,7 @@ impl CdpBackend {
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
         }
-        let _ = ws.close(None).await;
+        keep_page_ws(&active.ws_url, ws);
         if let Ok(event) = &last {
             let mut log = self
                 .recent_downloads
@@ -1201,15 +1308,22 @@ impl CdpBackend {
         // lands on the real element.
         if let Some(fid) = &fe.frame_id {
             tracing::debug!("cdp: element found in frame {fid}");
-            if let Ok((mut ws, _)) = tokio_tungstenite::connect_async(&active.ws_url).await {
-                if let Some((ox, oy)) = iframe_viewport_offset(&mut ws, fid).await {
-                    tracing::debug!("cdp: iframe offset ({ox}, {oy})");
-                    x += ox;
-                    y += oy;
-                } else {
-                    tracing::warn!("cdp: could not compute iframe offset for frame {fid}");
+            // Cached page connection — obscura-style servers keep page state
+            // per connection, so reuse instead of connecting per call.
+            if let Ok(mut ws) = take_page_ws(&active.ws_url).await {
+                let got = iframe_viewport_offset(&mut ws, fid).await;
+                match got {
+                    Some((ox, oy)) => {
+                        tracing::debug!("cdp: iframe offset ({ox}, {oy})");
+                        x += ox;
+                        y += oy;
+                        keep_page_ws(&active.ws_url, ws);
+                    }
+                    None => {
+                        tracing::warn!("cdp: could not compute iframe offset for frame {fid}");
+                        drop_page_ws(&active.ws_url);
+                    }
                 }
-                let _ = ws.close(None).await;
             }
         }
         let tag = point
@@ -1217,9 +1331,7 @@ impl CdpBackend {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
-            .await
-            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+        let mut ws = take_page_ws(&active.ws_url).await?;
         for (typ, buttons) in [("mouseMoved", 0), ("mousePressed", 1), ("mouseReleased", 0)] {
             rpc_expect(
                 &mut ws,
@@ -1260,9 +1372,7 @@ impl CdpBackend {
         if x < 0.0 || y < 0.0 {
             return Ok(json!({ "ok": false, "reason": "coordinates must be >= 0" }));
         }
-        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
-            .await
-            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+        let mut ws = take_page_ws(&active.ws_url).await?;
         let (rx, ry) = (x.round() as u64, y.round() as u64);
         for (typ, buttons) in [("mouseMoved", 0), ("mousePressed", 1), ("mouseReleased", 0)] {
             rpc_expect(
@@ -1279,7 +1389,7 @@ impl CdpBackend {
             )
             .await?;
         }
-        let _ = ws.close(None).await;
+        keep_page_ws(&active.ws_url, ws);
         self.touch();
         self.touch_tab(&sid).await;
         Ok(json!({ "ok": true, "x": rx, "y": ry }))
@@ -1381,11 +1491,12 @@ impl CdpBackend {
             .and_then(|v| v.as_bool())
             .unwrap_or(false),
         };
-        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
-            .await
-            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
-        rpc_expect(&mut ws, "Input.insertText", json!({ "text": text })).await?;
-        let _ = ws.close(None).await;
+        let mut ws = take_page_ws(&active.ws_url).await?;
+        if let Err(e) = rpc_expect(&mut ws, "Input.insertText", json!({ "text": text })).await {
+            drop_page_ws(&active.ws_url);
+            return Err(e);
+        }
+        keep_page_ws(&active.ws_url, ws);
         self.touch();
         self.touch_tab(&sid).await;
         // Confirm the landed value only for non-secret input — never read a
@@ -1419,11 +1530,9 @@ impl CdpBackend {
             other => return Err(Error::Unsupported(format!("unsupported key '{other}'"))),
         };
         let (sid, active) = self.active_page(session).await?;
-        let (mut ws, _) = tokio_tungstenite::connect_async(&active.ws_url)
-            .await
-            .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+        let mut ws = take_page_ws(&active.ws_url).await?;
         for typ in ["keyDown", "keyUp"] {
-            rpc_expect(
+            if let Err(e) = rpc_expect(
                 &mut ws,
                 "Input.dispatchKeyEvent",
                 json!({
@@ -1435,9 +1544,13 @@ impl CdpBackend {
                     "nativeVirtualKeyCode": key_code
                 }),
             )
-            .await?;
+            .await
+            {
+                drop_page_ws(&active.ws_url);
+                return Err(e);
+            }
         }
-        let _ = ws.close(None).await;
+        keep_page_ws(&active.ws_url, ws);
         self.touch();
         self.touch_tab(&sid).await;
         self.record_step(TrailStep {
@@ -1883,9 +1996,7 @@ impl CdpBackend {
                 let ws_url = active.ws_url.clone();
                 let path = path.to_path_buf();
                 async move {
-                    let (mut ws, _) = tokio_tungstenite::connect_async(&ws_url)
-                        .await
-                        .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+                    let mut ws = take_page_ws(&ws_url).await?;
 
                     // Stretch the viewport to the full content height for full-page shots.
                     if full_page {
@@ -1932,7 +2043,9 @@ impl CdpBackend {
                         std::fs::create_dir_all(dir).ok();
                     }
                     std::fs::write(&path, &bytes).map_err(Error::Io)?;
-                    let _ = ws.close(None).await;
+                    // Cache is only healthy on Chrome; obscura ignores the
+                    // Page.* variant. Either way the connection stays usable.
+                    keep_page_ws(&ws_url, ws);
                     Ok(path)
                 }
             })
@@ -2523,8 +2636,69 @@ async fn wait_for_devtools(http: &reqwest::Client, port: u16) -> Result<String> 
 type CdpWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+/// Run a single browser-level CDP command (Target domain) over the browser
+/// websocket, for engines lacking the DevTools HTTP endpoints `/json/new` and
+/// `/json/close`. Returns the tab descriptor for `Target.createTarget` (same
+/// JSON shape the HTTP endpoint returns: `id` + `webSocketDebuggerUrl`).
+async fn browser_target_rpc(port: u16, method: &str, params: Value) -> Result<Value> {
+    let version: Value = reqwest::get(format!("http://127.0.0.1:{port}/json/version"))
+        .await
+        .map_err(|e| Error::Transport(format!("cdp {method} (browser ws): {e}")))?
+        .json()
+        .await
+        .map_err(|e| Error::Transport(format!("cdp {method} version json: {e}")))?;
+    let browser_ws = version
+        .get("webSocketDebuggerUrl")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| Error::Transport("no browser ws url".into()))?
+        .to_string();
+    let (mut ws, _) = tokio_tungstenite::connect_async(&browser_ws)
+        .await
+        .map_err(|e| Error::Transport(format!("cdp browser connect: {e}")))?;
+    let result = rpc_expect(&mut ws, method, params).await?;
+    if method == "Target.createTarget" {
+        let target_id = result
+            .get("targetId")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::Transport("Target.createTarget: no targetId".into()))?
+            .to_string();
+        let list: Value = reqwest::get(format!("http://127.0.0.1:{port}/json/list"))
+            .await
+            .map_err(|e| Error::Transport(format!("cdp list after create: {e}")))?
+            .json()
+            .await
+            .map_err(|e| Error::Transport(format!("cdp list json: {e}")))?;
+        return list
+            .as_array()
+            .and_then(|arr| {
+                arr.iter().find(|t| {
+                    t.get("id").and_then(|v| v.as_str()) == Some(target_id.as_str())
+                })
+            })
+            .cloned()
+            .ok_or_else(|| {
+                Error::Transport(format!("created target {target_id} not in /json/list"))
+            });
+    }
+    Ok(result)
+}
+
 /// Open a websocket, navigate, wait for the load event, then serialize the
 /// rendered DOM. Returns `(html, title, final_url)`.
+/// Quick probe: has the frame navigated away from about:blank? `None` when
+/// the engine does not answer the probe (trust the caller's load event then).
+async fn frame_left_blank(ws: &mut CdpWs) -> Option<bool> {
+    let v = rpc_expect(
+        ws,
+        "Runtime.evaluate",
+        json!({ "expression": "location.href", "returnByValue": true }),
+    )
+    .await
+    .ok()?;
+    let href = v.pointer("/result/result/value").and_then(|x| x.as_str())?;
+    Some(!href.is_empty() && href != "about:blank")
+}
+
 async fn navigate_and_render(
     ws_url: &str,
     url: &str,
@@ -2534,12 +2708,37 @@ async fn navigate_and_render(
     preload_script: Option<&std::path::Path>,
     download_dir: Option<&std::path::Path>,
 ) -> Result<(String, String, String)> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
-        .await
-        .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+    let mut ws = take_page_ws(ws_url).await?;
+    let ws_result = navigate_and_render_inner(
+        &mut ws,
+        url,
+        user_agent,
+        js_wait_ms,
+        stealth,
+        preload_script,
+        download_dir,
+    )
+    .await;
+    match &ws_result {
+        Ok(_) => keep_page_ws(ws_url, ws),
+        Err(_) => drop_page_ws(ws_url),
+    }
+    ws_result
+}
 
-    rpc_expect(&mut ws, "Page.enable", json!({})).await?;
-    stealth_setup(&mut ws, user_agent, stealth, preload_script).await?;
+/// Body of navigate_and_render — split so the caller can keep or drop the
+/// (cached) connection based on the outcome.
+async fn navigate_and_render_inner(
+    ws: &mut CdpWs,
+    url: &str,
+    user_agent: &str,
+    js_wait_ms: u64,
+    stealth: bool,
+    preload_script: Option<&std::path::Path>,
+    download_dir: Option<&std::path::Path>,
+) -> Result<(String, String, String)> {
+    rpc_expect(ws, "Page.enable", json!({})).await?;
+    stealth_setup(ws, user_agent, stealth, preload_script).await?;
 
     // Allow programmatic downloads (anchor clicks / the `download` tool)
     // without Chromium's "multiple automatic downloads" gate, and route
@@ -2548,7 +2747,7 @@ async fn navigate_and_render(
     // allowAndName silently renames every file to a GUID (verified live).
     if let Some(dir) = download_dir {
         match rpc_expect(
-            &mut ws,
+            ws,
             "Browser.setDownloadBehavior",
             json!({ "behavior": "allow", "downloadPath": dir.display().to_string() }),
         )
@@ -2590,8 +2789,21 @@ async fn navigate_and_render(
             Ok(Some(Ok(WsMessage::Text(t)))) => {
                 let v: Value = serde_json::from_str(&t).unwrap_or(Value::Null);
                 if v.get("method").and_then(|m| m.as_str()) == Some("Page.loadEventFired") {
-                    loaded = true;
-                    break;
+                    // Page.enable on a freshly created target may replay the
+                    // INITIAL about:blank load event (engines materialize
+                    // pages lazily and emit the blank-page lifecycle on
+                    // enable). Racing Target.createTarget{url}, that stale
+                    // event would make us serialize the blank document.
+                    // Trust the event only once the frame left about:blank;
+                    // if the engine refuses the probe, trust the event.
+                    loaded = match frame_left_blank(ws).await {
+                        Some(left) => left,
+                        None => true,
+                    };
+                    tracing::debug!("TEMP loadEvent seen left_blank={loaded}");
+                    if loaded {
+                        break;
+                    }
                 }
             }
             Ok(Some(Ok(WsMessage::Ping(p)))) => {
@@ -2601,6 +2813,7 @@ async fn navigate_and_render(
         }
     }
 
+    tracing::debug!("TEMP navwait done loaded={loaded}");
     // Extra grace for lazy JS frameworks.
     if js_wait_ms > 0 {
         tokio::time::sleep(Duration::from_millis(js_wait_ms)).await;
@@ -2621,7 +2834,7 @@ async fn navigate_and_render(
             break;
         }
         let len = rpc_expect(
-            &mut ws,
+            ws,
             "Runtime.evaluate",
             json!({
                 "expression": "document.body ? document.body.innerText.length : 0",
@@ -2662,7 +2875,7 @@ async fn navigate_and_render(
     let mut challenge_waits = 0u32;
     while challenge_waits < 15 {
         let title = rpc_expect(
-            &mut ws,
+            ws,
             "Runtime.evaluate",
             json!({ "expression": "document.title", "returnByValue": true }),
         )
@@ -2692,7 +2905,7 @@ async fn navigate_and_render(
     // Serialize the rendered document.
     let expr = "JSON.stringify({title: document.title, url: location.href, html: document.documentElement.outerHTML})";
     let result = rpc_expect(
-        &mut ws,
+        ws,
         "Runtime.evaluate",
         json!({
             "expression": expr,
@@ -2726,7 +2939,6 @@ async fn navigate_and_render(
         .unwrap_or(url)
         .to_string();
 
-    let _ = ws.close(None).await;
     Ok((html, title, final_url))
 }
 
@@ -2898,18 +3110,19 @@ fn rand_suffix() -> String {
 }
 
 async fn evaluate_js(ws_url: &str, expression: &str) -> Result<Value> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
-        .await
-        .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+    let mut ws = take_page_ws(ws_url).await?;
     let result = rpc_expect(
         &mut ws,
         "Runtime.evaluate",
         json!({ "expression": expression, "returnByValue": true, "awaitPromise": true }),
     )
-    .await?;
-    let _ = ws.close(None).await;
-    result
-        .get("result")
+    .await;
+    match &result {
+        Ok(_) => keep_page_ws(ws_url, ws),
+        Err(_) => drop_page_ws(ws_url),
+    }
+    let v = result?;
+    v.get("result")
         .and_then(|r| r.get("value"))
         .cloned()
         .ok_or_else(|| Error::Parse("evaluate: no value returned".into()))
@@ -2929,9 +3142,9 @@ struct FrameEval {
 /// Cross-origin iframes (OOPIFs) are discovered via Target.getTargets as a
 /// last resort — they never appear in Page.getFrameTree.
 async fn eval_across_frames(port: u16, ws_url: &str, expression: &str) -> Result<FrameEval> {
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url)
-        .await
-        .map_err(|e| Error::Transport(format!("cdp connect: {e}")))?;
+    let mut ws = take_page_ws(ws_url).await?;
+    // Every early return below keeps the connection cached: rpc failures on
+    // individual frames are normal (cross-origin frames), not corruption.
 
     // Main frame first (no contextId = default context).
     if let Ok(v) = rpc_expect(
@@ -2943,7 +3156,7 @@ async fn eval_across_frames(port: u16, ws_url: &str, expression: &str) -> Result
     {
         if let Some(val) = v.pointer("/result/value") {
             if !val.is_null() && val.as_str() != Some("undefined") {
-                let _ = ws.close(None).await;
+                keep_page_ws(ws_url, ws);
                 return Ok(FrameEval {
                     frame_id: None,
                     value: val.clone(),
@@ -3005,7 +3218,7 @@ async fn eval_across_frames(port: u16, ws_url: &str, expression: &str) -> Result
         {
             if let Some(val) = v.pointer("/result/value") {
                 if !val.is_null() && val.as_str() != Some("undefined") {
-                    let _ = ws.close(None).await;
+                    keep_page_ws(ws_url, ws);
                     return Ok(FrameEval {
                         frame_id: Some(fid.clone()),
                         value: val.clone(),
@@ -3021,13 +3234,13 @@ async fn eval_across_frames(port: u16, ws_url: &str, expression: &str) -> Result
         .into_iter()
         .next()
     {
-        let _ = ws.close(None).await;
+        keep_page_ws(ws_url, ws);
         return Ok(FrameEval {
             frame_id: Some(tid),
             value: val,
         });
     }
-    let _ = ws.close(None).await;
+    keep_page_ws(ws_url, ws);
     Err(Error::Parse("no frame returned a value".into()))
 }
 
@@ -3139,11 +3352,11 @@ async fn iframe_viewport_offset(ws: &mut CdpWs, frame_id: &str) -> Option<(f64, 
 /// Collect the rendered HTML of every child frame (iframe) of the page, so
 /// snapshot extraction sees login forms and other frame-hosted content.
 async fn collect_frame_htmls(port: u16, ws_url: &str) -> Vec<String> {
-    let Ok((mut ws, _)) = tokio_tungstenite::connect_async(ws_url).await else {
+    let Ok(mut ws) = take_page_ws(ws_url).await else {
         return Vec::new();
     };
     let Ok(tree) = rpc_frame_tree(&mut ws).await else {
-        let _ = ws.close(None).await;
+        drop_page_ws(ws_url);
         return Vec::new();
     };
     let main_id = tree
@@ -3210,7 +3423,7 @@ async fn collect_frame_htmls(port: u16, ws_url: &str) -> Vec<String> {
             }
         }
     }
-    let _ = ws.close(None).await;
+    keep_page_ws(ws_url, ws);
     htmls
 }
 
